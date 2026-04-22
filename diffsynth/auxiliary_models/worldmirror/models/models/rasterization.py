@@ -132,10 +132,16 @@ class Gaussians:
                 delta_means = delta_means + 0 * self.backward_vel[mask]
         elif target_timestamp > self.timestamp and target_timestamp < self.forward_timestamp:
             delta_time = (target_timestamp - self.timestamp) / (self.forward_timestamp - self.timestamp)
-            delta_means = self.forward_vel[mask] * delta_time
+            if self.forward_vel is None:
+                delta_means = torch.zeros_like(means)
+            else:
+                delta_means = self.forward_vel[mask] * delta_time
         elif target_timestamp < self.timestamp and target_timestamp > self.backward_timestamp:
             delta_time = (self.timestamp - target_timestamp) / (self.timestamp - self.backward_timestamp)
-            delta_means = self.backward_vel[mask] * delta_time
+            if self.backward_vel is None:
+                delta_means = torch.zeros_like(means)
+            else:
+                delta_means = self.backward_vel[mask] * delta_time
         else:
             means = means[[]]
             delta_means = torch.zeros_like(means)

@@ -2,10 +2,22 @@ import torch
 import os
 import argparse
 import numpy as np
+from PIL import Image
 from torchvision.transforms import functional as F
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
 from diffsynth import save_video
 from diffsynth.utils.auxiliary import CameraTrajectory, load_video, homo_matrix_inverse
+
+
+def save_scalar_video(path, frames, fps=15):
+    frames = frames.detach().to(device="cpu", dtype=torch.float32).clamp(0, 1)
+    video = []
+    for frame in frames:
+        image = (frame * 255).to(dtype=torch.uint8).numpy()
+        if image.ndim == 3 and image.shape[-1] == 1:
+            image = image.squeeze(-1)
+        video.append(Image.fromarray(image))
+    save_video(video, path, fps=fps)
 
 
 @torch.no_grad()
@@ -63,6 +75,8 @@ def generate_video(pipe, input_video, prompt, negative_prompt, cam_traj: CameraT
         render_timestamps=[timestamps],
         sh_degree=0, width=width, height=height,
     )
+    if pipe.save_root is not None:
+        save_scalar_video(os.path.join(pipe.save_root, "target_alpha.mp4"), target_alpha[0], fps=15)
     target_mask = (target_alpha > alpha_threshold).float()
     if cam_traj.use_first_frame:
         target_rgb[0, 0] = views["img"][0, 0].permute(1, 2, 0)

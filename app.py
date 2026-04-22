@@ -1,10 +1,20 @@
 import argparse
 import gc
+import io
 import json
 import os
+import threading
+import time
 import torch
 import numpy as np
+import uvicorn
+
+for proxy_env in ("ALL_PROXY", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+    os.environ.pop(proxy_env, None)
+
 import gradio as gr
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from PIL import Image
 from torchvision.transforms import functional as F
 
@@ -19,6 +29,12 @@ parser.add_argument("--reconstructor_path", type=str,
                     help="Path to reconstructor checkpoint")
 parser.add_argument("--low_vram", action="store_true",
                     help="Enable low-VRAM mode with model offloading")
+parser.add_argument("--server_name", type=str, default="0.0.0.0",
+                    help="Host/IP for the Gradio server to bind to")
+parser.add_argument("--server_port", type=int, default=7860,
+                    help="Port for the Gradio server")
+parser.add_argument("--share", action="store_true",
+                    help="Enable Gradio share link (requires frpc download)")
 args, _ = parser.parse_known_args()
 
 # ---------------------------------------------------------------------------
@@ -32,6 +48,13 @@ MASK_PATH = os.path.join(OUTPUT_ROOT, "mask.mp4")
 OUTPUT_PATH = os.path.join(OUTPUT_ROOT, "output.mp4")
 JSON_PATH = os.path.join(OUTPUT_ROOT, "trajectory.json")
 device = "cuda" if torch.cuda.is_available() else "cpu"
+VIEWER_LOCK = threading.RLock()
+LATEST_SCENE = {
+    "state": None,
+    "meta": None,
+    "source": None,
+    "updated_at": None,
+}
 print(f"Loading NeoVerse pipeline (reconstructor: {args.reconstructor_path})...")
 pipe = WanVideoNeoVersePipeline.from_pretrained(
     local_model_path="models",
@@ -51,12 +74,306 @@ def _export_scene(scene):
     return GLB_PATH
 
 
-# ---------------------------------------------------------------------------
-# 1. Upload handler
-# ---------------------------------------------------------------------------
+def _safe_normalize(vec, eps=1e-6):
+    norm = np.linalg.norm(vec)
+    if norm < eps:
+        return vec * 0.0
+    return vec / norm
+
+
+def _rotation_matrix_from_axis_angle(axis, angle_deg):
+    axis = _safe_normalize(np.asarray(axis, dtype=np.float32))
+    angle = np.deg2rad(angle_deg)
+    x, y, z = axis
+    cross = np.array([
+        [0.0, -z, y],
+        [z, 0.0, -x],
+        [-y, x, 0.0],
+    ], dtype=np.float32)
+    eye = np.eye(3, dtype=np.float32)
+    return eye + np.sin(angle) * cross + (1.0 - np.cos(angle)) * (cross @ cross)
+
+
+def _build_orbit_camera_pose(center, yaw_deg, pitch_deg, roll_deg, radius):
+    center = np.asarray(center, dtype=np.float32)
+    yaw = np.deg2rad(yaw_deg)
+    pitch = np.deg2rad(pitch_deg)
+    radius = max(float(radius), 1e-3)
+
+    offset = np.array([
+        np.sin(yaw) * np.cos(pitch),
+        np.sin(pitch),
+        np.cos(yaw) * np.cos(pitch),
+    ], dtype=np.float32) * radius
+    camera_pos = center + offset
+
+    forward = _safe_normalize(center - camera_pos)
+    if np.linalg.norm(forward) < 1e-6:
+        forward = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    up_world = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    if abs(np.dot(forward, up_world)) > 0.98:
+        up_world = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    right = _safe_normalize(np.cross(up_world, forward))
+    up = _safe_normalize(np.cross(forward, right))
+
+    if abs(float(roll_deg)) > 1e-4:
+        roll_rot = _rotation_matrix_from_axis_angle(forward, roll_deg)
+        right = _safe_normalize(roll_rot @ right)
+        up = _safe_normalize(roll_rot @ up)
+
+    cam2world = np.eye(4, dtype=np.float32)
+    cam2world[:3, :3] = np.stack([right, up, forward], axis=1)
+    cam2world[:3, 3] = camera_pos
+    return cam2world
+
+
+def _to_rgb_image(frame):
+    image = (frame.detach().clamp(0, 1) * 255).to(dtype=torch.uint8).cpu().numpy()
+    return Image.fromarray(image)
+
+
+def _to_scalar_image(frame, scale=None):
+    frame = frame.detach().float().cpu()
+    if scale is None:
+        valid = frame[frame > 0]
+        scale = float(valid.max().item()) if valid.numel() > 0 else 1.0
+    scale = max(scale, 1e-6)
+    image = (frame.clamp(0, scale) * (255.0 / scale)).to(dtype=torch.uint8).numpy()
+    return Image.fromarray(image)
+
+
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
 
 
+def _build_source_views(pil_images, scene_type):
+    static_flag = scene_type == "Static scene"
+    frame_num = len(pil_images)
+    views = {
+        "img": torch.stack([F.to_tensor(img)[None] for img in pil_images], dim=1).to(device),
+        "is_target": torch.zeros((1, frame_num), dtype=torch.bool, device=device),
+    }
+    if static_flag:
+        views["is_static"] = torch.ones((1, frame_num), dtype=torch.bool, device=device)
+        views["timestamp"] = torch.zeros((1, frame_num), dtype=torch.int64, device=device)
+    else:
+        views["is_static"] = torch.zeros((1, frame_num), dtype=torch.bool, device=device)
+        views["timestamp"] = torch.arange(0, frame_num, dtype=torch.int64, device=device).unsqueeze(0)
+    return views
+
+
+def _load_media_from_paths(paths, scene_type):
+    if not paths:
+        raise ValueError("Please provide at least one local video or image path.")
+
+    static = scene_type == "Static scene"
+    video_path = None
+    image_paths = []
+    for path in paths:
+        if not os.path.exists(path):
+            raise ValueError(f"Input path does not exist: {path}")
+        ext = os.path.splitext(path)[1].lower()
+        if ext in VIDEO_EXTS:
+            video_path = path
+            break
+        image_paths.append(path)
+
+    if video_path is not None:
+        pil_images = load_video(
+            video_path,
+            81,
+            resolution=(560, 336),
+            resize_mode="center_crop",
+            static_scene=static,
+        )
+    elif image_paths:
+        pil_images = load_video(
+            image_paths,
+            81,
+            resolution=(560, 336),
+            resize_mode="center_crop",
+            static_scene=static,
+        )
+    else:
+        raise ValueError("No supported video or image inputs were found.")
+    return {"images": pil_images, "scene_type": scene_type}
+
+
+def _camera_pose_to_orbit(center, cam2world):
+    camera_pos = np.asarray(cam2world[:3, 3], dtype=np.float32)
+    offset = camera_pos - np.asarray(center, dtype=np.float32)
+    radius = float(np.linalg.norm(offset))
+    if radius < 1e-6:
+        return 0.0, -10.0, 1.5
+    yaw = float(np.rad2deg(np.arctan2(offset[0], offset[2])))
+    pitch = float(np.rad2deg(np.arcsin(np.clip(offset[1] / radius, -1.0, 1.0))))
+    return yaw, pitch, radius
+
+
+def _compute_scene_meta(state):
+    timestamps = state["input_timestamps"].detach().cpu().float().numpy()
+    input_cam2world = state["input_cam2world"].detach().cpu().numpy()
+    scene_center = np.asarray(state["scene_center"], dtype=np.float32)
+    camera_positions = input_cam2world[:, :3, 3]
+    camera_distances = np.linalg.norm(camera_positions - scene_center[None], axis=1)
+    if state["points"].shape[0] > 0:
+        point_distances = np.linalg.norm(state["points"] - scene_center[None], axis=1)
+        scene_scale = float(np.quantile(point_distances, 0.9))
+    else:
+        scene_scale = float(np.quantile(camera_distances, 0.9)) if len(camera_distances) > 0 else 1.0
+    scene_scale = max(scene_scale, 0.25)
+
+    default_yaw, default_pitch, default_radius = _camera_pose_to_orbit(scene_center, input_cam2world[0])
+    default_radius = max(default_radius, scene_scale * 1.2, 0.5)
+
+    return {
+        "width": int(state["width"]),
+        "height": int(state["height"]),
+        "scene_center": [float(v) for v in scene_center.tolist()],
+        "scene_scale": float(scene_scale),
+        "time_min": float(timestamps.min()) if len(timestamps) > 0 else 0.0,
+        "time_max": float(timestamps.max()) if len(timestamps) > 0 else 0.0,
+        "num_frames": int(len(timestamps)),
+        "static_scene": bool(state.get("scene_type", "General scene") == "Static scene"),
+        "default_yaw": float(default_yaw),
+        "default_pitch": float(default_pitch),
+        "default_roll": 0.0,
+        "default_radius": float(default_radius),
+        "min_radius": float(max(default_radius * 0.12, scene_scale * 0.05, 0.1)),
+        "max_radius": float(max(default_radius * 3.5, scene_scale * 4.0, 2.0)),
+        "default_focal_scale": 1.0,
+        "source_label": state.get("source_label", "local input"),
+    }
+
+
+def _store_latest_scene(state, source):
+    meta = _compute_scene_meta(state)
+    state["viewer_meta"] = meta
+    with VIEWER_LOCK:
+        LATEST_SCENE["state"] = state
+        LATEST_SCENE["meta"] = meta
+        LATEST_SCENE["source"] = source
+        LATEST_SCENE["updated_at"] = time.time()
+    return meta
+
+
+@torch.no_grad()
+def _render_view_image(
+    state,
+    viewer_mode="Orbit Viewer",
+    time_value=0.0,
+    yaw=0.0,
+    pitch=-10.0,
+    roll=0.0,
+    radius=1.5,
+    center_x=0.0,
+    center_y=0.0,
+    center_z=0.0,
+    focal_scale=1.0,
+    modality="rgb",
+    mask_threshold=0.95,
+    resolution_scale=1.0,
+    include_scene_glb=False,
+):
+    if state is None or "gaussians" not in state:
+        raise ValueError("Run reconstruction first.")
+
+    base_h, base_w = state["height"], state["width"]
+    resolution_scale = float(np.clip(resolution_scale, 0.25, 1.0))
+    render_h = max(64, int(round(base_h * resolution_scale)))
+    render_w = max(64, int(round(base_w * resolution_scale)))
+
+    input_cam2world = state["input_cam2world"]
+    input_intrs = state["input_intrs"]
+    input_timestamps = state["input_timestamps"]
+    static_flag = state.get("scene_type", "General scene") == "Static scene"
+
+    timestamps_np = input_timestamps.detach().cpu().float().numpy()
+    if len(timestamps_np) == 0:
+        raise ValueError("No timestamps are available for rendering.")
+    requested_time = 0.0 if static_flag else float(np.clip(time_value, timestamps_np.min(), timestamps_np.max()))
+    frame_idx = 0 if static_flag else int(np.argmin(np.abs(timestamps_np - requested_time)))
+    resolved_time = float(timestamps_np[0] if static_flag else requested_time)
+    render_timestamp = torch.tensor(
+        resolved_time,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    intrs = input_intrs[0 if static_flag else frame_idx].clone().to(device=device)
+    intrs[:2] *= resolution_scale
+    intrs[0, 0] *= float(focal_scale)
+    intrs[1, 1] *= float(focal_scale)
+
+    viewer_mode_norm = viewer_mode.lower().replace("_", " ")
+    if viewer_mode_norm in {"input camera", "input"}:
+        cam2world = input_cam2world[0 if static_flag else frame_idx].to(device=device)
+        extra_cam2worlds = None
+        resolved_mode = "input"
+    else:
+        orbit_center = state["scene_center"] + np.array([center_x, center_y, center_z], dtype=np.float32)
+        cam2world_np = _build_orbit_camera_pose(orbit_center, yaw, pitch, roll, radius)
+        cam2world = torch.from_numpy(cam2world_np).to(device=device, dtype=input_cam2world.dtype)
+        extra_cam2worlds = [cam2world_np]
+        resolved_mode = "orbit"
+
+    world2cam = homo_matrix_inverse(cam2world.unsqueeze(0))[0]
+    render_rgb, render_depth, render_alpha = pipe.reconstructor.gs_renderer.rasterizer.forward(
+        state["gaussians"],
+        render_viewmats=[world2cam.unsqueeze(0)],
+        render_Ks=[intrs.unsqueeze(0)],
+        render_timestamps=[render_timestamp.unsqueeze(0)],
+        sh_degree=0,
+        width=render_w,
+        height=render_h,
+    )
+
+    modality = modality.lower()
+    if modality == "rgb":
+        output_image = _to_rgb_image(render_rgb[0, 0])
+    elif modality == "depth":
+        output_image = _to_scalar_image(render_depth[0, 0, ..., 0])
+    elif modality == "alpha":
+        output_image = _to_scalar_image(render_alpha[0, 0, ..., 0], scale=1.0)
+    elif modality == "mask":
+        output_image = _to_scalar_image((render_alpha[0, 0, ..., 0] > float(mask_threshold)).float(), scale=1.0)
+    else:
+        raise ValueError(f"Unsupported modality: {modality}")
+
+    glb_path = None
+    if include_scene_glb:
+        scene = build_scene_glb(
+            state["points"],
+            state["colors"],
+            state["frame_indices"],
+            input_cam2world.detach().cpu().numpy(),
+            selected_idx=frame_idx,
+            extra_cam2worlds=extra_cam2worlds,
+            extra_camera_colors=[(255, 255, 255)] if extra_cam2worlds is not None else None,
+        )
+        glb_path = _export_scene(scene)
+
+    camera_pos = cam2world[:3, 3].detach().cpu().numpy()
+    meta = {
+        "mode": resolved_mode,
+        "frame_index": int(frame_idx),
+        "timestamp": resolved_time,
+        "requested_time": float(requested_time),
+        "camera_position": [float(v) for v in camera_pos.tolist()],
+        "render_width": int(render_w),
+        "render_height": int(render_h),
+        "modality": modality,
+    }
+    status = (
+        f"mode={resolved_mode} | frame={meta['frame_index']} | "
+        f"time={meta['timestamp']:.2f} | camera=({camera_pos[0]:.2f}, {camera_pos[1]:.2f}, {camera_pos[2]:.2f}) | "
+        f"render={render_w}x{render_h}"
+    )
+    return output_image, status, meta, glb_path
+
+
+# ---------------------------------------------------------------------------
+# 1. Upload handler
+# ---------------------------------------------------------------------------
 def _get_example_videos(config_path="examples/gallery.json"):
     """Scan directory for video/image files and return metadata list.
 
@@ -97,71 +414,39 @@ def handle_upload(files, scene_type):
     """Load user media into a list of PIL images stored in gr.State."""
     if not files:
         return gr.update(), None, gr.update(interactive=False)
-    static = scene_type == "Static scene"
-    # Detect whether any file is a video
-    video_path = None
-    image_paths = []
-    for f in files:
-        ext = os.path.splitext(f)[1].lower()
-        if ext in VIDEO_EXTS:
-            video_path = f
-            break
-        else:
-            image_paths.append(f)
-    if video_path:
-        pil_images = load_video(video_path, 81, resolution=(560, 336),
-                                resize_mode="center_crop", static_scene=static)
-    elif image_paths:
-        pil_images = load_video(image_paths, 81, resolution=(560, 336),
-                                resize_mode="center_crop", static_scene=static)
-    else:
+    try:
+        state = _load_media_from_paths(list(files), scene_type)
+    except ValueError:
         return gr.update(), None, gr.update(interactive=False)
-    state = {"images": pil_images, "scene_type": scene_type}
-    return state, pil_images, gr.update(interactive=True)
+    state["source_label"] = os.path.basename(files[0]) if files else "uploaded input"
+    return state, state["images"], gr.update(interactive=True)
 
 
 # ---------------------------------------------------------------------------
 # 2. Reconstruction
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def reconstruct(state):
-    """Run the reconstructor and return 3D scene."""
+def _run_reconstruction_core(state, source="gradio"):
     if state is None or "images" not in state:
-        raise gr.Error("Please upload a video or images first.")
+        raise ValueError("Please upload a video or images first.")
 
     pil_images = state["images"]
-    scene_type = state.get("scene_type", "General scene")
-    static_flag = scene_type == "Static scene"
-    S = len(pil_images)
+    views = _build_source_views(pil_images, state.get("scene_type", "General scene"))
 
-    views = {
-        "img": torch.stack([F.to_tensor(img)[None] for img in pil_images], dim=1).to(device),
-        "is_target": torch.zeros((1, S), dtype=torch.bool, device=device),
-    }
-    if static_flag:
-        views["is_static"] = torch.ones((1, S), dtype=torch.bool, device=device)
-        views["timestamp"] = torch.zeros((1, S), dtype=torch.int64, device=device)
-    else:
-        views["is_static"] = torch.zeros((1, S), dtype=torch.bool, device=device)
-        views["timestamp"] = torch.arange(0, S, dtype=torch.int64, device=device).unsqueeze(0)
-
-    # Low-VRAM: load reconstructor to GPU before use
     if pipe.vram_management_enabled:
         pipe.reconstructor.to(device)
 
     with torch.amp.autocast("cuda", dtype=pipe.torch_dtype):
         predictions = pipe.reconstructor(views, is_inference=True, use_motion=False)
 
-    # Low-VRAM: offload reconstructor back to CPU
     if pipe.vram_management_enabled:
         pipe.reconstructor.cpu()
         torch.cuda.empty_cache()
 
     gaussians = predictions["splats"]
-    input_intrs = predictions["rendered_intrinsics"][0]        # [S, 3, 3]
-    input_cam2world = predictions["rendered_extrinsics"][0]     # [S, 4, 4]
-    input_timestamps = predictions["rendered_timestamps"][0]    # [S]
-
+    input_intrs = predictions["rendered_intrinsics"][0]
+    input_cam2world = predictions["rendered_extrinsics"][0]
+    input_timestamps = predictions["rendered_timestamps"][0]
     points, colors, frame_indices = extract_point_cloud(predictions)
 
     state["source_views"] = views
@@ -174,11 +459,25 @@ def reconstruct(state):
     state["frame_indices"] = frame_indices
     state["height"] = pil_images[0].size[1]
     state["width"] = pil_images[0].size[0]
+    if points.shape[0] > 0:
+        state["scene_center"] = np.median(points, axis=0).astype(np.float32)
+    else:
+        state["scene_center"] = input_cam2world[:, :3, 3].detach().cpu().numpy().mean(axis=0).astype(np.float32)
 
-    # Build GLB: 11-frame point cloud, all S cameras shown
-    scene = build_scene_glb(points, colors, frame_indices, input_cam2world.cpu().numpy())
+    scene = build_scene_glb(points, colors, frame_indices, input_cam2world.detach().cpu().numpy())
     glb_path = _export_scene(scene)
-    return state, glb_path, gr.update(interactive=True)
+    meta = _store_latest_scene(state, source=source)
+    return state, glb_path, meta
+
+
+@torch.no_grad()
+def reconstruct(state):
+    """Run the reconstructor and return 3D scene."""
+    try:
+        state, glb_path, _ = _run_reconstruction_core(state, source="gradio")
+    except ValueError as exc:
+        raise gr.Error(str(exc)) from exc
+    return state, glb_path, gr.update(interactive=True), gr.update(interactive=True)
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +626,71 @@ def preview(state, selected_tab, t_file, t_type, angle, distance, orbit_r,
 
 
 # ---------------------------------------------------------------------------
+# 4.5 Dynamic viewer
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def render_dynamic_view(state, viewer_mode, time_index, yaw, pitch, roll, radius,
+                        center_x, center_y, center_z, focal_scale):
+    """Render a freely movable camera view at a selectable timestamp."""
+    if state is None or "gaussians" not in state:
+        raise gr.Error("Run reconstruction first.")
+
+    H, W = state["height"], state["width"]
+    input_cam2world = state["input_cam2world"]
+    input_intrs = state["input_intrs"]
+    input_timestamps = state["input_timestamps"]
+    static_flag = state.get("scene_type", "General scene") == "Static scene"
+
+    frame_idx = 0 if static_flag else int(np.clip(time_index, 0, len(input_timestamps) - 1))
+    timestamp = input_timestamps[frame_idx].to(device=device)
+    intrs = input_intrs[0 if static_flag else frame_idx].clone().to(device=device)
+    intrs[0, 0] *= float(focal_scale)
+    intrs[1, 1] *= float(focal_scale)
+
+    if viewer_mode == "Input Camera":
+        cam2world = input_cam2world[0 if static_flag else frame_idx].to(device=device)
+        extra_cam2worlds = None
+    else:
+        orbit_center = state["scene_center"] + np.array([center_x, center_y, center_z], dtype=np.float32)
+        cam2world_np = _build_orbit_camera_pose(orbit_center, yaw, pitch, roll, radius)
+        cam2world = torch.from_numpy(cam2world_np).to(device=device, dtype=input_cam2world.dtype)
+        extra_cam2worlds = [cam2world_np]
+
+    world2cam = homo_matrix_inverse(cam2world.unsqueeze(0))[0]
+    render_rgb, render_depth, render_alpha = pipe.reconstructor.gs_renderer.rasterizer.forward(
+        state["gaussians"],
+        render_viewmats=[world2cam.unsqueeze(0)],
+        render_Ks=[intrs.unsqueeze(0)],
+        render_timestamps=[timestamp.unsqueeze(0)],
+        sh_degree=0,
+        width=W,
+        height=H,
+    )
+
+    rgb_image = _to_rgb_image(render_rgb[0, 0])
+    depth_image = _to_scalar_image(render_depth[0, 0, ..., 0])
+    alpha_image = _to_scalar_image(render_alpha[0, 0, ..., 0], scale=1.0)
+
+    scene = build_scene_glb(
+        state["points"],
+        state["colors"],
+        state["frame_indices"],
+        input_cam2world.cpu().numpy(),
+        selected_idx=frame_idx,
+        extra_cam2worlds=extra_cam2worlds,
+        extra_camera_colors=[(255, 255, 255)] if extra_cam2worlds is not None else None,
+    )
+    glb_path = _export_scene(scene)
+
+    camera_pos = cam2world[:3, 3].detach().cpu().numpy()
+    status = (
+        f"mode={viewer_mode} | frame={frame_idx} | timestamp={int(timestamp.item())} | "
+        f"camera=({camera_pos[0]:.2f}, {camera_pos[1]:.2f}, {camera_pos[2]:.2f})"
+    )
+    return glb_path, rgb_image, depth_image, alpha_image, status
+
+
+# ---------------------------------------------------------------------------
 # 5. Generate final video
 # ---------------------------------------------------------------------------
 @torch.no_grad()
@@ -364,13 +728,12 @@ def generate_final(state, prompt, negative_prompt, seed):
 # ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
-theme = gr.themes.Base()
 
 VALID_TYPES = sorted(CameraTrajectory.VALID_TRAJECTORY_TYPES)
 TAB_CAMERA_PARAMS = "tab_camera_params"
 TAB_TRAJ_FILE = "tab_traj_file"
 
-with gr.Blocks(theme=theme, title="NeoVerse Interactive Demo") as demo:
+with gr.Blocks(title="NeoVerse Interactive Demo") as demo:
     gr.HTML(
     """
     <div style="text-align: center;">
@@ -443,6 +806,43 @@ with gr.Blocks(theme=theme, title="NeoVerse Interactive Demo") as demo:
                 with gr.Column(scale=1):
                     preview_video = gr.Video(label="RGB Rendering", height=170)
                     mask_video = gr.Video(label="Mask Rendering", height=170)
+
+            with gr.Accordion("Dynamic 4D Viewer", open=False):
+                with gr.Row():
+                    viewer_mode = gr.Radio(
+                        ["Orbit Viewer", "Input Camera"],
+                        value="Orbit Viewer",
+                        label="Viewer Mode",
+                    )
+                    viewer_time = gr.Slider(
+                        minimum=0,
+                        maximum=80,
+                        value=0,
+                        step=1,
+                        label="Frame / Time",
+                    )
+                    viewer_focal = gr.Slider(
+                        minimum=0.5,
+                        maximum=2.0,
+                        value=1.0,
+                        step=0.05,
+                        label="Focal Scale",
+                    )
+                with gr.Row():
+                    viewer_yaw = gr.Slider(minimum=-180, maximum=180, value=0, step=1, label="Yaw")
+                    viewer_pitch = gr.Slider(minimum=-89, maximum=89, value=-10, step=1, label="Pitch")
+                    viewer_roll = gr.Slider(minimum=-180, maximum=180, value=0, step=1, label="Roll")
+                    viewer_radius = gr.Slider(minimum=0.2, maximum=5.0, value=1.5, step=0.05, label="Radius")
+                with gr.Row():
+                    viewer_center_x = gr.Slider(minimum=-2.0, maximum=2.0, value=0.0, step=0.05, label="Center X Offset")
+                    viewer_center_y = gr.Slider(minimum=-2.0, maximum=2.0, value=0.0, step=0.05, label="Center Y Offset")
+                    viewer_center_z = gr.Slider(minimum=-2.0, maximum=2.0, value=0.0, step=0.05, label="Center Z Offset")
+                viewer_btn = gr.Button("Render Dynamic View", variant="secondary", interactive=False)
+                viewer_status = gr.Textbox(label="Viewer Status", interactive=False)
+                with gr.Row():
+                    viewer_rgb = gr.Image(label="Viewer RGB", type="pil", interactive=False)
+                    viewer_depth = gr.Image(label="Viewer Depth", type="pil", interactive=False)
+                    viewer_alpha = gr.Image(label="Viewer Alpha", type="pil", interactive=False)
 
             with gr.Tabs() as traj_tabs:
                 with gr.Tab("Camera Parameters", id=TAB_CAMERA_PARAMS) as tab_camera:
@@ -571,14 +971,14 @@ with gr.Blocks(theme=theme, title="NeoVerse Interactive Demo") as demo:
         ).then(
             fn=reconstruct,
             inputs=[app_state],
-            outputs=[app_state, model3d, preview_btn],
+            outputs=[app_state, model3d, preview_btn, viewer_btn],
         )
 
     # Reconstruct
     reconstruct_btn.click(
         fn=reconstruct,
         inputs=[app_state],
-        outputs=[app_state, model3d, preview_btn],
+        outputs=[app_state, model3d, preview_btn, viewer_btn],
     )
     # Preview (build trajectory + render + export JSON)
     # Active tab determines trajectory source
@@ -605,6 +1005,1173 @@ with gr.Blocks(theme=theme, title="NeoVerse Interactive Demo") as demo:
         outputs=[output_video],
     )
 
+    viewer_btn.click(
+        fn=render_dynamic_view,
+        inputs=[
+            app_state,
+            viewer_mode,
+            viewer_time,
+            viewer_yaw,
+            viewer_pitch,
+            viewer_roll,
+            viewer_radius,
+            viewer_center_x,
+            viewer_center_y,
+            viewer_center_z,
+            viewer_focal,
+        ],
+        outputs=[model3d, viewer_rgb, viewer_depth, viewer_alpha, viewer_status],
+    )
+
+
+def _encode_image_bytes(image, modality):
+    buffer = io.BytesIO()
+    if modality == "rgb":
+        image.save(buffer, format="JPEG", quality=90)
+        return buffer.getvalue(), "image/jpeg"
+    image.save(buffer, format="PNG")
+    return buffer.getvalue(), "image/png"
+
+
+VIEWER_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NeoVerse Viewer</title>
+  <style>
+    :root {
+      --paper: #f4efe6;
+      --panel: rgba(255, 252, 246, 0.9);
+      --ink: #171717;
+      --muted: #6b685f;
+      --signal: #d95f02;
+      --signal-2: #1f6f78;
+      --line: rgba(23, 23, 23, 0.12);
+      --viewport: #111111;
+      --shadow: 0 18px 60px rgba(0, 0, 0, 0.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "IBM Plex Sans", "Helvetica Neue", "Segoe UI", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(217, 95, 2, 0.12), transparent 28%),
+        radial-gradient(circle at top right, rgba(31, 111, 120, 0.1), transparent 25%),
+        linear-gradient(180deg, #fbf7f1 0%, var(--paper) 100%);
+    }
+    .shell {
+      max-width: 1480px;
+      margin: 0 auto;
+      padding: 28px 22px 36px;
+    }
+    .masthead {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 24px;
+      margin-bottom: 18px;
+    }
+    .title-wrap h1 {
+      margin: 0;
+      font-size: clamp(30px, 5vw, 54px);
+      line-height: 0.94;
+      letter-spacing: -0.04em;
+      font-weight: 700;
+    }
+    .title-wrap h1 span {
+      color: var(--signal);
+    }
+    .title-wrap p {
+      margin: 10px 0 0;
+      max-width: 760px;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.5;
+    }
+    .top-links {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .pill-link, .primary-btn, .secondary-btn {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 10px 16px;
+      font-size: 13px;
+      text-decoration: none;
+      color: var(--ink);
+      background: rgba(255, 255, 255, 0.72);
+      transition: transform 140ms ease, box-shadow 140ms ease, background 140ms ease;
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.04);
+    }
+    .pill-link:hover, .primary-btn:hover, .secondary-btn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 10px 26px rgba(0, 0, 0, 0.08);
+    }
+    .primary-btn {
+      border-color: rgba(217, 95, 2, 0.25);
+      background: linear-gradient(135deg, rgba(217, 95, 2, 0.14), rgba(255, 255, 255, 0.94));
+      cursor: pointer;
+    }
+    .secondary-btn {
+      cursor: pointer;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 360px minmax(0, 1fr);
+      gap: 18px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px);
+    }
+    .sidebar {
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .sidebar section {
+      padding-bottom: 14px;
+      border-bottom: 1px solid var(--line);
+    }
+    .sidebar section:last-child {
+      border-bottom: 0;
+      padding-bottom: 0;
+    }
+    .section-label {
+      margin: 0 0 10px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+      margin-bottom: 10px;
+    }
+    .field:last-child {
+      margin-bottom: 0;
+    }
+    .field label {
+      font-size: 13px;
+      font-weight: 600;
+    }
+    input[type="text"], select, input[type="number"] {
+      width: 100%;
+      border: 1px solid rgba(23, 23, 23, 0.14);
+      border-radius: 14px;
+      padding: 12px 14px;
+      font: inherit;
+      background: rgba(255, 255, 255, 0.86);
+      color: var(--ink);
+    }
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--signal);
+    }
+    .button-row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .button-row > * {
+      flex: 1 1 0;
+    }
+    .viewer-card {
+      padding: 18px;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 14px;
+      min-height: 760px;
+    }
+    .viewer-toolbar {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .viewer-toolbar .toolbar-group {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .status-chip {
+      padding: 9px 14px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.84);
+      border: 1px solid var(--line);
+      font-size: 12px;
+      letter-spacing: 0.02em;
+      color: var(--muted);
+    }
+    .viewport-wrap {
+      position: relative;
+      overflow: hidden;
+      border-radius: 24px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      background:
+        radial-gradient(circle at 20% 20%, rgba(217, 95, 2, 0.16), transparent 22%),
+        radial-gradient(circle at 80% 24%, rgba(31, 111, 120, 0.16), transparent 18%),
+        linear-gradient(180deg, #202020 0%, var(--viewport) 100%);
+      min-height: 540px;
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+    }
+    #viewer-image {
+      width: 100%;
+      height: 100%;
+      min-height: 540px;
+      object-fit: contain;
+      display: block;
+      user-select: none;
+      -webkit-user-drag: none;
+    }
+    .overlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      pointer-events: none;
+    }
+    .overlay-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      padding: 16px;
+    }
+    .overlay-bottom {
+      padding: 16px;
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: end;
+      flex-wrap: wrap;
+    }
+    .badge {
+      background: rgba(17, 17, 17, 0.7);
+      color: #f3efe8;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 999px;
+      padding: 10px 14px;
+      font-size: 12px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      backdrop-filter: blur(10px);
+    }
+    .badge strong {
+      color: #fff6d5;
+    }
+    .hint-box {
+      max-width: 520px;
+      background: rgba(17, 17, 17, 0.62);
+      color: rgba(255, 255, 255, 0.78);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 18px;
+      padding: 14px 16px;
+      font-size: 13px;
+      line-height: 1.55;
+      backdrop-filter: blur(10px);
+    }
+    .timeline {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 12px;
+      align-items: center;
+    }
+    .timeline .time-label {
+      min-width: 64px;
+      font-size: 12px;
+      color: var(--muted);
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+    .timeline button {
+      min-width: 92px;
+    }
+    .mini-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .mini-grid .field {
+      margin: 0;
+    }
+    .scene-facts {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .scene-facts strong {
+      display: block;
+      color: var(--ink);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 4px;
+    }
+    .loading-strip {
+      height: 3px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: rgba(17, 17, 17, 0.06);
+    }
+    .loading-strip::before {
+      content: "";
+      display: block;
+      width: 32%;
+      height: 100%;
+      background: linear-gradient(90deg, var(--signal), var(--signal-2));
+      transform: translateX(-120%);
+      animation: slide 1.2s infinite ease-in-out;
+    }
+    .hidden { display: none !important; }
+    @keyframes slide {
+      0% { transform: translateX(-120%); }
+      100% { transform: translateX(420%); }
+    }
+    @media (max-width: 1080px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+      .viewer-card {
+        min-height: 0;
+      }
+      .viewport-wrap, #viewer-image {
+        min-height: 420px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="masthead">
+      <div class="title-wrap">
+        <h1><span>NeoVerse</span> Live 4D Viewer</h1>
+        <p>Drag to orbit, shift-drag or right-drag to pan, scroll to dolly, scrub time continuously, and query the reconstructed 4D scene on demand. The legacy Gradio workflow is still available if you need preview rendering or full generation.</p>
+      </div>
+      <div class="top-links">
+        <a class="pill-link" href="/gradio" target="_blank" rel="noreferrer">Open Legacy Gradio</a>
+        <a class="pill-link" href="https://github.com/IamCreateAI/NeoVerse" target="_blank" rel="noreferrer">GitHub</a>
+      </div>
+    </div>
+
+    <div class="grid">
+      <aside class="panel sidebar">
+        <section>
+          <p class="section-label">Source</p>
+          <div class="field">
+            <label for="example-select">Example</label>
+            <select id="example-select"></select>
+          </div>
+          <div class="button-row">
+            <button class="secondary-btn" id="use-example-btn">Use Example Path</button>
+          </div>
+          <div class="field">
+            <label for="path-input">Local Video Or Image Path</label>
+            <input id="path-input" type="text" placeholder="/root/.../robot.mp4">
+          </div>
+          <div class="field">
+            <label for="scene-type">Scene Type</label>
+            <select id="scene-type">
+              <option value="General scene">General scene</option>
+              <option value="Static scene">Static scene</option>
+            </select>
+          </div>
+          <div class="button-row">
+            <button class="primary-btn" id="reconstruct-btn">Reconstruct Scene</button>
+            <button class="secondary-btn" id="reset-view-btn">Reset View</button>
+          </div>
+        </section>
+
+        <section>
+          <p class="section-label">Render</p>
+          <div class="mini-grid">
+            <div class="field">
+              <label for="viewer-mode">Camera Mode</label>
+              <select id="viewer-mode">
+                <option value="Orbit Viewer">Orbit Viewer</option>
+                <option value="Input Camera">Input Camera</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="modality-select">Modality</label>
+              <select id="modality-select">
+                <option value="rgb">RGB</option>
+                <option value="depth">Depth</option>
+                <option value="alpha">Alpha</option>
+                <option value="mask">Mask</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="radius-slider">Radius</label>
+              <input id="radius-slider" type="range" min="0.2" max="5.0" step="0.01" value="1.5">
+            </div>
+            <div class="field">
+              <label for="focal-slider">Focal Scale</label>
+              <input id="focal-slider" type="range" min="0.5" max="2.0" step="0.01" value="1.0">
+            </div>
+          </div>
+          <div class="field">
+            <label for="mask-threshold">Mask Threshold</label>
+            <input id="mask-threshold" type="range" min="0" max="1" step="0.01" value="0.95">
+          </div>
+          <div class="field">
+            <label for="time-slider">Time</label>
+            <div class="timeline">
+              <button class="secondary-btn" id="play-btn">Play</button>
+              <input id="time-slider" type="range" min="0" max="80" step="0.01" value="0">
+              <div class="time-label" id="time-value">0.00</div>
+            </div>
+          </div>
+        </section>
+
+        <section>
+          <p class="section-label">Scene</p>
+          <div class="scene-facts" id="scene-facts">
+            <div><strong>Source</strong><span id="fact-source">No scene</span></div>
+            <div><strong>Frames</strong><span id="fact-frames">-</span></div>
+            <div><strong>Resolution</strong><span id="fact-resolution">-</span></div>
+            <div><strong>Scale</strong><span id="fact-scale">-</span></div>
+          </div>
+        </section>
+
+        <section>
+          <p class="section-label">Controls</p>
+          <div style="font-size:13px; line-height:1.6; color:var(--muted);">
+            <div><strong style="color:var(--ink);">Mouse</strong>: left drag orbit, shift-drag or right-drag pan, wheel dolly.</div>
+            <div><strong style="color:var(--ink);">Keys</strong>: W/S forward-back, A/D strafe, Q/E vertical, space play-pause.</div>
+            <div><strong style="color:var(--ink);">Behavior</strong>: while moving, the viewer renders a preview pass first and refines when interaction settles.</div>
+          </div>
+        </section>
+      </aside>
+
+      <main class="panel viewer-card">
+        <div class="viewer-toolbar">
+          <div class="toolbar-group">
+            <div class="status-chip" id="status-line">Waiting for reconstruction.</div>
+            <div class="status-chip" id="render-line">No render yet.</div>
+          </div>
+          <div class="toolbar-group">
+            <div class="status-chip">Root: <strong>/</strong></div>
+            <div class="status-chip">Fallback: <strong>/gradio</strong></div>
+          </div>
+        </div>
+
+        <div class="viewport-wrap" id="viewport">
+          <img id="viewer-image" alt="NeoVerse render viewport">
+          <div class="overlay">
+            <div class="overlay-top">
+              <div class="badge" id="badge-left"><strong>Idle</strong> ready for scene reconstruction</div>
+              <div class="badge" id="badge-right">mode orbit | modality rgb</div>
+            </div>
+            <div class="overlay-bottom">
+              <div class="hint-box" id="hint-box">Paste a local path or choose an example, reconstruct the scene once, then drag anywhere in the viewport to request that camera pose. The time bar supports continuous timestamps instead of frame-only jumps.</div>
+              <div style="min-width:240px;">
+                <div class="loading-strip hidden" id="loading-strip"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="viewer-toolbar">
+          <div class="toolbar-group">
+            <div class="status-chip" id="camera-line">camera unavailable</div>
+          </div>
+          <div class="toolbar-group">
+            <div class="status-chip" id="timing-line">render latency unavailable</div>
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <script>
+    const state = {
+      ready: false,
+      playing: false,
+      timeValue: 0,
+      yaw: 0,
+      pitch: -10,
+      roll: 0,
+      radius: 1.5,
+      centerX: 0,
+      centerY: 0,
+      centerZ: 0,
+      focalScale: 1.0,
+      viewerMode: 'Orbit Viewer',
+      modality: 'rgb',
+      maskThreshold: 0.95,
+      renderInFlight: false,
+      pendingRender: null,
+      interactiveRenderRaf: null,
+      fullRenderTimer: null,
+      playbackRaf: null,
+      playbackLastTs: null,
+      lastPlaybackEnqueueAt: 0,
+      scene: null,
+      examples: [],
+      dragging: false,
+      dragMode: 'orbit',
+      lastX: 0,
+      lastY: 0,
+      currentImageUrl: null,
+    };
+
+    const el = {
+      exampleSelect: document.getElementById('example-select'),
+      useExampleBtn: document.getElementById('use-example-btn'),
+      pathInput: document.getElementById('path-input'),
+      sceneType: document.getElementById('scene-type'),
+      reconstructBtn: document.getElementById('reconstruct-btn'),
+      resetViewBtn: document.getElementById('reset-view-btn'),
+      viewerMode: document.getElementById('viewer-mode'),
+      modalitySelect: document.getElementById('modality-select'),
+      radiusSlider: document.getElementById('radius-slider'),
+      focalSlider: document.getElementById('focal-slider'),
+      maskThreshold: document.getElementById('mask-threshold'),
+      timeSlider: document.getElementById('time-slider'),
+      timeValue: document.getElementById('time-value'),
+      playBtn: document.getElementById('play-btn'),
+      viewerImage: document.getElementById('viewer-image'),
+      viewport: document.getElementById('viewport'),
+      statusLine: document.getElementById('status-line'),
+      renderLine: document.getElementById('render-line'),
+      badgeLeft: document.getElementById('badge-left'),
+      badgeRight: document.getElementById('badge-right'),
+      hintBox: document.getElementById('hint-box'),
+      loadingStrip: document.getElementById('loading-strip'),
+      cameraLine: document.getElementById('camera-line'),
+      timingLine: document.getElementById('timing-line'),
+      factSource: document.getElementById('fact-source'),
+      factFrames: document.getElementById('fact-frames'),
+      factResolution: document.getElementById('fact-resolution'),
+      factScale: document.getElementById('fact-scale'),
+    };
+
+    function clamp(value, minValue, maxValue) {
+      return Math.min(Math.max(value, minValue), maxValue);
+    }
+
+    function normalize(vec) {
+      const norm = Math.hypot(vec[0], vec[1], vec[2]) || 1;
+      return [vec[0] / norm, vec[1] / norm, vec[2] / norm];
+    }
+
+    function cross(a, b) {
+      return [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+      ];
+    }
+
+    function getCameraBasis() {
+      const yaw = state.yaw * Math.PI / 180;
+      const pitch = state.pitch * Math.PI / 180;
+      const forward = normalize([
+        -Math.sin(yaw) * Math.cos(pitch),
+        -Math.sin(pitch),
+        -Math.cos(yaw) * Math.cos(pitch),
+      ]);
+      const upWorld = Math.abs(forward[1]) > 0.98 ? [0, 0, 1] : [0, 1, 0];
+      const right = normalize(cross(upWorld, forward));
+      const up = normalize(cross(forward, right));
+      return { forward, right, up };
+    }
+
+    function movePivot(deltaRight, deltaUp, deltaForward) {
+      const { forward, right, up } = getCameraBasis();
+      const step = Math.max(state.radius * 0.025, 0.01);
+      state.centerX += (right[0] * deltaRight + up[0] * deltaUp + forward[0] * deltaForward) * step;
+      state.centerY += (right[1] * deltaRight + up[1] * deltaUp + forward[1] * deltaForward) * step;
+      state.centerZ += (right[2] * deltaRight + up[2] * deltaUp + forward[2] * deltaForward) * step;
+    }
+
+    function setLoading(active, message) {
+      el.loadingStrip.classList.toggle('hidden', !active);
+      if (message) {
+        el.badgeLeft.innerHTML = '<strong>' + message + '</strong>';
+      }
+    }
+
+    function setStatus(message) {
+      el.statusLine.textContent = message;
+    }
+
+    function setRenderInfo(message) {
+      el.renderLine.textContent = message;
+    }
+
+    function snapshotRenderState() {
+      return {
+        viewerMode: state.viewerMode,
+        modality: state.modality,
+        timeValue: state.timeValue,
+        yaw: state.yaw,
+        pitch: state.pitch,
+        roll: state.roll,
+        radius: state.radius,
+        centerX: state.centerX,
+        centerY: state.centerY,
+        centerZ: state.centerZ,
+        focalScale: state.focalScale,
+        maskThreshold: state.maskThreshold,
+      };
+    }
+
+    function requestRender(resolutionScale) {
+      if (!state.ready || !state.scene) {
+        return;
+      }
+      state.pendingRender = {
+        snapshot: snapshotRenderState(),
+        resolutionScale,
+      };
+      if (!state.renderInFlight) {
+        void flushRenderQueue();
+      }
+    }
+
+    async function flushRenderQueue() {
+      if (state.renderInFlight || !state.pendingRender || !state.ready || !state.scene) {
+        return;
+      }
+
+      const job = state.pendingRender;
+      state.pendingRender = null;
+      state.renderInFlight = true;
+      updateOverlayLabels();
+      setLoading(true, job.resolutionScale < 1 ? 'preview' : 'rendering');
+
+      const params = new URLSearchParams({
+        viewer_mode: job.snapshot.viewerMode,
+        modality: job.snapshot.modality,
+        time_value: String(job.snapshot.timeValue),
+        yaw: String(job.snapshot.yaw),
+        pitch: String(job.snapshot.pitch),
+        roll: String(job.snapshot.roll),
+        radius: String(job.snapshot.radius),
+        center_x: String(job.snapshot.centerX),
+        center_y: String(job.snapshot.centerY),
+        center_z: String(job.snapshot.centerZ),
+        focal_scale: String(job.snapshot.focalScale),
+        mask_threshold: String(job.snapshot.maskThreshold),
+        resolution_scale: String(job.resolutionScale),
+      });
+
+      const startedAt = performance.now();
+      try {
+        const response = await fetch('/api/render?' + params.toString(), {
+          cache: 'no-store',
+        });
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({ detail: 'Render failed.' }));
+          throw new Error(payload.detail || 'Render failed.');
+        }
+
+        const blob = await response.blob();
+        if (state.currentImageUrl) {
+          URL.revokeObjectURL(state.currentImageUrl);
+        }
+        state.currentImageUrl = URL.createObjectURL(blob);
+        el.viewerImage.src = state.currentImageUrl;
+
+        const renderMs = response.headers.get('x-render-ms') || (performance.now() - startedAt).toFixed(1);
+        const cameraPos = response.headers.get('x-camera-pos') || 'n/a';
+        const statusText = response.headers.get('x-status') || 'render complete';
+        setRenderInfo(statusText);
+        el.cameraLine.textContent = 'camera ' + cameraPos;
+        el.timingLine.textContent = 'render ' + renderMs + ' ms';
+        el.badgeLeft.innerHTML = '<strong>' + (job.resolutionScale < 1 ? 'Preview' : 'Stable') + '</strong> render complete';
+      } catch (error) {
+        setStatus(String(error.message || error));
+      } finally {
+        state.renderInFlight = false;
+        if (state.pendingRender) {
+          queueMicrotask(() => {
+            void flushRenderQueue();
+          });
+        } else {
+          setLoading(false, 'idle');
+        }
+      }
+    }
+
+    function resetViewFromScene() {
+      if (!state.scene) {
+        return;
+      }
+      state.yaw = state.scene.default_yaw;
+      state.pitch = state.scene.default_pitch;
+      state.roll = state.scene.default_roll;
+      state.radius = state.scene.default_radius;
+      state.centerX = 0;
+      state.centerY = 0;
+      state.centerZ = 0;
+      state.focalScale = state.scene.default_focal_scale;
+      state.timeValue = state.scene.time_min;
+      el.radiusSlider.min = state.scene.min_radius;
+      el.radiusSlider.max = state.scene.max_radius;
+      el.radiusSlider.value = state.radius;
+      el.focalSlider.value = state.focalScale;
+      el.timeSlider.min = state.scene.time_min;
+      el.timeSlider.max = state.scene.time_max;
+      el.timeSlider.value = state.timeValue;
+      el.timeValue.textContent = Number(state.timeValue).toFixed(2);
+      updateOverlayLabels();
+    }
+
+    function applyScene(scene) {
+      state.scene = scene;
+      state.ready = true;
+      state.pendingRender = null;
+      clearTimeout(state.fullRenderTimer);
+      if (state.interactiveRenderRaf !== null) {
+        cancelAnimationFrame(state.interactiveRenderRaf);
+        state.interactiveRenderRaf = null;
+      }
+      resetViewFromScene();
+      el.factSource.textContent = scene.source_label;
+      el.factFrames.textContent = scene.static_scene ? 'static' : String(scene.num_frames);
+      el.factResolution.textContent = scene.width + ' x ' + scene.height;
+      el.factScale.textContent = scene.scene_scale.toFixed(2);
+      el.hintBox.textContent = 'Scene ready. Drag in the viewport to orbit. Shift-drag or right-drag pans the pivot. Mouse wheel changes radius. Space toggles playback.';
+      setStatus('Scene reconstructed. Ready for live viewpoint queries.');
+    }
+
+    function updateOverlayLabels() {
+      el.badgeRight.textContent = 'mode ' + (state.viewerMode === 'Input Camera' ? 'input' : 'orbit') + ' | modality ' + state.modality;
+      el.timeValue.textContent = Number(state.timeValue).toFixed(2);
+    }
+
+    async function fetchExamples() {
+      const response = await fetch('/api/examples');
+      const payload = await response.json();
+      state.examples = payload.examples || [];
+      el.exampleSelect.innerHTML = '';
+      state.examples.forEach((example, index) => {
+        const option = document.createElement('option');
+        option.value = String(index);
+        option.textContent = example.name + ' [' + example.scene_type + ']';
+        el.exampleSelect.appendChild(option);
+      });
+      if (state.examples.length > 0) {
+        const example = state.examples[0];
+        el.pathInput.value = example.file;
+        el.sceneType.value = example.scene_type;
+      }
+    }
+
+    async function fetchSceneIfAvailable() {
+      const response = await fetch('/api/scene');
+      const payload = await response.json();
+      if (payload.ready) {
+        applyScene(payload.scene);
+        queueFullRender(10);
+      }
+    }
+
+    async function reconstructScene() {
+      const sourcePath = el.pathInput.value.trim();
+      if (!sourcePath) {
+        setStatus('Please provide a local path or choose an example.');
+        return;
+      }
+      stopPlayback(false);
+      setLoading(true, 'reconstructing');
+      setStatus('Reconstructing the 4D scene. This runs the feed-forward reconstructor once.');
+      const startedAt = performance.now();
+      try {
+        const response = await fetch('/api/reconstruct', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            source_path: sourcePath,
+            scene_type: el.sceneType.value,
+          }),
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.detail || 'Reconstruction failed.');
+        }
+        applyScene(payload.scene);
+        setRenderInfo('reconstruction ' + payload.elapsed_s.toFixed(2) + ' s');
+        setStatus('Reconstruction finished in ' + payload.elapsed_s.toFixed(2) + ' s. Rendering first view.');
+        queueFullRender(20);
+      } catch (error) {
+        setStatus(String(error.message || error));
+      } finally {
+        const elapsed = ((performance.now() - startedAt) / 1000).toFixed(2);
+        el.timingLine.textContent = 'last reconstruction ' + elapsed + ' s';
+        setLoading(false, 'idle');
+      }
+    }
+
+    function queueFullRender(delayMs) {
+      clearTimeout(state.fullRenderTimer);
+      state.fullRenderTimer = setTimeout(() => requestRender(1.0), delayMs);
+    }
+
+    function queueInteractiveRender(previewScale = 0.55) {
+      if (state.interactiveRenderRaf === null) {
+        state.interactiveRenderRaf = requestAnimationFrame(() => {
+          state.interactiveRenderRaf = null;
+          requestRender(previewScale);
+        });
+      }
+      if (!state.playing) {
+        queueFullRender(140);
+      }
+    }
+
+    function stopPlayback(renderStable = true) {
+      if (state.playbackRaf !== null) {
+        cancelAnimationFrame(state.playbackRaf);
+        state.playbackRaf = null;
+      }
+      state.playbackLastTs = null;
+      state.lastPlaybackEnqueueAt = 0;
+      state.playing = false;
+      el.playBtn.textContent = 'Play';
+      if (renderStable) {
+        queueFullRender(40);
+      }
+    }
+
+    function playbackStep(ts) {
+      if (!state.playing || !state.scene) {
+        return;
+      }
+      if (state.playbackLastTs === null) {
+        state.playbackLastTs = ts;
+      }
+
+      const deltaSec = Math.min((ts - state.playbackLastTs) / 1000, 0.1);
+      state.playbackLastTs = ts;
+
+      const span = Math.max(state.scene.time_max - state.scene.time_min, 1e-6);
+      const loopDurationSec = Math.max(span / 16, 4.5);
+      state.timeValue += deltaSec * (span / loopDurationSec);
+      if (state.timeValue > state.scene.time_max) {
+        state.timeValue = state.scene.time_min + (state.timeValue - state.scene.time_max);
+      }
+
+      el.timeSlider.value = state.timeValue;
+      updateOverlayLabels();
+
+      if (ts - state.lastPlaybackEnqueueAt >= 45) {
+        state.lastPlaybackEnqueueAt = ts;
+        requestRender(0.62);
+      }
+
+      state.playbackRaf = requestAnimationFrame(playbackStep);
+    }
+
+    function togglePlayback() {
+      if (!state.ready || !state.scene || state.scene.static_scene) {
+        return;
+      }
+      if (state.playing) {
+        stopPlayback(true);
+        return;
+      }
+      clearTimeout(state.fullRenderTimer);
+      state.playing = true;
+      el.playBtn.textContent = 'Pause';
+      state.playbackLastTs = null;
+      state.lastPlaybackEnqueueAt = 0;
+      state.playbackRaf = requestAnimationFrame(playbackStep);
+    }
+
+    el.useExampleBtn.addEventListener('click', () => {
+      const index = Number(el.exampleSelect.value || 0);
+      const example = state.examples[index];
+      if (!example) {
+        return;
+      }
+      el.pathInput.value = example.file;
+      el.sceneType.value = example.scene_type;
+      setStatus('Example selected. Reconstruct when ready.');
+    });
+
+    el.reconstructBtn.addEventListener('click', reconstructScene);
+    el.resetViewBtn.addEventListener('click', () => {
+      resetViewFromScene();
+      queueFullRender(30);
+    });
+    el.playBtn.addEventListener('click', togglePlayback);
+
+    el.viewerMode.addEventListener('change', () => {
+      state.viewerMode = el.viewerMode.value;
+      updateOverlayLabels();
+      queueFullRender(20);
+    });
+    el.modalitySelect.addEventListener('change', () => {
+      state.modality = el.modalitySelect.value;
+      updateOverlayLabels();
+      queueFullRender(10);
+    });
+    el.radiusSlider.addEventListener('input', () => {
+      state.radius = Number(el.radiusSlider.value);
+      queueInteractiveRender();
+    });
+    el.focalSlider.addEventListener('input', () => {
+      state.focalScale = Number(el.focalSlider.value);
+      queueInteractiveRender();
+    });
+    el.maskThreshold.addEventListener('input', () => {
+      state.maskThreshold = Number(el.maskThreshold.value);
+      if (state.modality === 'mask') {
+        queueInteractiveRender();
+      }
+    });
+    el.timeSlider.addEventListener('input', () => {
+      state.timeValue = Number(el.timeSlider.value);
+      updateOverlayLabels();
+      queueInteractiveRender();
+    });
+
+    el.viewport.addEventListener('contextmenu', (event) => event.preventDefault());
+    el.viewport.addEventListener('pointerdown', (event) => {
+      if (!state.ready) {
+        return;
+      }
+      state.dragging = true;
+      state.dragMode = event.button === 2 || event.shiftKey ? 'pan' : 'orbit';
+      state.lastX = event.clientX;
+      state.lastY = event.clientY;
+      el.viewport.setPointerCapture(event.pointerId);
+    });
+    el.viewport.addEventListener('pointermove', (event) => {
+      if (!state.dragging) {
+        return;
+      }
+      const dx = event.clientX - state.lastX;
+      const dy = event.clientY - state.lastY;
+      state.lastX = event.clientX;
+      state.lastY = event.clientY;
+      if (state.dragMode === 'orbit') {
+        state.yaw += dx * 0.32;
+        state.pitch = clamp(state.pitch - dy * 0.22, -89, 89);
+      } else {
+        movePivot(-dx * 0.8, dy * 0.8, 0);
+      }
+      queueInteractiveRender();
+    });
+    function endDrag(event) {
+      if (!state.dragging) {
+        return;
+      }
+      state.dragging = false;
+      if (event && event.pointerId !== undefined) {
+        try {
+          el.viewport.releasePointerCapture(event.pointerId);
+        } catch (error) {
+        }
+      }
+      queueFullRender(20);
+    }
+    el.viewport.addEventListener('pointerup', endDrag);
+    el.viewport.addEventListener('pointercancel', endDrag);
+    el.viewport.addEventListener('wheel', (event) => {
+      if (!state.ready || !state.scene) {
+        return;
+      }
+      event.preventDefault();
+      const factor = event.deltaY > 0 ? 1.06 : 0.94;
+      state.radius = clamp(state.radius * factor, state.scene.min_radius, state.scene.max_radius);
+      el.radiusSlider.value = state.radius;
+      queueInteractiveRender();
+    }, { passive: false });
+
+    window.addEventListener('keydown', (event) => {
+      if (event.target && ['INPUT', 'SELECT', 'TEXTAREA'].includes(event.target.tagName)) {
+        return;
+      }
+      if (event.code === 'Space') {
+        event.preventDefault();
+        togglePlayback();
+        return;
+      }
+      if (!state.ready) {
+        return;
+      }
+      if (event.key === 'r') {
+        resetViewFromScene();
+        queueFullRender(20);
+        return;
+      }
+      let handled = true;
+      if (event.key === 'w') movePivot(0, 0, 1);
+      else if (event.key === 's') movePivot(0, 0, -1);
+      else if (event.key === 'a') movePivot(-1, 0, 0);
+      else if (event.key === 'd') movePivot(1, 0, 0);
+      else if (event.key === 'q') movePivot(0, 1, 0);
+      else if (event.key === 'e') movePivot(0, -1, 0);
+      else handled = false;
+      if (handled) {
+        queueInteractiveRender();
+      }
+    });
+
+    updateOverlayLabels();
+    fetchExamples().then(fetchSceneIfAvailable).catch((error) => {
+      setStatus(String(error.message || error));
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+server_app = FastAPI(title="NeoVerse Interactive Viewer")
+
+
+@server_app.get("/", response_class=HTMLResponse)
+async def viewer_home():
+    return HTMLResponse(VIEWER_HTML)
+
+
+@server_app.get("/healthz")
+async def healthz():
+    return {"ok": True, "device": device}
+
+
+@server_app.get("/api/examples")
+async def api_examples():
+    return {
+        "examples": [
+            {
+                "name": example["name"],
+                "file": example["file"],
+                "scene_type": example.get("scene_type", "General scene"),
+            }
+            for example in _examples
+        ]
+    }
+
+
+@server_app.get("/api/scene")
+async def api_scene():
+    with VIEWER_LOCK:
+        ready = LATEST_SCENE["state"] is not None
+        scene = LATEST_SCENE["meta"]
+    return {"ready": ready, "scene": scene}
+
+
+@server_app.post("/api/reconstruct")
+async def api_reconstruct(request: Request):
+    payload = await request.json()
+    source_path = str(payload.get("source_path", "")).strip()
+    scene_type = payload.get("scene_type", "General scene")
+    if not source_path:
+        raise HTTPException(status_code=400, detail="source_path is required.")
+
+    source_paths = [part.strip() for part in source_path.split(",") if part.strip()]
+    started_at = time.perf_counter()
+    try:
+        state = _load_media_from_paths(source_paths, scene_type)
+        state["source_label"] = os.path.basename(source_paths[0])
+        with VIEWER_LOCK:
+            _, _, meta = _run_reconstruction_core(state, source="api")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "ok": True,
+        "scene": meta,
+        "elapsed_s": float(time.perf_counter() - started_at),
+    }
+
+
+@server_app.get("/api/render")
+async def api_render(
+    viewer_mode: str = "Orbit Viewer",
+    modality: str = "rgb",
+    time_value: float = 0.0,
+    yaw: float = 0.0,
+    pitch: float = -10.0,
+    roll: float = 0.0,
+    radius: float = 1.5,
+    center_x: float = 0.0,
+    center_y: float = 0.0,
+    center_z: float = 0.0,
+    focal_scale: float = 1.0,
+    mask_threshold: float = 0.95,
+    resolution_scale: float = 1.0,
+):
+    with VIEWER_LOCK:
+        state = LATEST_SCENE["state"]
+        if state is None:
+            raise HTTPException(status_code=400, detail="No reconstructed scene is available yet.")
+
+        started_at = time.perf_counter()
+        try:
+            image, status, meta, _ = _render_view_image(
+                state,
+                viewer_mode=viewer_mode,
+                time_value=time_value,
+                yaw=yaw,
+                pitch=pitch,
+                roll=roll,
+                radius=radius,
+                center_x=center_x,
+                center_y=center_y,
+                center_z=center_z,
+                focal_scale=focal_scale,
+                modality=modality,
+                mask_threshold=mask_threshold,
+                resolution_scale=resolution_scale,
+                include_scene_glb=False,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        render_ms = (time.perf_counter() - started_at) * 1000.0
+
+    image_bytes, media_type = _encode_image_bytes(image, meta["modality"])
+    return Response(
+        content=image_bytes,
+        media_type=media_type,
+        headers={
+            "X-Render-Ms": f"{render_ms:.1f}",
+            "X-Status": status,
+            "X-Camera-Pos": ", ".join(f"{v:.3f}" for v in meta["camera_position"]),
+            "X-Frame-Index": str(meta["frame_index"]),
+            "X-Timestamp": f"{meta['timestamp']:.3f}",
+            "X-Render-Size": f"{meta['render_width']}x{meta['render_height']}",
+        },
+    )
+
+
+demo.queue(max_size=5)
+server_app = gr.mount_gradio_app(
+    server_app,
+    demo,
+    path="/gradio",
+    server_name=args.server_name,
+    server_port=args.server_port,
+    show_error=True,
+)
+
 
 if __name__ == "__main__":
-    demo.queue(max_size=5).launch(show_error=True, share=True)
+    if args.share:
+        print("`--share` is not supported by the lightweight root viewer. Use the local URL or open `/gradio` manually.")
+    uvicorn.run(server_app, host=args.server_name, port=args.server_port, log_level="info")

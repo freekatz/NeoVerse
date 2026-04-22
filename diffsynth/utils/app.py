@@ -64,7 +64,8 @@ def extract_point_cloud(predictions):
 
 
 def build_scene_glb(points, colors, frame_indices, cam2world,
-                    selected_idx=None, vis_frame_num=11, camera_size=1.0):
+                    selected_idx=None, vis_frame_num=11, camera_size=1.0,
+                    extra_cam2worlds=None, extra_camera_colors=None, extra_camera_size=None):
     """Build a trimesh.Scene with point cloud and camera frustums.
 
     Returns the trimesh.Scene object (caller is responsible for exporting).
@@ -106,6 +107,14 @@ def build_scene_glb(points, colors, frame_indices, cam2world,
             cur_cam_size = camera_size
 
         integrate_camera_into_scene(scene, c2w, cam_color, cur_cam_size)
+
+    if extra_cam2worlds is not None:
+        if extra_camera_colors is None:
+            extra_camera_colors = [(255, 255, 255)] * len(extra_cam2worlds)
+        if extra_camera_size is None:
+            extra_camera_size = camera_size * 1.5
+        for c2w, cam_color in zip(extra_cam2worlds, extra_camera_colors):
+            integrate_camera_into_scene(scene, c2w, cam_color, extra_camera_size)
 
     # OpenCV→OpenGL flip: Y and Z
     flip = np.diag([1.0, -1.0, -1.0, 1.0])

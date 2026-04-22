@@ -32,6 +32,42 @@ from ..lora import GeneralLoRALoader, LightX2VLoRALoader
 from ..data import save_video
 
 
+def build_vis_output_path(save_root, source_views, filename):
+    output_path = save_root + "/"
+    if source_views is not None and "dataset" in source_views:
+        output_path += source_views["dataset"][0][0] + "/"
+    if source_views is not None and "video_name" in source_views:
+        output_path += source_views["video_name"][0][0] + "/"
+    output_path += filename
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    return output_path
+
+
+def save_tensor_video_for_vis(save_root, source_views, filename, frames, pattern="B T C H W", min_value=0.0, max_value=1.0):
+    if save_root is None:
+        return
+    if pattern == "B T C H W":
+        frames = rearrange(frames, "B T C H W -> (B T) H W C")
+    elif pattern == "B T H W C":
+        frames = rearrange(frames, "B T H W C -> (B T) H W C")
+    elif pattern == "B T H W":
+        frames = rearrange(frames, "B T H W -> (B T) H W")
+    else:
+        raise ValueError(f"Unsupported video visualization pattern: {pattern}")
+
+    frames = frames.detach().to(device="cpu", dtype=torch.float32)
+    scale = max(max_value - min_value, 1e-6)
+    frames = ((frames - min_value) * (255.0 / scale)).clip(0, 255).to(dtype=torch.uint8)
+
+    video = []
+    for frame in frames:
+        if frame.ndim == 3 and frame.shape[-1] == 1:
+            frame = frame.squeeze(-1)
+        video.append(Image.fromarray(frame.numpy()))
+
+    save_video(video, build_vis_output_path(save_root, source_views, filename), fps=15)
+
+
 class WanVideoNeoVersePipeline(BasePipeline):
 
     def __init__(self, device="cuda", torch_dtype=torch.bfloat16, tokenizer_path=None, pipeline_kwargs={}):
@@ -812,17 +848,7 @@ class WanVideoUnit_4DEmbedder(PipelineUnit):
             target_rgb = rearrange(target_rgb, "B T H W C -> B T C H W")
 
             if pipe.save_root is not None:
-                for_save = rearrange(target_rgb, "B T C H W -> (B T) H W C")
-                for_save = (for_save * 255).clip(0, 255)
-                video = [Image.fromarray(image.to(device="cpu", dtype=torch.uint8).numpy()) for image in for_save]
-                output_path = pipe.save_root + "/"
-                if "dataset" in source_views:
-                    output_path += source_views["dataset"][0][0] + "/"
-                if "video_name" in source_views:
-                    output_path += source_views["video_name"][0][0] + "/"
-                output_path += "target_rgb.mp4"
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                save_video(video, output_path, fps=15)
+                save_tensor_video_for_vis(pipe.save_root, source_views, "target_rgb.mp4", target_rgb)
 
             target_rgb = pipe.preprocess_video(target_rgb)
             target_rgb_latents = pipe.vae.encode(target_rgb, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
@@ -830,33 +856,35 @@ class WanVideoUnit_4DEmbedder(PipelineUnit):
             target_depth = repeat(target_depth, "B T H W 1 -> B T C H W", C=3)
 
             if pipe.save_root is not None:
-                for_save = rearrange(target_depth, "B T C H W -> (B T) H W C") / d_max[0]
-                for_save = (for_save * 255).clip(0, 255)
-                video = [Image.fromarray(image.to(device="cpu", dtype=torch.uint8).numpy()) for image in for_save]
-                output_path = pipe.save_root + "/"
-                if "dataset" in source_views:
-                    output_path += source_views["dataset"][0][0] + "/"
-                if "video_name" in source_views:
-                    output_path += source_views["video_name"][0][0] + "/"
-                output_path += "target_depth.mp4"
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                save_video(video, output_path, fps=15)
+                target_depth_vis = (target_depth / d_max).clamp(0, 1)
+                save_tensor_video_for_vis(pipe.save_root, source_views, "target_depth.mp4", target_depth_vis)
 
             target_depth = pipe.preprocess_video(target_depth, normalize=d_max).clamp(min=-1, max=1)
             target_depth_latents = pipe.vae.encode(target_depth, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
 
             if pipe.save_root is not None:
-                for_save = rearrange(target_mask, "B T H W C -> (B T) H W C").squeeze(-1)
-                for_save = (for_save * 255).clip(0, 255)
-                video = [Image.fromarray(image.to(device="cpu", dtype=torch.uint8).numpy()) for image in for_save]
-                output_path = pipe.save_root + "/"
-                if "dataset" in source_views:
-                    output_path += source_views["dataset"][0][0] + "/"
-                if "video_name" in source_views:
-                    output_path += source_views["video_name"][0][0] + "/"
-                output_path += "target_mask.mp4"
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                save_video(video, output_path, fps=15)
+                save_tensor_video_for_vis(pipe.save_root, source_views, "target_mask.mp4", target_mask, pattern="B T H W C")
+
+                target_camera_dir = target_camera_embed[:, :, :3].clamp(-1, 1)
+                target_camera_moment = target_camera_embed[:, :, 3:]
+                target_camera_moment_scale = target_camera_moment.float().abs().reshape(batch_size, -1).amax(dim=-1).clamp_min(1e-6)[:, None, None, None, None]
+                target_camera_moment = (target_camera_moment / target_camera_moment_scale).clamp(-1, 1)
+                save_tensor_video_for_vis(
+                    pipe.save_root,
+                    source_views,
+                    "target_camera_dir.mp4",
+                    target_camera_dir,
+                    min_value=-1.0,
+                    max_value=1.0,
+                )
+                save_tensor_video_for_vis(
+                    pipe.save_root,
+                    source_views,
+                    "target_camera_moment.mp4",
+                    target_camera_moment,
+                    min_value=-1.0,
+                    max_value=1.0,
+                )
             return {
                 "target_rgb": target_rgb_latents,
                 "target_depth": target_depth_latents,
