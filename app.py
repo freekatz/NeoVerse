@@ -5,7 +5,6 @@ import json
 import os
 import threading
 import time
-import matplotlib
 import torch
 import numpy as np
 import uvicorn
@@ -13,10 +12,7 @@ import uvicorn
 for proxy_env in ("ALL_PROXY", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
     os.environ.pop(proxy_env, None)
 
-matplotlib.use("Agg")
-
 import gradio as gr
-import matplotlib.pyplot as plt
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from PIL import Image
@@ -50,6 +46,7 @@ GLB_PATH = os.path.join(OUTPUT_ROOT, "scene.glb")
 PREVIEW_PATH = os.path.join(OUTPUT_ROOT, "preview.mp4")
 MASK_PATH = os.path.join(OUTPUT_ROOT, "mask.mp4")
 OUTPUT_PATH = os.path.join(OUTPUT_ROOT, "output.mp4")
+COMPARE_PATH = os.path.join(OUTPUT_ROOT, "render_vs_generated.mp4")
 JSON_PATH = os.path.join(OUTPUT_ROOT, "trajectory.json")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 VIEWER_LOCK = threading.RLock()
@@ -144,6 +141,58 @@ def _to_scalar_image(frame, scale=None):
     scale = max(scale, 1e-6)
     image = (frame.clamp(0, scale) * (255.0 / scale)).to(dtype=torch.uint8).numpy()
     return Image.fromarray(image)
+
+
+def _frame_to_rgb_pil(frame):
+    if isinstance(frame, Image.Image):
+        return frame.convert("RGB")
+    if torch.is_tensor(frame):
+        tensor = frame.detach().cpu()
+        if tensor.ndim == 3 and tensor.shape[-1] == 3:
+            array = tensor.float().clamp(0, 1).mul(255).to(torch.uint8).numpy()
+        elif tensor.ndim == 3 and tensor.shape[0] == 3:
+            array = tensor.permute(1, 2, 0).float().clamp(0, 1).mul(255).to(torch.uint8).numpy()
+        elif tensor.ndim == 2:
+            gray = tensor.float().clamp(0, 1).mul(255).to(torch.uint8).numpy()
+            array = np.stack([gray] * 3, axis=-1)
+        else:
+            raise ValueError(f"Unsupported tensor frame shape: {tuple(tensor.shape)}")
+        return Image.fromarray(array).convert("RGB")
+
+    array = np.asarray(frame)
+    if array.ndim == 2:
+        array = np.stack([array] * 3, axis=-1)
+    if array.ndim == 3 and array.shape[2] == 1:
+        array = np.repeat(array, 3, axis=2)
+    if array.dtype != np.uint8:
+        array = np.clip(array, 0, 255 if array.max() > 1.0 else 1.0)
+        if array.max() <= 1.0:
+            array = (array * 255.0).astype(np.uint8)
+        else:
+            array = array.astype(np.uint8)
+    return Image.fromarray(array).convert("RGB")
+
+
+def _target_rgb_to_pil_frames(target_rgb):
+    return [_frame_to_rgb_pil(target_rgb[0, frame_idx]) for frame_idx in range(target_rgb.shape[1])]
+
+
+def _build_side_by_side_frames(left_frames, right_frames, gap=8, background=(10, 12, 16)):
+    if not left_frames or not right_frames:
+        raise ValueError("Both left and right frame sequences are required for comparison video.")
+
+    num_frames = max(len(left_frames), len(right_frames))
+    output_frames = []
+    for frame_idx in range(num_frames):
+        left = _frame_to_rgb_pil(left_frames[min(frame_idx, len(left_frames) - 1)])
+        right = _frame_to_rgb_pil(right_frames[min(frame_idx, len(right_frames) - 1)])
+        frame_height = max(left.height, right.height)
+        frame_width = left.width + gap + right.width
+        canvas = Image.new("RGB", (frame_width, frame_height), color=background)
+        canvas.paste(left, (0, (frame_height - left.height) // 2))
+        canvas.paste(right, (left.width + gap, (frame_height - right.height) // 2))
+        output_frames.append(canvas)
+    return output_frames
 
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
@@ -528,6 +577,525 @@ TIME_PRESET_DESCRIPTIONS = {
     "custom": "User-defined time control.",
 }
 
+TIME_CURVE_EDITOR_HTML = """
+<div class="neo-time-editor-shell">
+  <style>
+    .neo-time-editor-shell {
+      border: 1px solid var(--border-color-primary, rgba(15, 23, 42, 0.12));
+      border-radius: 14px;
+      background: var(--block-background-fill, rgba(255, 255, 255, 0.96));
+      padding: 12px;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.4);
+      font-family: inherit;
+    }
+    .neo-time-editor-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+    .neo-time-editor-help {
+      font-size: 12px;
+      line-height: 1.45;
+      color: var(--body-text-color-subdued, #667085);
+      margin: 0;
+      flex: 1 1 auto;
+    }
+    .neo-time-editor-badges {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      flex: 0 0 auto;
+    }
+    .neo-time-editor-badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 3px 9px;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.05);
+      color: var(--body-text-color, #1f2937);
+      font-size: 12px;
+      font-weight: 500;
+      white-space: nowrap;
+    }
+    .neo-time-editor-stage {
+      position: relative;
+      border-radius: 12px;
+      overflow: hidden;
+      background:
+        linear-gradient(180deg, rgba(15, 23, 42, 0.02), rgba(15, 23, 42, 0.01)),
+        var(--panel-background-fill, #f8fafc);
+      border: 1px solid rgba(15, 23, 42, 0.08);
+    }
+    .neo-time-editor-svg {
+      display: block;
+      width: 100%;
+      height: 260px;
+      touch-action: none;
+      cursor: crosshair;
+    }
+    .neo-time-editor-foot {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      margin-top: 8px;
+    }
+    .neo-time-editor-status {
+      font-size: 12px;
+      color: var(--body-text-color-subdued, #667085);
+      min-height: 18px;
+      flex: 1 1 auto;
+    }
+    .neo-time-editor-reset {
+      border: 1px solid rgba(15, 23, 42, 0.12);
+      border-radius: 10px;
+      padding: 7px 11px;
+      font-size: 12px;
+      font-weight: 500;
+      background: var(--button-secondary-background-fill, rgba(255, 255, 255, 0.92));
+      color: var(--body-text-color, #1f2937);
+      cursor: pointer;
+    }
+    .neo-time-editor-reset:hover {
+      background: rgba(15, 23, 42, 0.04);
+    }
+    @media (max-width: 760px) {
+      .neo-time-editor-head,
+      .neo-time-editor-foot {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+      .neo-time-editor-badges {
+        justify-content: flex-start;
+      }
+    }
+  </style>
+  <div class="neo-time-editor-head">
+    <p class="neo-time-editor-help">Drag points to retime. Double-click to add one. Right-click an inner point to delete it.</p>
+    <div class="neo-time-editor-badges">
+      <span class="neo-time-editor-badge" data-role="frames">frames 81</span>
+      <span class="neo-time-editor-badge" data-role="points">points 2</span>
+    </div>
+  </div>
+  <div class="neo-time-editor-stage">
+    <svg class="neo-time-editor-svg" preserveAspectRatio="none"></svg>
+  </div>
+  <div class="neo-time-editor-foot">
+    <div class="neo-time-editor-status" data-role="status">Linked to Time Keyframes JSON.</div>
+    <button type="button" class="neo-time-editor-reset" data-role="reset">Reload From JSON</button>
+  </div>
+</div>
+"""
+
+TIME_CURVE_EDITOR_JS = """
+const root = element.querySelector('.neo-time-editor-shell') || element;
+if (!root) {
+  return;
+}
+if (element.__neoTimeEditorBooted) {
+  return;
+}
+element.__neoTimeEditorBooted = true;
+const svg = root.querySelector('.neo-time-editor-svg');
+const statusNode = root.querySelector('[data-role="status"]');
+const framesBadge = root.querySelector('[data-role="frames"]');
+const pointsBadge = root.querySelector('[data-role="points"]');
+const resetButton = root.querySelector('[data-role="reset"]');
+const margin = { left: 18, right: 18, top: 16, bottom: 16 };
+const svgWidth = 720;
+const svgHeight = 260;
+const state = {
+  points: [],
+  numFrames: 81,
+  yMax: 80,
+  dragIndex: null,
+  hoverIndex: null,
+  lastText: null,
+  intervalId: null,
+  resizeObserver: null,
+};
+
+function clamp(value, minValue, maxValue) {
+  return Math.min(Math.max(value, minValue), maxValue);
+}
+
+function formatNumber(value) {
+  return Number.parseFloat(value.toFixed(2)).toString();
+}
+
+function setStatus(message) {
+  if (statusNode) {
+    statusNode.textContent = message;
+  }
+}
+
+function getTextarea() {
+  return document.querySelector('#time-keyframes-input textarea');
+}
+
+function setNativeValue(node, value) {
+  const prototype = node.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+  const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value');
+  if (descriptor && descriptor.set) {
+    descriptor.set.call(node, value);
+  } else {
+    node.value = value;
+  }
+}
+
+function parseTextareaValue(text) {
+  const trimmed = (text || '').trim();
+  if (!trimmed) {
+    return null;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (error) {
+    setStatus('Editor paused: invalid JSON in Time Keyframes.');
+    return null;
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    setStatus('Editor paused: expected a non-empty JSON list.');
+    return null;
+  }
+  const points = [];
+  for (const item of parsed) {
+    if (!item || typeof item !== 'object') {
+      continue;
+    }
+    const entries = Object.entries(item);
+    if (entries.length !== 1) {
+      continue;
+    }
+    const [frameKey, timeValue] = entries[0];
+    const frame = Number.parseInt(frameKey, 10);
+    const sourceTime = Number(timeValue);
+    if (!Number.isFinite(frame) || !Number.isFinite(sourceTime)) {
+      continue;
+    }
+    points.push({ frame, time: sourceTime });
+  }
+  if (points.length === 0) {
+    setStatus('Editor paused: no valid points were found.');
+    return null;
+  }
+  points.sort((a, b) => a.frame - b.frame);
+  const deduped = [];
+  for (const point of points) {
+    if (deduped.length && deduped[deduped.length - 1].frame === point.frame) {
+      deduped[deduped.length - 1] = point;
+    } else {
+      deduped.push(point);
+    }
+  }
+  const maxFrame = Math.max(1, deduped[deduped.length - 1].frame);
+  const yMax = Math.max(
+    1,
+    maxFrame,
+    ...deduped.map((point) => point.time),
+  );
+  return {
+    points: deduped,
+    numFrames: maxFrame + 1,
+    yMax,
+  };
+}
+
+function serializePoints(points) {
+  const payload = points.map((point) => ({
+    [String(point.frame)]: Number(point.time.toFixed(2)),
+  }));
+  return JSON.stringify(payload, null, 2);
+}
+
+function innerWidth() {
+  return svgWidth - margin.left - margin.right;
+}
+
+function innerHeight() {
+  return svgHeight - margin.top - margin.bottom;
+}
+
+function lastFrame() {
+  return Math.max(1, state.numFrames - 1);
+}
+
+function xToSvg(frame) {
+  return margin.left + (frame / lastFrame()) * innerWidth();
+}
+
+function yToSvg(sourceTime) {
+  return margin.top + (1 - sourceTime / state.yMax) * innerHeight();
+}
+
+function svgToPoint(clientX, clientY) {
+  const rect = svg.getBoundingClientRect();
+  const localX = clamp(clientX - rect.left, margin.left, rect.width - margin.right);
+  const localY = clamp(clientY - rect.top, margin.top, rect.height - margin.bottom);
+  const xNorm = clamp((localX - margin.left) / Math.max(1, rect.width - margin.left - margin.right), 0, 1);
+  const yNorm = clamp(1 - (localY - margin.top) / Math.max(1, rect.height - margin.top - margin.bottom), 0, 1);
+  return {
+    frame: xNorm * lastFrame(),
+    time: yNorm * state.yMax,
+  };
+}
+
+function findPointIndex(clientX, clientY) {
+  const rect = svg.getBoundingClientRect();
+  const localX = clientX - rect.left;
+  const localY = clientY - rect.top;
+  let bestIndex = -1;
+  let bestDistance = Infinity;
+  state.points.forEach((point, index) => {
+    const dx = localX - xToSvg(point.frame) * rect.width / svgWidth;
+    const dy = localY - yToSvg(point.time) * rect.height / svgHeight;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  });
+  return bestDistance <= 16 ? bestIndex : -1;
+}
+
+function syncToTextbox(triggerServer) {
+  const textarea = getTextarea();
+  if (!textarea) {
+    setStatus('Waiting for Time Keyframes JSON input.');
+    return;
+  }
+  const text = serializePoints(state.points);
+  if (textarea.value === text && state.lastText === text) {
+    return;
+  }
+  setNativeValue(textarea, text);
+  textarea.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+  if (triggerServer) {
+    textarea.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+  }
+  state.lastText = text;
+  setStatus('Curve updated from drag editor.');
+}
+
+function drawLine(x1, y1, x2, y2, color, width, dashArray) {
+  const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+  line.setAttribute('x1', x1);
+  line.setAttribute('y1', y1);
+  line.setAttribute('x2', x2);
+  line.setAttribute('y2', y2);
+  line.setAttribute('stroke', color);
+  line.setAttribute('stroke-width', width);
+  if (dashArray) {
+    line.setAttribute('stroke-dasharray', dashArray);
+  }
+  svg.appendChild(line);
+}
+
+function render() {
+  svg.setAttribute('viewBox', `0 0 ${svgWidth} ${svgHeight}`);
+  svg.innerHTML = '';
+  const background = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+  background.setAttribute('x', '0');
+  background.setAttribute('y', '0');
+  background.setAttribute('width', String(svgWidth));
+  background.setAttribute('height', String(svgHeight));
+  background.setAttribute('fill', 'rgba(248, 250, 252, 0.0)');
+  svg.appendChild(background);
+
+  for (let i = 0; i <= 4; i += 1) {
+    const x = margin.left + (i / 4) * innerWidth();
+    drawLine(x, margin.top, x, svgHeight - margin.bottom, 'rgba(148, 163, 184, 0.24)', 1, '4 6');
+  }
+  for (let i = 0; i <= 4; i += 1) {
+    const y = margin.top + (i / 4) * innerHeight();
+    drawLine(margin.left, y, svgWidth - margin.right, y, 'rgba(148, 163, 184, 0.18)', 1, '4 6');
+  }
+
+  const polyline = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+  polyline.setAttribute(
+    'points',
+    state.points.map((point) => `${xToSvg(point.frame)},${yToSvg(point.time)}`).join(' '),
+  );
+  polyline.setAttribute('fill', 'none');
+  polyline.setAttribute('stroke', '#d95f02');
+  polyline.setAttribute('stroke-width', '3');
+  polyline.setAttribute('stroke-linecap', 'round');
+  polyline.setAttribute('stroke-linejoin', 'round');
+  svg.appendChild(polyline);
+
+  state.points.forEach((point, index) => {
+    const x = xToSvg(point.frame);
+    const y = yToSvg(point.time);
+    const halo = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    halo.setAttribute('cx', x);
+    halo.setAttribute('cy', y);
+    halo.setAttribute('r', index === state.hoverIndex || index === state.dragIndex ? '10' : '8');
+    halo.setAttribute('fill', 'rgba(59, 130, 246, 0.16)');
+    svg.appendChild(halo);
+
+    const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    circle.setAttribute('cx', x);
+    circle.setAttribute('cy', y);
+    circle.setAttribute('r', '5');
+    circle.setAttribute('fill', index === 0 || index === state.points.length - 1 ? '#0f172a' : '#1d4ed8');
+    circle.setAttribute('stroke', '#ffffff');
+    circle.setAttribute('stroke-width', '2');
+    svg.appendChild(circle);
+  });
+
+  if (framesBadge) {
+    framesBadge.textContent = `frames ${state.numFrames}`;
+  }
+  if (pointsBadge) {
+    pointsBadge.textContent = `points ${state.points.length}`;
+  }
+  const activeIndex = state.dragIndex !== null ? state.dragIndex : state.hoverIndex;
+  if (activeIndex !== null && activeIndex >= 0 && activeIndex < state.points.length) {
+    const point = state.points[activeIndex];
+    setStatus(`frame ${point.frame} -> source ${formatNumber(point.time)} | double-click to add | right-click to delete`);
+  } else {
+    setStatus('Drag to retime. Double-click to add a point. Right-click an inner point to delete it.');
+  }
+}
+
+function loadFromTextarea(force) {
+  const textarea = getTextarea();
+  if (!textarea) {
+    setStatus('Waiting for Time Keyframes JSON input.');
+    return;
+  }
+  const text = textarea.value || '';
+  if (!force && text === state.lastText) {
+    return;
+  }
+  const parsed = parseTextareaValue(text);
+  if (!parsed) {
+    return;
+  }
+  state.points = parsed.points;
+  state.numFrames = parsed.numFrames;
+  state.yMax = parsed.yMax;
+  state.lastText = text;
+  render();
+}
+
+function updateDraggedPoint(clientX, clientY) {
+  if (state.dragIndex === null) {
+    return;
+  }
+  const candidate = svgToPoint(clientX, clientY);
+  const index = state.dragIndex;
+  let frame = Math.round(candidate.frame);
+  if (index === 0) {
+    frame = 0;
+  } else if (index === state.points.length - 1) {
+    frame = lastFrame();
+  } else {
+    const previousFrame = state.points[index - 1].frame + 1;
+    const nextFrame = state.points[index + 1].frame - 1;
+    frame = clamp(frame, previousFrame, nextFrame);
+  }
+  const time = Number(clamp(candidate.time, 0, state.yMax).toFixed(2));
+  state.points[index] = { frame, time };
+  render();
+}
+
+function addPoint(clientX, clientY) {
+  const candidate = svgToPoint(clientX, clientY);
+  const frame = Math.round(candidate.frame);
+  if (frame <= 0 || frame >= lastFrame()) {
+    return;
+  }
+  if (state.points.some((point) => point.frame === frame)) {
+    return;
+  }
+  state.points.push({
+    frame,
+    time: Number(clamp(candidate.time, 0, state.yMax).toFixed(2)),
+  });
+  state.points.sort((a, b) => a.frame - b.frame);
+  render();
+  syncToTextbox(true);
+}
+
+function removePoint(clientX, clientY) {
+  const index = findPointIndex(clientX, clientY);
+  if (index <= 0 || index >= state.points.length - 1) {
+    return;
+  }
+  state.points.splice(index, 1);
+  state.hoverIndex = null;
+  render();
+  syncToTextbox(true);
+}
+
+function handlePointerMove(event) {
+  if (state.dragIndex !== null) {
+    updateDraggedPoint(event.clientX, event.clientY);
+    return;
+  }
+  const nextHover = findPointIndex(event.clientX, event.clientY);
+  if (nextHover !== state.hoverIndex) {
+    state.hoverIndex = nextHover;
+    render();
+  }
+}
+
+function handlePointerUp(event) {
+  if (state.dragIndex !== null) {
+    updateDraggedPoint(event.clientX, event.clientY);
+    state.dragIndex = null;
+    syncToTextbox(true);
+  }
+}
+
+svg.addEventListener('pointerdown', (event) => {
+  const index = findPointIndex(event.clientX, event.clientY);
+  if (index === -1) {
+    return;
+  }
+  state.dragIndex = index;
+  state.hoverIndex = index;
+  svg.setPointerCapture(event.pointerId);
+  event.preventDefault();
+  render();
+});
+
+svg.addEventListener('pointermove', handlePointerMove);
+svg.addEventListener('pointerup', handlePointerUp);
+svg.addEventListener('pointercancel', handlePointerUp);
+svg.addEventListener('dblclick', (event) => {
+  event.preventDefault();
+  addPoint(event.clientX, event.clientY);
+});
+svg.addEventListener('contextmenu', (event) => {
+  const index = findPointIndex(event.clientX, event.clientY);
+  if (index > 0 && index < state.points.length - 1) {
+    event.preventDefault();
+    removePoint(event.clientX, event.clientY);
+  }
+});
+
+resetButton.addEventListener('click', () => {
+  loadFromTextarea(true);
+});
+
+state.intervalId = window.setInterval(() => {
+  loadFromTextarea(false);
+}, 250);
+
+if (window.ResizeObserver) {
+  state.resizeObserver = new ResizeObserver(() => render());
+  state.resizeObserver.observe(root);
+}
+
+loadFromTextarea(true);
+"""
+
 
 def _get_num_frames_from_state(state, fallback=DEFAULT_TRAJECTORY_FRAMES):
     if state is None:
@@ -756,29 +1324,12 @@ def _build_time_curve_summary(time_curve):
     )
 
 
-def _build_time_curve_plot(time_curve, time_keyframes=None):
-    curve = np.asarray(time_curve, dtype=np.float32)
-    fig, ax = plt.subplots(figsize=(5.8, 2.6), dpi=140)
-    frames = np.arange(curve.size, dtype=np.float32)
-    ax.plot(frames, curve, color="#d95f02", linewidth=2.0)
-    if time_keyframes:
-        keyframe_x = [next(iter(item.keys())) for item in time_keyframes]
-        keyframe_y = [next(iter(item.values())) for item in time_keyframes]
-        ax.scatter(keyframe_x, keyframe_y, color="#1f6f78", s=24, zorder=3)
-    ax.set_title("Absolute Source Time Curve")
-    ax.set_xlabel("Output Frame")
-    ax.set_ylabel("Source Time")
-    ax.grid(True, alpha=0.25, linestyle="--")
-    fig.tight_layout()
-    return fig
-
-
 def _build_time_controls(num_frames, time_keyframes=None, preset="linear"):
     keyframes = time_keyframes or _build_time_preset_keyframes(preset, num_frames)
     time_curve = CameraTrajectory._build_time_curve_from_keyframes(keyframes, num_frames)
     description = TIME_PRESET_DESCRIPTIONS.get(preset, TIME_PRESET_DESCRIPTIONS["custom"])
     summary = f"preset={preset} | {description} | {_build_time_curve_summary(time_curve)}"
-    return preset, _time_keyframes_to_text(keyframes), summary, _build_time_curve_plot(time_curve, keyframes)
+    return preset, _time_keyframes_to_text(keyframes), summary
 
 
 def _build_time_controls_from_json(data, fallback_num_frames=DEFAULT_TRAJECTORY_FRAMES):
@@ -794,10 +1345,12 @@ def _apply_time_preset(state, time_preset, current_text):
     if time_preset == "custom":
         if (current_text or "").strip():
             keyframes = _parse_time_keyframes_text(current_text, num_frames)
-            return "custom", *_build_time_controls(num_frames, keyframes, preset="custom")[1:]
+            _, time_text, time_summary = _build_time_controls(num_frames, keyframes, preset="custom")
+            return "custom", time_text, time_summary
         time_preset = "linear"
     keyframes = _build_time_preset_keyframes(time_preset, num_frames)
-    return time_preset, *_build_time_controls(num_frames, keyframes, preset=time_preset)[1:]
+    _, time_text, time_summary = _build_time_controls(num_frames, keyframes, preset=time_preset)
+    return time_preset, time_text, time_summary
 
 
 def _refresh_time_controls(state, time_keyframes_text):
@@ -805,7 +1358,8 @@ def _refresh_time_controls(state, time_keyframes_text):
     if (time_keyframes_text or "").strip() == "":
         return _apply_time_preset(state, "linear", "")
     keyframes = _parse_time_keyframes_text(time_keyframes_text, num_frames)
-    return "custom", *_build_time_controls(num_frames, keyframes, preset="custom")[1:]
+    _, time_text, time_summary = _build_time_controls(num_frames, keyframes, preset="custom")
+    return "custom", time_text, time_summary
 
 
 def _resolve_time_payload(num_frames, time_preset, time_keyframes_text):
@@ -913,14 +1467,14 @@ def upload_trajectory(state, t_file):
 def handle_traj_upload(t_file):
     """Parse uploaded trajectory JSON and extract shared parameters."""
     if t_file is None:
-        return (gr.update(),) * 7
+        return (gr.update(),) * 6
     with open(t_file, "r") as f:
         data = json.load(f)
     mode = data.get("mode", "relative")
     zoom_ratio = data.get("zoom_ratio", 1.0)
     use_first_frame = data.get("use_first_frame", True)
-    time_preset, time_text, time_summary, time_plot = _build_time_controls_from_json(data)
-    return mode, zoom_ratio, use_first_frame, time_preset, time_text, time_summary, time_plot
+    time_preset, time_text, time_summary = _build_time_controls_from_json(data)
+    return mode, zoom_ratio, use_first_frame, time_preset, time_text, time_summary
 
 
 # ---------------------------------------------------------------------------
@@ -1046,7 +1600,7 @@ def preview(state, selected_tab, t_file, t_type, angle, distance, orbit_r,
 
     save_video(frames, PREVIEW_PATH, fps=16)
     save_video(mask_frames, MASK_PATH, fps=16)
-    return state, glb_path, PREVIEW_PATH, MASK_PATH, gr.update(interactive=True), JSON_PATH
+    return state, glb_path, PREVIEW_PATH, MASK_PATH, gr.update(interactive=True), JSON_PATH, gr.update(value=None)
 
 
 # ---------------------------------------------------------------------------
@@ -1145,9 +1699,14 @@ def generate_final(state, prompt, negative_prompt, seed):
     )
 
     save_video(generated_frames, OUTPUT_PATH, fps=16)
+    comparison_frames = _build_side_by_side_frames(
+        _target_rgb_to_pil_frames(state["target_rgb"]),
+        generated_frames,
+    )
+    save_video(comparison_frames, COMPARE_PATH, fps=16)
     gc.collect()
     torch.cuda.empty_cache()
-    return OUTPUT_PATH
+    return OUTPUT_PATH, COMPARE_PATH
 
 
 # ---------------------------------------------------------------------------
@@ -1157,7 +1716,7 @@ def generate_final(state, prompt, negative_prompt, seed):
 VALID_TYPES = sorted(CameraTrajectory.VALID_TRAJECTORY_TYPES)
 TAB_CAMERA_PARAMS = "tab_camera_params"
 TAB_TRAJ_FILE = "tab_traj_file"
-DEFAULT_TIME_PRESET, DEFAULT_TIME_TEXT, DEFAULT_TIME_SUMMARY, DEFAULT_TIME_PLOT = _build_time_controls(
+DEFAULT_TIME_PRESET, DEFAULT_TIME_TEXT, DEFAULT_TIME_SUMMARY = _build_time_controls(
     DEFAULT_TRAJECTORY_FRAMES,
     preset="linear",
 )
@@ -1306,22 +1865,27 @@ with gr.Blocks(title="NeoVerse Interactive Demo") as demo:
                         choices=TIME_PRESETS,
                         value=DEFAULT_TIME_PRESET,
                         label="Time Preset",
+                        elem_id="time-preset-input",
                     )
                     time_apply_btn = gr.Button("Apply Preset", variant="secondary")
+                time_curve_editor = gr.HTML(
+                    value=TIME_CURVE_EDITOR_HTML,
+                    js_on_load=TIME_CURVE_EDITOR_JS,
+                    container=False,
+                    elem_id="time-curve-editor",
+                )
                 time_keyframes_input = gr.Textbox(
                     value=DEFAULT_TIME_TEXT,
                     label="Time Keyframes JSON",
                     lines=8,
                     placeholder='[\n  {"0": 0.0},\n  {"40": 10.0},\n  {"80": 80.0}\n]',
+                    elem_id="time-keyframes-input",
                 )
                 time_summary_output = gr.Textbox(
                     value=DEFAULT_TIME_SUMMARY,
                     label="Time Summary",
                     interactive=False,
-                )
-                time_plot = gr.Plot(
-                    value=DEFAULT_TIME_PLOT,
-                    label="Time Curve",
+                    elem_id="time-summary-output",
                 )
             traj_download = gr.File(
                 label="Download Trajectory JSON",
@@ -1340,6 +1904,7 @@ with gr.Blocks(title="NeoVerse Interactive Demo") as demo:
             neg_prompt = gr.Textbox(label="Negative Prompt", value="")
             seed = gr.Number(label="Seed", value=42, precision=0)
             output_video = gr.Video(label="Generated Video")
+            compare_video = gr.Video(label="Render vs Generated", height=300)
             generate_btn = gr.Button("Generate", variant="primary", interactive=False)
 
     # ================================================================
@@ -1394,9 +1959,9 @@ with gr.Blocks(title="NeoVerse Interactive Demo") as demo:
             if traj_file and os.path.exists(traj_file):
                 with open(traj_file, "r") as f:
                     traj_data = json.load(f)
-                time_preset, time_text, time_summary, time_plot_value = _build_time_controls_from_json(traj_data)
+                time_preset, time_text, time_summary = _build_time_controls_from_json(traj_data)
             else:
-                time_preset, time_text, time_summary, time_plot_value = _build_time_controls(
+                time_preset, time_text, time_summary = _build_time_controls(
                     DEFAULT_TRAJECTORY_FRAMES,
                     preset="linear",
                 )
@@ -1421,8 +1986,7 @@ with gr.Blocks(title="NeoVerse Interactive Demo") as demo:
                     tab_id,
                     time_preset,
                     time_text,
-                    time_summary,
-                    time_plot_value)
+                    time_summary)
 
         example_gallery.select(
             fn=_load_example,
@@ -1433,7 +1997,7 @@ with gr.Blocks(title="NeoVerse Interactive Demo") as demo:
                      traj_mode, zoom_ratio_input, alpha_threshold_input,
                      use_first_frame_input, traj_upload, traj_tabs,
                      selected_tab_state, time_preset_input, time_keyframes_input,
-                     time_summary_output, time_plot],
+                     time_summary_output],
         ).then(
             fn=reconstruct,
             inputs=[app_state],
@@ -1454,7 +2018,7 @@ with gr.Blocks(title="NeoVerse Interactive Demo") as demo:
                 traj_mode, zoom_ratio_input, use_first_frame_input,
                 alpha_threshold_input, time_preset_input, time_keyframes_input],
         outputs=[app_state, model3d,
-                 preview_video, mask_video, generate_btn, traj_download],
+                 preview_video, mask_video, generate_btn, traj_download, compare_video],
     )
 
     # Sync shared params from uploaded trajectory JSON
@@ -1468,27 +2032,26 @@ with gr.Blocks(title="NeoVerse Interactive Demo") as demo:
             time_preset_input,
             time_keyframes_input,
             time_summary_output,
-            time_plot,
         ],
     )
 
     time_apply_btn.click(
         fn=_apply_time_preset,
         inputs=[app_state, time_preset_input, time_keyframes_input],
-        outputs=[time_preset_input, time_keyframes_input, time_summary_output, time_plot],
+        outputs=[time_preset_input, time_keyframes_input, time_summary_output],
     )
 
     time_keyframes_input.change(
         fn=_refresh_time_controls,
         inputs=[app_state, time_keyframes_input],
-        outputs=[time_preset_input, time_keyframes_input, time_summary_output, time_plot],
+        outputs=[time_preset_input, time_keyframes_input, time_summary_output],
     )
 
     # Generate
     generate_btn.click(
         fn=generate_final,
         inputs=[app_state, prompt, neg_prompt, seed],
-        outputs=[output_video],
+        outputs=[output_video, compare_video],
     )
 
     viewer_btn.click(
