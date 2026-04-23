@@ -204,6 +204,9 @@ class CameraTrajectory:
         name: Human-readable name
         zoom_ratio: Zoom factor (1.0 = no zoom)
         use_first_frame: Whether to use the first frame as reference
+        time_curve: Dense per-frame source timestamps [N]
+        time_control_mode: Timestamp interpretation mode
+        time_clamp: Out-of-range handling mode
     """
 
     VALID_TRAJECTORY_TYPES = {
@@ -212,17 +215,44 @@ class CameraTrajectory:
         "boom_up", "boom_down", "orbit_left", "orbit_right",
         "static",
     }
+    VALID_TIME_CONTROL_MODES = {"absolute_source_time"}
+    VALID_TIME_CLAMPS = {"clamp"}
 
-    def __init__(self, c2w, mode="relative", name="trajectory", zoom_ratio=1.0, use_first_frame=False):
+    def __init__(
+        self,
+        c2w,
+        mode="relative",
+        name="trajectory",
+        zoom_ratio=1.0,
+        use_first_frame=False,
+        time_curve=None,
+        time_control_mode="absolute_source_time",
+        time_clamp="clamp",
+    ):
         if isinstance(c2w, np.ndarray):
             c2w = torch.from_numpy(c2w)
         assert c2w.ndim == 3 and c2w.shape[1:] == (4, 4), f"c2w must be [N, 4, 4], got {c2w.shape}"
         assert mode in ("relative", "global"), f"mode must be 'relative' or 'global', got '{mode}'"
+        assert time_control_mode in self.VALID_TIME_CONTROL_MODES, (
+            f"time_control_mode must be one of {sorted(self.VALID_TIME_CONTROL_MODES)}, "
+            f"got '{time_control_mode}'"
+        )
+        assert time_clamp in self.VALID_TIME_CLAMPS, (
+            f"time_clamp must be one of {sorted(self.VALID_TIME_CLAMPS)}, got '{time_clamp}'"
+        )
         self.c2w = c2w.float()
         self.mode = mode
         self.name = name
         self.zoom_ratio = zoom_ratio
         self.use_first_frame = use_first_frame
+        num_frames = self.c2w.shape[0]
+        if time_curve is None:
+            time_curve = self._default_time_curve(num_frames)
+        else:
+            time_curve = self._normalize_time_curve(time_curve, num_frames)
+        self.time_curve = torch.as_tensor(time_curve, dtype=torch.float32)
+        self.time_control_mode = time_control_mode
+        self.time_clamp = time_clamp
 
     @classmethod
     def from_predefined(cls, trajectory_type, num_frames=81, mode="relative",
@@ -260,10 +290,28 @@ class CameraTrajectory:
             {num_frames - 1: [{trajectory_type: params}]},
         ]
         cameras = cls._compose_keyframes(keyframes, num_frames)
-        return cls(torch.from_numpy(cameras), mode=mode, name=trajectory_type, zoom_ratio=zoom_ratio, use_first_frame=True)
+        return cls(
+            torch.from_numpy(cameras),
+            mode=mode,
+            name=trajectory_type,
+            zoom_ratio=zoom_ratio,
+            use_first_frame=True,
+            time_curve=cls._default_time_curve(num_frames),
+        )
 
     @classmethod
-    def from_keyframes(cls, keyframes, num_frames=81, mode="relative", name="keyframes", zoom_ratio=1.0, use_first_frame=False):
+    def from_keyframes(
+        cls,
+        keyframes,
+        num_frames=81,
+        mode="relative",
+        name="keyframes",
+        zoom_ratio=1.0,
+        use_first_frame=False,
+        time_curve=None,
+        time_control_mode="absolute_source_time",
+        time_clamp="clamp",
+    ):
         """Create from programmatic keyframe list.
 
         Args:
@@ -276,7 +324,16 @@ class CameraTrajectory:
             use_first_frame: Whether to use the first frame as a reference.
         """
         cameras = cls._compose_keyframes(keyframes, num_frames)
-        return cls(torch.from_numpy(cameras), mode=mode, name=name, zoom_ratio=zoom_ratio, use_first_frame=use_first_frame)
+        return cls(
+            torch.from_numpy(cameras),
+            mode=mode,
+            name=name,
+            zoom_ratio=zoom_ratio,
+            use_first_frame=use_first_frame,
+            time_curve=time_curve,
+            time_control_mode=time_control_mode,
+            time_clamp=time_clamp,
+        )
 
     @classmethod
     def from_json(cls, filepath):
@@ -287,6 +344,14 @@ class CameraTrajectory:
         name = data.get("name", os.path.splitext(os.path.basename(filepath))[0])
         zoom_ratio = data.get("zoom_ratio", 1.0)
         use_first_frame = data.get("use_first_frame", False)
+        time_control_mode = data.get("time_control_mode", "absolute_source_time")
+        time_clamp = data.get("time_clamp", "clamp")
+        if "time_curve" in data:
+            time_curve = cls._normalize_time_curve(data["time_curve"], num_frames)
+        elif "time_keyframes" in data:
+            time_curve = cls._build_time_curve_from_keyframes(data["time_keyframes"], num_frames)
+        else:
+            time_curve = cls._default_time_curve(num_frames)
         if "keyframes" in data:
             keyframes_list = []
             for kf in data["keyframes"]:
@@ -306,7 +371,16 @@ class CameraTrajectory:
                 frame_matrices = traj["frame_matrices"]
             cameras = cls._interpolate_sparse_matrices(frame_indices, frame_matrices, num_frames)
 
-        return cls(torch.from_numpy(cameras), mode=mode, name=name, zoom_ratio=zoom_ratio, use_first_frame=use_first_frame)
+        return cls(
+            torch.from_numpy(cameras),
+            mode=mode,
+            name=name,
+            zoom_ratio=zoom_ratio,
+            use_first_frame=use_first_frame,
+            time_curve=time_curve,
+            time_control_mode=time_control_mode,
+            time_clamp=time_clamp,
+        )
 
     def __len__(self):
         return self.c2w.shape[0]
@@ -332,8 +406,97 @@ class CameraTrajectory:
             CameraTrajectory._validate_matrix_format(data)
         else:
             raise ValueError("Must contain either 'keyframes' or 'trajectory' field")
+        CameraTrajectory._validate_time_format(data)
 
         return data
+
+    @staticmethod
+    def _default_time_curve(num_frames):
+        return np.linspace(0, max(num_frames - 1, 0), num_frames, dtype=np.float32)
+
+    @staticmethod
+    def _normalize_time_curve(time_curve, num_frames):
+        curve = np.asarray(time_curve, dtype=np.float32)
+        if curve.ndim != 1:
+            raise ValueError("time_curve must be a 1D list of numeric timestamps")
+        if curve.shape[0] != num_frames:
+            raise ValueError(f"time_curve length must match num_frames ({num_frames}), got {curve.shape[0]}")
+        return curve
+
+    @staticmethod
+    def _normalize_time_keyframes(time_keyframes, num_frames):
+        min_keyframes = 1 if num_frames <= 1 else 2
+        if not isinstance(time_keyframes, list) or len(time_keyframes) < min_keyframes:
+            raise ValueError(f"time_keyframes must be a list with at least {min_keyframes} keyframes")
+
+        normalized = []
+        frame_indices = []
+        for i, keyframe in enumerate(time_keyframes):
+            if isinstance(keyframe, dict) and len(keyframe) == 1:
+                frame_key, time_value = next(iter(keyframe.items()))
+            elif isinstance(keyframe, dict) and {"frame", "time"} <= set(keyframe.keys()):
+                frame_key = keyframe["frame"]
+                time_value = keyframe["time"]
+            else:
+                raise ValueError(
+                    f"time_keyframes[{i}] must be a single-key dict {{frame_index: source_time}} "
+                    "or a dict with 'frame' and 'time'"
+                )
+
+            try:
+                frame_index = int(frame_key)
+            except (TypeError, ValueError):
+                raise ValueError(f"time_keyframes[{i}] frame index must be an integer, got '{frame_key}'")
+            if frame_index < 0 or frame_index >= num_frames:
+                raise ValueError(
+                    f"time_keyframes[{i}] frame index must be >= 0 and < {num_frames}, got {frame_index}"
+                )
+            if not isinstance(time_value, (int, float)):
+                raise ValueError(f"time_keyframes[{i}] time value must be numeric, got {type(time_value).__name__}")
+
+            frame_indices.append(frame_index)
+            normalized.append({frame_index: float(time_value)})
+
+        if frame_indices != sorted(frame_indices):
+            raise ValueError("time_keyframes frame indices must be in ascending order")
+        if len(set(frame_indices)) != len(frame_indices):
+            raise ValueError("time_keyframes frame indices must be unique")
+        if frame_indices[0] != 0:
+            raise ValueError("First time_keyframe frame index must be 0")
+        if frame_indices[-1] != max(num_frames - 1, 0):
+            raise ValueError(f"Last time_keyframe frame index must be {num_frames - 1}")
+        return normalized
+
+    @staticmethod
+    def _build_time_curve_from_keyframes(time_keyframes, num_frames):
+        normalized = CameraTrajectory._normalize_time_keyframes(time_keyframes, num_frames)
+        if num_frames == 1:
+            only_time = float(next(iter(normalized[0].values())))
+            return np.asarray([only_time], dtype=np.float32)
+
+        frame_indices = np.asarray([next(iter(item.keys())) for item in normalized], dtype=np.float32)
+        source_times = np.asarray([next(iter(item.values())) for item in normalized], dtype=np.float32)
+        dense_indices = np.arange(num_frames, dtype=np.float32)
+        return np.interp(dense_indices, frame_indices, source_times).astype(np.float32)
+
+    @staticmethod
+    def _validate_time_format(data):
+        num_frames = data.get("num_frames", 81)
+        time_control_mode = data.get("time_control_mode", "absolute_source_time")
+        time_clamp = data.get("time_clamp", "clamp")
+        if time_control_mode not in CameraTrajectory.VALID_TIME_CONTROL_MODES:
+            raise ValueError(
+                f"time_control_mode must be one of {sorted(CameraTrajectory.VALID_TIME_CONTROL_MODES)}, "
+                f"got '{time_control_mode}'"
+            )
+        if time_clamp not in CameraTrajectory.VALID_TIME_CLAMPS:
+            raise ValueError(
+                f"time_clamp must be one of {sorted(CameraTrajectory.VALID_TIME_CLAMPS)}, got '{time_clamp}'"
+            )
+        if "time_curve" in data:
+            CameraTrajectory._normalize_time_curve(data["time_curve"], num_frames)
+        if "time_keyframes" in data:
+            CameraTrajectory._normalize_time_keyframes(data["time_keyframes"], num_frames)
 
     @staticmethod
     def _get_camera_matrix(trajectory_type, distance=0.1, orbit_radius=0.5, angle=30):

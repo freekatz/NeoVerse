@@ -266,11 +266,106 @@ These fields are shared across all JSON-based methods (2, 3, and 4):
 | `num_frames` | integer | 81 | Number of output frames |
 | `zoom_ratio` | float | 1.0 | Zoom factor (1.0 = no zoom) |
 | `use_first_frame` | boolean | false | When the target trajectory starts from the same viewpoint as the first input frame, replace the rendered first frame with the original input frame for better quality |
+| `time_control_mode` | string | `"absolute_source_time"` | Interpret time control values as absolute source timestamps |
+| `time_clamp` | string | `"clamp"` | Clamp out-of-range timestamps to the first / last reconstructed source timestamp |
 
 ### Mode
 
 - **`"relative"`** (default): Trajectory transformations are applied relative to the original camera motion: `T_target = T_original × T_trajectory`. Recommended for most use cases.
 - **`"global"`**: Trajectory is used as-is in world coordinates: `T_target = T_trajectory`. Useful for precise positioning.
+
+## Time Trajectory
+
+JSON trajectories can optionally control which reconstructed source time is rendered at each output frame. This is useful for speed-up, slow motion, reverse playback, and bullet-time style holds.
+
+The Gradio demo also ships with several built-in time presets for quick iteration:
+
+- `linear`: uniform playback
+- `ease_in`: slow start, fast finish
+- `ease_out`: fast start, gentle landing
+- `ease_in_out`: slow-fast-slow
+- `fast_forward`: reach the end early and hold
+- `hyperlapse`: more aggressive fast-forward
+- `slow_motion`: traverse only part of the source clip
+- `freeze_start`: hold the opening moment, then move
+- `freeze_end`: rush forward and freeze on the ending frame
+- `reverse`: reverse playback
+- `reverse_bullet`: reverse with a held middle moment
+- `bullet_time`: forward playback with a held middle moment
+- `boomerang`: go to the end, then return
+- `yo_yo`: forward, pull back part-way, then finish forward
+- `stutter`: bursty forward motion with temporal holds
+- `time_warp`: fast jump, rewind pocket, then recover
+
+### Dense Time Curve
+
+```json
+{
+  "name": "reverse_orbit",
+  "mode": "relative",
+  "num_frames": 5,
+  "keyframes": [
+    {"0": [{"static": {}}]},
+    {"4": [{"orbit_left": {"angle": 15, "orbit_radius": 1.0}}]}
+  ],
+  "time_control_mode": "absolute_source_time",
+  "time_clamp": "clamp",
+  "time_curve": [4.0, 3.0, 2.0, 1.0, 0.0]
+}
+```
+
+- `time_curve` must be a numeric list of length `num_frames`.
+- Each entry is the absolute source timestamp to render for that output frame.
+- If both `time_curve` and `time_keyframes` are present, `time_curve` takes priority.
+
+### Sparse Time Keyframes
+
+```json
+{
+  "name": "bullet_time_orbit",
+  "mode": "relative",
+  "num_frames": 81,
+  "keyframes": [
+    {"0": [{"static": {}}]},
+    {"80": [{"orbit_left": {"angle": 15, "orbit_radius": 1.0}}]}
+  ],
+  "time_control_mode": "absolute_source_time",
+  "time_clamp": "clamp",
+  "time_keyframes": [
+    {"0": 0.0},
+    {"20": 10.0},
+    {"40": 10.0},
+    {"80": 80.0}
+  ]
+}
+```
+
+- `time_keyframes` must be a list of single-key dicts `{output_frame: source_time}`.
+- Frame indices must be ascending.
+- The first key must be `0`.
+- The last key must be `num_frames - 1`.
+- Source times are interpolated linearly between keyframes.
+
+### Example Patterns
+
+Reverse playback:
+
+```json
+"time_keyframes": [
+  {"0": 80.0},
+  {"80": 0.0}
+]
+```
+
+Fast forward then hold:
+
+```json
+"time_keyframes": [
+  {"0": 0.0},
+  {"28": 80.0},
+  {"80": 80.0}
+]
+```
 
 ## Validation
 
@@ -289,6 +384,8 @@ Output includes format type, entry count, and mode. Common validation errors:
 - **Unknown operation type** — must be one of the 13 valid types
 - **Invalid matrix dimensions** — each matrix must be exactly 4x4 with numeric values
 - **Mismatched lengths** — `frame_indices` and `frame_matrices` must have the same length
+- **Invalid time curve** — `time_curve` must be numeric and match `num_frames`
+- **Bad time keyframes** — `time_keyframes` must be ascending, first=0, last=num_frames-1
 
 ## Examples
 

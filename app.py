@@ -5,6 +5,7 @@ import json
 import os
 import threading
 import time
+import matplotlib
 import torch
 import numpy as np
 import uvicorn
@@ -12,7 +13,10 @@ import uvicorn
 for proxy_env in ("ALL_PROXY", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
     os.environ.pop(proxy_env, None)
 
+matplotlib.use("Agg")
+
 import gradio as gr
+import matplotlib.pyplot as plt
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from PIL import Image
@@ -481,17 +485,402 @@ def reconstruct(state):
 
 
 # ---------------------------------------------------------------------------
+# 3. Time trajectory helpers
+# ---------------------------------------------------------------------------
+DEFAULT_TRAJECTORY_FRAMES = 81
+TIME_PRESETS = [
+    "linear",
+    "ease_in",
+    "ease_out",
+    "ease_in_out",
+    "fast_forward",
+    "hyperlapse",
+    "slow_motion",
+    "freeze_start",
+    "freeze_end",
+    "reverse",
+    "reverse_bullet",
+    "bullet_time",
+    "boomerang",
+    "yo_yo",
+    "stutter",
+    "time_warp",
+    "custom",
+]
+
+TIME_PRESET_DESCRIPTIONS = {
+    "linear": "Uniform playback speed.",
+    "ease_in": "Starts cautiously and accelerates into the shot.",
+    "ease_out": "Hits hard early and gently settles at the end.",
+    "ease_in_out": "Slow-fast-slow cinematic timing.",
+    "fast_forward": "Reach the end early, then hold.",
+    "hyperlapse": "Very aggressive rush to the end frame.",
+    "slow_motion": "Only traverses part of the source clip by the end.",
+    "freeze_start": "Hold the opening moment, then launch forward.",
+    "freeze_end": "Rush through the scene and land on the ending frame.",
+    "reverse": "Play the source clip backward.",
+    "reverse_bullet": "Reverse playback with a held middle moment.",
+    "bullet_time": "Move, freeze on a moment, then continue.",
+    "boomerang": "Go to the end, then return to the start.",
+    "yo_yo": "Forward, snap part-way back, then surge forward again.",
+    "stutter": "Advance in bursts with repeated temporal holds.",
+    "time_warp": "Fast jump, rewind pocket, then recover to the end.",
+    "custom": "User-defined time control.",
+}
+
+
+def _get_num_frames_from_state(state, fallback=DEFAULT_TRAJECTORY_FRAMES):
+    if state is None:
+        return fallback
+    if "input_timestamps" in state:
+        return int(state["input_timestamps"].shape[0])
+    if "input_cam2world" in state:
+        return int(state["input_cam2world"].shape[0])
+    if "target_rgb" in state:
+        return int(state["target_rgb"].shape[1])
+    return fallback
+
+
+def _time_keyframes_to_text(time_keyframes):
+    return json.dumps(time_keyframes, indent=2)
+
+
+def _dense_curve_to_time_keyframes(time_curve):
+    curve = np.asarray(time_curve, dtype=np.float32)
+    if curve.size == 0:
+        return []
+    if curve.size == 1:
+        return [{0: float(curve[0])}]
+
+    frame_indices = [0]
+    previous_delta = float(curve[1] - curve[0])
+    for idx in range(1, curve.size - 1):
+        delta = float(curve[idx + 1] - curve[idx])
+        if not np.isclose(delta, previous_delta, atol=1e-4, rtol=1e-4):
+            frame_indices.append(idx)
+        previous_delta = delta
+    frame_indices.append(curve.size - 1)
+    frame_indices = sorted(set(frame_indices))
+    return [{int(idx): float(curve[idx])} for idx in frame_indices]
+
+
+def _pairs_to_time_keyframes(pairs, num_frames):
+    last_idx = max(num_frames - 1, 0)
+    time_keyframes = []
+    for frame_idx, time_value in pairs:
+        clamped_idx = int(np.clip(frame_idx, 0, last_idx))
+        time_keyframes.append({clamped_idx: float(time_value)})
+
+    if num_frames > 1:
+        normalized = {}
+        for keyframe in time_keyframes:
+            frame_idx, time_value = next(iter(keyframe.items()))
+            normalized[frame_idx] = time_value
+        if 0 not in normalized:
+            normalized[0] = 0.0
+        if last_idx not in normalized:
+            normalized[last_idx] = float(last_idx)
+        time_keyframes = [{frame_idx: normalized[frame_idx]} for frame_idx in sorted(normalized.keys())]
+    return CameraTrajectory._normalize_time_keyframes(time_keyframes, num_frames)
+
+
+def _fractional_pairs_to_time_keyframes(pairs, num_frames):
+    last_idx = max(num_frames - 1, 0)
+    last_time = float(last_idx)
+    scaled_pairs = [
+        (int(round(frame_ratio * last_idx)), float(time_ratio * last_time))
+        for frame_ratio, time_ratio in pairs
+    ]
+    return _pairs_to_time_keyframes(scaled_pairs, num_frames)
+
+
+def _build_time_preset_keyframes(preset, num_frames):
+    preset_pairs = {
+        "linear": [
+            (0.0, 0.0),
+            (1.0, 1.0),
+        ],
+        "ease_in": [
+            (0.0, 0.0),
+            (0.14, 0.03),
+            (0.3, 0.12),
+            (0.48, 0.3),
+            (0.68, 0.56),
+            (0.84, 0.8),
+            (1.0, 1.0),
+        ],
+        "ease_out": [
+            (0.0, 0.0),
+            (0.16, 0.2),
+            (0.32, 0.44),
+            (0.52, 0.7),
+            (0.7, 0.88),
+            (0.86, 0.97),
+            (1.0, 1.0),
+        ],
+        "ease_in_out": [
+            (0.0, 0.0),
+            (0.16, 0.05),
+            (0.32, 0.18),
+            (0.5, 0.5),
+            (0.68, 0.82),
+            (0.84, 0.95),
+            (1.0, 1.0),
+        ],
+        "fast_forward": [
+            (0.0, 0.0),
+            (0.35, 1.0),
+            (1.0, 1.0),
+        ],
+        "hyperlapse": [
+            (0.0, 0.0),
+            (0.12, 0.48),
+            (0.24, 0.8),
+            (0.36, 1.0),
+            (1.0, 1.0),
+        ],
+        "slow_motion": [
+            (0.0, 0.0),
+            (1.0, 0.45),
+        ],
+        "freeze_start": [
+            (0.0, 0.0),
+            (0.22, 0.0),
+            (0.46, 0.24),
+            (0.7, 0.68),
+            (1.0, 1.0),
+        ],
+        "freeze_end": [
+            (0.0, 0.0),
+            (0.18, 0.34),
+            (0.42, 0.72),
+            (0.68, 1.0),
+            (1.0, 1.0),
+        ],
+        "reverse": [
+            (0.0, 1.0),
+            (1.0, 0.0),
+        ],
+        "reverse_bullet": [
+            (0.0, 1.0),
+            (0.28, 0.5),
+            (0.72, 0.5),
+            (1.0, 0.0),
+        ],
+        "bullet_time": [
+            (0.0, 0.0),
+            (0.28, 0.5),
+            (0.72, 0.5),
+            (1.0, 1.0),
+        ],
+        "boomerang": [
+            (0.0, 0.0),
+            (0.5, 1.0),
+            (1.0, 0.0),
+        ],
+        "yo_yo": [
+            (0.0, 0.0),
+            (0.34, 1.0),
+            (0.66, 0.18),
+            (1.0, 1.0),
+        ],
+        "stutter": [
+            (0.0, 0.0),
+            (0.12, 0.12),
+            (0.18, 0.12),
+            (0.34, 0.38),
+            (0.42, 0.38),
+            (0.6, 0.66),
+            (0.7, 0.66),
+            (0.86, 0.92),
+            (1.0, 1.0),
+        ],
+        "time_warp": [
+            (0.0, 0.0),
+            (0.16, 0.34),
+            (0.28, 0.82),
+            (0.42, 0.54),
+            (0.62, 0.72),
+            (0.8, 0.96),
+            (1.0, 1.0),
+        ],
+    }
+    return _fractional_pairs_to_time_keyframes(preset_pairs.get(preset, preset_pairs["linear"]), num_frames)
+
+
+def _parse_time_keyframes_text(time_keyframes_text, num_frames):
+    raw_text = (time_keyframes_text or "").strip()
+    if raw_text == "":
+        return _build_time_preset_keyframes("linear", num_frames)
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise gr.Error(f"Invalid time keyframes JSON: {exc}") from exc
+    try:
+        return CameraTrajectory._normalize_time_keyframes(parsed, num_frames)
+    except ValueError as exc:
+        raise gr.Error(str(exc)) from exc
+
+
+def _extract_time_keyframes_from_data(data, num_frames):
+    if "time_keyframes" in data:
+        return CameraTrajectory._normalize_time_keyframes(data["time_keyframes"], num_frames)
+    if "time_curve" in data:
+        time_curve = CameraTrajectory._normalize_time_curve(data["time_curve"], num_frames)
+        return _dense_curve_to_time_keyframes(time_curve)
+    return _build_time_preset_keyframes("linear", num_frames)
+
+
+def _build_time_curve_summary(time_curve):
+    curve = np.asarray(time_curve, dtype=np.float32)
+    if curve.size == 0:
+        return "No source-time curve."
+    deltas = np.diff(curve)
+    if deltas.size == 0:
+        direction = "static"
+        hold_segments = 0
+    elif np.all(deltas >= -1e-4):
+        direction = "forward"
+        hold_segments = int(np.count_nonzero(np.isclose(deltas, 0.0, atol=1e-4)))
+    elif np.all(deltas <= 1e-4):
+        direction = "reverse"
+        hold_segments = int(np.count_nonzero(np.isclose(deltas, 0.0, atol=1e-4)))
+    else:
+        direction = "mixed"
+        hold_segments = int(np.count_nonzero(np.isclose(deltas, 0.0, atol=1e-4)))
+    backward_segments = int(np.count_nonzero(deltas < -1e-4))
+    return (
+        f"mode=absolute_source_time | clamp=clamp | frames={curve.size} | "
+        f"source={curve[0]:.2f}->{curve[-1]:.2f} | min/max={curve.min():.2f}/{curve.max():.2f} | "
+        f"direction={direction} | hold_segments={hold_segments} | backward_segments={backward_segments}"
+    )
+
+
+def _build_time_curve_plot(time_curve, time_keyframes=None):
+    curve = np.asarray(time_curve, dtype=np.float32)
+    fig, ax = plt.subplots(figsize=(5.8, 2.6), dpi=140)
+    frames = np.arange(curve.size, dtype=np.float32)
+    ax.plot(frames, curve, color="#d95f02", linewidth=2.0)
+    if time_keyframes:
+        keyframe_x = [next(iter(item.keys())) for item in time_keyframes]
+        keyframe_y = [next(iter(item.values())) for item in time_keyframes]
+        ax.scatter(keyframe_x, keyframe_y, color="#1f6f78", s=24, zorder=3)
+    ax.set_title("Absolute Source Time Curve")
+    ax.set_xlabel("Output Frame")
+    ax.set_ylabel("Source Time")
+    ax.grid(True, alpha=0.25, linestyle="--")
+    fig.tight_layout()
+    return fig
+
+
+def _build_time_controls(num_frames, time_keyframes=None, preset="linear"):
+    keyframes = time_keyframes or _build_time_preset_keyframes(preset, num_frames)
+    time_curve = CameraTrajectory._build_time_curve_from_keyframes(keyframes, num_frames)
+    description = TIME_PRESET_DESCRIPTIONS.get(preset, TIME_PRESET_DESCRIPTIONS["custom"])
+    summary = f"preset={preset} | {description} | {_build_time_curve_summary(time_curve)}"
+    return preset, _time_keyframes_to_text(keyframes), summary, _build_time_curve_plot(time_curve, keyframes)
+
+
+def _build_time_controls_from_json(data, fallback_num_frames=DEFAULT_TRAJECTORY_FRAMES):
+    num_frames = int(data.get("num_frames", fallback_num_frames))
+    if "time_keyframes" in data or "time_curve" in data:
+        keyframes = _extract_time_keyframes_from_data(data, num_frames)
+        return _build_time_controls(num_frames, keyframes, preset="custom")
+    return _build_time_controls(num_frames, preset="linear")
+
+
+def _apply_time_preset(state, time_preset, current_text):
+    num_frames = _get_num_frames_from_state(state)
+    if time_preset == "custom":
+        if (current_text or "").strip():
+            keyframes = _parse_time_keyframes_text(current_text, num_frames)
+            return "custom", *_build_time_controls(num_frames, keyframes, preset="custom")[1:]
+        time_preset = "linear"
+    keyframes = _build_time_preset_keyframes(time_preset, num_frames)
+    return time_preset, *_build_time_controls(num_frames, keyframes, preset=time_preset)[1:]
+
+
+def _refresh_time_controls(state, time_keyframes_text):
+    num_frames = _get_num_frames_from_state(state)
+    if (time_keyframes_text or "").strip() == "":
+        return _apply_time_preset(state, "linear", "")
+    keyframes = _parse_time_keyframes_text(time_keyframes_text, num_frames)
+    return "custom", *_build_time_controls(num_frames, keyframes, preset="custom")[1:]
+
+
+def _resolve_time_payload(num_frames, time_preset, time_keyframes_text):
+    if (time_keyframes_text or "").strip():
+        keyframes = _parse_time_keyframes_text(time_keyframes_text, num_frames)
+    else:
+        effective_preset = time_preset if time_preset in TIME_PRESETS and time_preset != "custom" else "linear"
+        keyframes = _build_time_preset_keyframes(effective_preset, num_frames)
+    time_curve = CameraTrajectory._build_time_curve_from_keyframes(keyframes, num_frames)
+    payload = {
+        "time_control_mode": "absolute_source_time",
+        "time_clamp": "clamp",
+        "time_keyframes": keyframes,
+        "time_curve": [float(t) for t in time_curve.tolist()],
+    }
+    return payload, keyframes, time_curve
+
+
+def _resample_camera_sequence(cam2world, num_frames):
+    if cam2world.shape[0] == num_frames:
+        return cam2world
+    matrices = cam2world.detach().cpu().numpy()
+    frame_indices = np.arange(matrices.shape[0], dtype=np.int32)
+    resampled = CameraTrajectory._interpolate_sparse_matrices(frame_indices, matrices, num_frames)
+    return torch.from_numpy(resampled).to(device=cam2world.device, dtype=cam2world.dtype)
+
+
+def _resample_intrinsics(intrs, num_frames):
+    if intrs.shape[0] == num_frames:
+        return intrs
+    source = intrs.detach().cpu().numpy()
+    src_axis = np.linspace(0.0, 1.0, source.shape[0], dtype=np.float32)
+    dst_axis = np.linspace(0.0, 1.0, num_frames, dtype=np.float32)
+    flattened = source.reshape(source.shape[0], -1)
+    interpolated = np.stack(
+        [np.interp(dst_axis, src_axis, flattened[:, idx]) for idx in range(flattened.shape[1])],
+        axis=-1,
+    )
+    interpolated = interpolated.reshape(num_frames, *source.shape[1:]).astype(np.float32)
+    return torch.from_numpy(interpolated).to(device=intrs.device, dtype=intrs.dtype)
+
+
+def _poses_are_aligned(reference_pose, candidate_pose, translation_atol=1e-4, rotation_atol_rad=1e-3):
+    translation_error = torch.linalg.vector_norm(reference_pose[:3, 3] - candidate_pose[:3, 3]).item()
+    rotation_delta = reference_pose[:3, :3].transpose(0, 1) @ candidate_pose[:3, :3]
+    cosine = torch.clamp((torch.trace(rotation_delta) - 1.0) / 2.0, -1.0, 1.0)
+    rotation_error = float(torch.arccos(cosine).item())
+    return translation_error <= translation_atol and rotation_error <= rotation_atol_rad
+
+
+def _should_copy_first_frame(use_first_frame, render_timestamps, input_timestamps, target_cam2world, input_cam2world):
+    if not use_first_frame:
+        return False
+    if render_timestamps.numel() == 0 or input_timestamps.numel() == 0:
+        return False
+    if abs(float(render_timestamps[0].item()) - float(input_timestamps[0].item())) > 1e-4:
+        return False
+    return _poses_are_aligned(input_cam2world[0], target_cam2world[0])
+
+
+# ---------------------------------------------------------------------------
 # 3. Build trajectory
 # ---------------------------------------------------------------------------
-def build_trajectory(state, t_type, mode, angle, distance, orbit_radius, zoom_ratio, use_first_frame):
+def build_trajectory(state, t_type, mode, angle, distance, orbit_radius, zoom_ratio, use_first_frame,
+                     time_preset, time_keyframes_text):
     """Build camera trajectory from UI rows, visualize, and export JSON."""
     if state is None or "gaussians" not in state:
         raise gr.Error("Run reconstruction first.")
+    num_frames = _get_num_frames_from_state(state)
+    time_payload, _, _ = _resolve_time_payload(num_frames, time_preset, time_keyframes_text)
 
     json_data = {
         "name": "gradio_traj",
         "mode": mode,
-        "num_frames": 81,
+        "num_frames": num_frames,
         "zoom_ratio": zoom_ratio,
         "use_first_frame": use_first_frame,
         "keyframes": [
@@ -499,10 +888,11 @@ def build_trajectory(state, t_type, mode, angle, distance, orbit_radius, zoom_ra
                 "0": [{"static": {}}]
             },
             {
-                "80": [{t_type: {"angle": int(angle), "distance": float(distance), "orbit_radius": float(orbit_radius)}}]
+                str(num_frames - 1): [{t_type: {"angle": int(angle), "distance": float(distance), "orbit_radius": float(orbit_radius)}}]
             }
         ]
     }
+    json_data.update(time_payload)
     with open(JSON_PATH, "w") as f:
         json.dump(json_data, f, indent=2)
     cam_traj = CameraTrajectory.from_json(JSON_PATH)
@@ -513,6 +903,8 @@ def upload_trajectory(state, t_file):
     """Load trajectory JSON, build trajectory."""
     if state is None or "gaussians" not in state:
         raise gr.Error("Upload a trajectory JSON after reconstruction.")
+    if t_file is None:
+        raise gr.Error("Upload a trajectory JSON first.")
 
     cam_traj = CameraTrajectory.from_json(t_file)
     return cam_traj
@@ -521,13 +913,14 @@ def upload_trajectory(state, t_file):
 def handle_traj_upload(t_file):
     """Parse uploaded trajectory JSON and extract shared parameters."""
     if t_file is None:
-        return gr.update(), gr.update(), gr.update(), gr.update()
+        return (gr.update(),) * 7
     with open(t_file, "r") as f:
         data = json.load(f)
     mode = data.get("mode", "relative")
     zoom_ratio = data.get("zoom_ratio", 1.0)
     use_first_frame = data.get("use_first_frame", True)
-    return mode, zoom_ratio, use_first_frame
+    time_preset, time_text, time_summary, time_plot = _build_time_controls_from_json(data)
+    return mode, zoom_ratio, use_first_frame, time_preset, time_text, time_summary, time_plot
 
 
 # ---------------------------------------------------------------------------
@@ -535,35 +928,61 @@ def handle_traj_upload(t_file):
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def preview(state, selected_tab, t_file, t_type, angle, distance, orbit_r,
-            mode, zoom, use_ff, alpha_threshold):
+            mode, zoom, use_ff, alpha_threshold, time_preset, time_keyframes_text):
     """Build trajectory then render preview.
 
     The active tab determines the trajectory source:
     *TAB_TRAJ_FILE* uses the uploaded JSON; *TAB_CAMERA_PARAMS* uses sliders.
     """
+    if state is None or "gaussians" not in state:
+        raise gr.Error("Run reconstruction first.")
     if selected_tab == TAB_TRAJ_FILE:
-        cam_traj = upload_trajectory(state, t_file)
-        cam_traj.mode = mode
-        cam_traj.zoom_ratio = zoom
-        cam_traj.use_first_frame = use_ff
+        if t_file is None:
+            raise gr.Error("Upload a trajectory JSON first.")
         with open(t_file, "r") as f:
             json_data = json.load(f)
-        json_data["mode"] = mode
-        json_data["zoom_ratio"] = zoom
-        json_data["use_first_frame"] = use_ff
-        with open(JSON_PATH, "w") as f:
-            json.dump(json_data, f, indent=2)
     else:
-        cam_traj = build_trajectory(
-            state, t_type, mode, angle, distance, orbit_r, zoom, use_ff)
+        num_frames = _get_num_frames_from_state(state)
+        json_data = {
+            "name": "gradio_traj",
+            "mode": mode,
+            "num_frames": num_frames,
+            "zoom_ratio": zoom,
+            "use_first_frame": use_ff,
+            "keyframes": [
+                {"0": [{"static": {}}]},
+                {
+                    str(num_frames - 1): [{
+                        t_type: {
+                            "angle": int(angle),
+                            "distance": float(distance),
+                            "orbit_radius": float(orbit_r),
+                        }
+                    }]
+                },
+            ],
+        }
+
+    json_data["mode"] = mode
+    json_data["zoom_ratio"] = zoom
+    json_data["use_first_frame"] = use_ff
+    json_data.setdefault("num_frames", _get_num_frames_from_state(state))
+    time_payload, _, _ = _resolve_time_payload(int(json_data["num_frames"]), time_preset, time_keyframes_text)
+    json_data.update(time_payload)
+    with open(JSON_PATH, "w") as f:
+        json.dump(json_data, f, indent=2)
+    cam_traj = CameraTrajectory.from_json(JSON_PATH)
+
     static_flag = state.get("scene_type", "General scene") == "Static scene"
     input_cam2world = state["input_cam2world"]
     target_cam2world = cam_traj.c2w.to(device)
+    num_frames = target_cam2world.shape[0]
     if cam_traj.mode == "relative":
         if static_flag:
             target_cam2world = input_cam2world[0:1] @ target_cam2world
         else:
-            target_cam2world = input_cam2world @ target_cam2world
+            source_cam2world = _resample_camera_sequence(input_cam2world, num_frames)
+            target_cam2world = source_cam2world @ target_cam2world
 
     scene = build_scene_glb(state["points"], state["colors"], state["frame_indices"],
                             target_cam2world.cpu().numpy())
@@ -574,15 +993,19 @@ def preview(state, selected_tab, t_file, t_type, angle, distance, orbit_r,
     H, W = state["height"], state["width"]
 
     if static_flag:
-        K_81 = input_intrs[:1].repeat(81, 1, 1)
-        ts_81 = timestamps[:1].repeat(81)
+        K_render = input_intrs[:1].repeat(num_frames, 1, 1)
+        render_timestamps = timestamps[:1].repeat(num_frames)
     else:
-        K_81 = input_intrs
-        ts_81 = timestamps
+        K_render = _resample_intrinsics(input_intrs, num_frames)
+        render_timestamps = cam_traj.time_curve.to(device=device, dtype=timestamps.dtype)
+        render_timestamps = render_timestamps.clamp(
+            min=float(timestamps.min().item()),
+            max=float(timestamps.max().item()),
+        )
 
     # Apply zoom_ratio (matches inference.py)
-    ratio = torch.linspace(1, cam_traj.zoom_ratio, K_81.shape[0], device=device)
-    K_zoomed = K_81.clone()
+    ratio = torch.linspace(1, cam_traj.zoom_ratio, K_render.shape[0], device=K_render.device, dtype=K_render.dtype)
+    K_zoomed = K_render.clone()
     K_zoomed[:, 0, 0] *= ratio
     K_zoomed[:, 1, 1] *= ratio
 
@@ -591,12 +1014,12 @@ def preview(state, selected_tab, t_file, t_type, angle, distance, orbit_r,
         gaussians,
         render_viewmats=[target_world2cam],
         render_Ks=[K_zoomed],
-        render_timestamps=[ts_81],
+        render_timestamps=[render_timestamps],
         sh_degree=0, width=W, height=H,
     )
 
     target_mask = (target_alpha > alpha_threshold).float()
-    if cam_traj.use_first_frame:
+    if _should_copy_first_frame(cam_traj.use_first_frame, render_timestamps, timestamps, target_cam2world, input_cam2world):
         pil_images = state["images"]
         first_frame_rgb = F.to_tensor(pil_images[0]).permute(1, 2, 0).to(device)
         target_rgb[0, 0] = first_frame_rgb
@@ -619,6 +1042,7 @@ def preview(state, selected_tab, t_file, t_type, angle, distance, orbit_r,
     state["target_mask"] = target_mask
     state["target_poses"] = target_cam2world.unsqueeze(0)
     state["target_intrs"] = K_zoomed.unsqueeze(0)
+    state["target_timestamps"] = render_timestamps.unsqueeze(0)
 
     save_video(frames, PREVIEW_PATH, fps=16)
     save_video(mask_frames, MASK_PATH, fps=16)
@@ -700,6 +1124,7 @@ def generate_final(state, prompt, negative_prompt, seed):
         raise gr.Error("Run Render Preview first.")
 
     H, W = state["height"], state["width"]
+    num_frames = int(state["target_rgb"].shape[1])
     wrapped_data = {
         "source_views": state["source_views"],
         "target_rgb": state["target_rgb"],
@@ -714,7 +1139,7 @@ def generate_final(state, prompt, negative_prompt, seed):
         prompt=prompt,
         negative_prompt=negative_prompt,
         seed=seed, rand_device=device,
-        height=H, width=W, num_frames=81,
+        height=H, width=W, num_frames=num_frames,
         cfg_scale=1.0, num_inference_steps=4, tiled=False,
         **wrapped_data,
     )
@@ -732,6 +1157,10 @@ def generate_final(state, prompt, negative_prompt, seed):
 VALID_TYPES = sorted(CameraTrajectory.VALID_TRAJECTORY_TYPES)
 TAB_CAMERA_PARAMS = "tab_camera_params"
 TAB_TRAJ_FILE = "tab_traj_file"
+DEFAULT_TIME_PRESET, DEFAULT_TIME_TEXT, DEFAULT_TIME_SUMMARY, DEFAULT_TIME_PLOT = _build_time_controls(
+    DEFAULT_TRAJECTORY_FRAMES,
+    preset="linear",
+)
 
 with gr.Blocks(title="NeoVerse Interactive Demo") as demo:
     gr.HTML(
@@ -871,6 +1300,29 @@ with gr.Blocks(title="NeoVerse Interactive Demo") as demo:
                                                     step=0.01, label="Alpha Threshold")
                 use_first_frame_input = gr.Checkbox(value=True,
                                                         label="Use First Frame")
+            with gr.Accordion("Time Trajectory", open=True):
+                with gr.Row():
+                    time_preset_input = gr.Dropdown(
+                        choices=TIME_PRESETS,
+                        value=DEFAULT_TIME_PRESET,
+                        label="Time Preset",
+                    )
+                    time_apply_btn = gr.Button("Apply Preset", variant="secondary")
+                time_keyframes_input = gr.Textbox(
+                    value=DEFAULT_TIME_TEXT,
+                    label="Time Keyframes JSON",
+                    lines=8,
+                    placeholder='[\n  {"0": 0.0},\n  {"40": 10.0},\n  {"80": 80.0}\n]',
+                )
+                time_summary_output = gr.Textbox(
+                    value=DEFAULT_TIME_SUMMARY,
+                    label="Time Summary",
+                    interactive=False,
+                )
+                time_plot = gr.Plot(
+                    value=DEFAULT_TIME_PLOT,
+                    label="Time Curve",
+                )
             traj_download = gr.File(
                 label="Download Trajectory JSON",
                 interactive=False,
@@ -939,6 +1391,15 @@ with gr.Blocks(title="NeoVerse Interactive Demo") as demo:
             sc_type = ex.get("scene_type", "General scene")
             state, pil_images, btn_update = handle_upload([ex["file"]], sc_type)
             traj_file = ex.get("traj_file", None)
+            if traj_file and os.path.exists(traj_file):
+                with open(traj_file, "r") as f:
+                    traj_data = json.load(f)
+                time_preset, time_text, time_summary, time_plot_value = _build_time_controls_from_json(traj_data)
+            else:
+                time_preset, time_text, time_summary, time_plot_value = _build_time_controls(
+                    DEFAULT_TRAJECTORY_FRAMES,
+                    preset="linear",
+                )
             if traj_file:
                 tab_sel = gr.Tabs(selected=TAB_TRAJ_FILE)
                 tab_id = TAB_TRAJ_FILE
@@ -957,7 +1418,11 @@ with gr.Blocks(title="NeoVerse Interactive Demo") as demo:
                     ex.get("use_first_frame", True),
                     traj_file,
                     tab_sel,
-                    tab_id)
+                    tab_id,
+                    time_preset,
+                    time_text,
+                    time_summary,
+                    time_plot_value)
 
         example_gallery.select(
             fn=_load_example,
@@ -967,7 +1432,8 @@ with gr.Blocks(title="NeoVerse Interactive Demo") as demo:
                      traj_type, traj_angle, traj_distance, traj_orbit,
                      traj_mode, zoom_ratio_input, alpha_threshold_input,
                      use_first_frame_input, traj_upload, traj_tabs,
-                     selected_tab_state],
+                     selected_tab_state, time_preset_input, time_keyframes_input,
+                     time_summary_output, time_plot],
         ).then(
             fn=reconstruct,
             inputs=[app_state],
@@ -986,7 +1452,7 @@ with gr.Blocks(title="NeoVerse Interactive Demo") as demo:
         fn=preview,
         inputs=[app_state, selected_tab_state, traj_upload, traj_type, traj_angle, traj_distance, traj_orbit,
                 traj_mode, zoom_ratio_input, use_first_frame_input,
-                alpha_threshold_input],
+                alpha_threshold_input, time_preset_input, time_keyframes_input],
         outputs=[app_state, model3d,
                  preview_video, mask_video, generate_btn, traj_download],
     )
@@ -995,7 +1461,27 @@ with gr.Blocks(title="NeoVerse Interactive Demo") as demo:
     traj_upload.change(
         fn=handle_traj_upload,
         inputs=[traj_upload],
-        outputs=[traj_mode, zoom_ratio_input, use_first_frame_input],
+        outputs=[
+            traj_mode,
+            zoom_ratio_input,
+            use_first_frame_input,
+            time_preset_input,
+            time_keyframes_input,
+            time_summary_output,
+            time_plot,
+        ],
+    )
+
+    time_apply_btn.click(
+        fn=_apply_time_preset,
+        inputs=[app_state, time_preset_input, time_keyframes_input],
+        outputs=[time_preset_input, time_keyframes_input, time_summary_output, time_plot],
+    )
+
+    time_keyframes_input.change(
+        fn=_refresh_time_controls,
+        inputs=[app_state, time_keyframes_input],
+        outputs=[time_preset_input, time_keyframes_input, time_summary_output, time_plot],
     )
 
     # Generate
