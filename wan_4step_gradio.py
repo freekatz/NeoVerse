@@ -255,7 +255,7 @@ def build_demo():
                 output_video = gr.Video(label="输出视频")
                 gr.Markdown(
                     "建议先用默认 `560x336 / 81 frames / 4 steps / cfg=1.0` 做 smoke test。\n\n"
-                    "4-step distilled LoRA 推荐 `steps=4`、`cfg=1.0`；调大步数可以跑，但就不是标准 4-step 测试。"
+                    "当前仓库默认用 `steps=4`、`cfg=1.0` 跑这个 distilled LoRA；调大步数可以跑，但就不是复现仓库默认设置。"
                 )
 
         load_btn.click(load_model_ui, outputs=status)

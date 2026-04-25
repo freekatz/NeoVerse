@@ -429,7 +429,7 @@ fps=16
 说明：
 
 - 页面启动后不会立刻加载大模型，点击“加载模型”或“生成视频”才会加载。
-- 4-step distilled LoRA 建议保持 `推理步数=4`、`CFG scale=1.0`。
+- 当前仓库默认用 `推理步数=4`、`CFG scale=1.0` 跑这个 distilled LoRA。
 - 输出视频默认保存在 `outputs/wan_4step_gradio/`。
 
 如果不想低显存换入换出，可以去掉 `--low_vram`，但需要更高显存。
