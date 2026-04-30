@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Usage examples:
+#   DRY_RUN=1 bash scripts/train_distill_control_latent.sh
+#   RUN_NAME=neoverse_distill_v1 bash scripts/train_distill_control_latent.sh
+#   GPU_LIST=0,1 RUN_NAME=neoverse_distill_v1 bash scripts/train_distill_control_latent.sh
+#   LAUNCH_MODE=background RUN_NAME=neoverse_distill_v1 bash scripts/train_distill_control_latent.sh
+#   On Volcengine/MLP with MLP_* env vars already set:
+#     RUN_NAME=neoverse_distill_v1 bash scripts/train_distill_control_latent.sh
+
+timestamp_utc() {
+  date -u "+%Y%m%d_%H%M%S"
+}
+
+log() {
+  printf '[train_distill_control][%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"
+}
+
+die() {
+  log "ERROR: $*"
+  exit 1
+}
+
+run_cmd() {
+  log "+ $*"
+  if [[ "${DRY_RUN}" != "1" ]]; then
+    "$@"
+  fi
+}
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CODE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+MODE="${MODE:-train}"
+LAUNCH_MODE="${LAUNCH_MODE:-foreground}"
+DRY_RUN="${DRY_RUN:-0}"
+
+VENV_PATH="${VENV_PATH:-/root/vepfs/envs/neoverse}"
+ENV_PYTHON="${ENV_PYTHON:-${VENV_PATH}/bin/python}"
+ACCELERATE="${ACCELERATE:-${VENV_PATH}/bin/accelerate}"
+CONFIG="${CONFIG:-configs/distill_control_latent.yaml}"
+
+PROJECT_NAME="${PROJECT_NAME:-NeoVerseControlLatentDistill}"
+RUN_DATE="${RUN_DATE:-$(date +%F)}"
+RUN_TIME="${RUN_TIME:-$(date +%H-%M-%S)}"
+OUTPUT_PATH="${OUTPUT_PATH:-outputs/${PROJECT_NAME}/${RUN_DATE}/${RUN_TIME}}"
+RUN_NAME="${RUN_NAME:-train}"
+LOG_DIR="${LOG_DIR:-${OUTPUT_PATH}/logs}"
+LOG_FILE="${LOG_FILE:-${LOG_DIR}/train_${RUN_NAME}.log}"
+PID_FILE="${PID_FILE:-${LOG_DIR}/run.pid}"
+CONFIG_FILE="${CONFIG_FILE:-${LOG_DIR}/run_config.env}"
+
+GPU_LIST="${GPU_LIST:-}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${GPU_LIST}}"
+MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
+PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+
+LAUNCHER="${LAUNCHER:-accelerate}"
+USE_DISTRIBUTED="${USE_DISTRIBUTED:-auto}"
+DIST_NPROC_PER_NODE="${DIST_NPROC_PER_NODE:-${MLP_WORKER_GPU:-}}"
+DIST_NNODES="${DIST_NNODES:-${MLP_WORKER_NUM:-1}}"
+DIST_NODE_RANK="${DIST_NODE_RANK:-${MLP_ROLE_INDEX:-0}}"
+DIST_MASTER_ADDR="${DIST_MASTER_ADDR:-${MLP_WORKER_0_HOST:-127.0.0.1}}"
+DIST_MASTER_PORT="${DIST_MASTER_PORT:-${MLP_WORKER_0_PORT:-29500}}"
+NUM_CPU_THREADS_PER_PROCESS="${NUM_CPU_THREADS_PER_PROCESS:-}"
+ACCELERATE_EXTRA_ARGS="${ACCELERATE_EXTRA_ARGS:-}"
+
+mkdir -p "${LOG_DIR}" "${OUTPUT_PATH}"
+
+case "${MODE}" in
+  train) ;;
+  *)
+    die "Unsupported MODE=${MODE}. Expected: train"
+    ;;
+esac
+
+if [[ "${LAUNCH_MODE}" == "background" && "${_NEOVERSE_DISTILL_BG:-0}" != "1" ]]; then
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    die "DRY_RUN=1 cannot be combined with LAUNCH_MODE=background"
+  fi
+  log "Launching in background"
+  log "output_path=${OUTPUT_PATH}"
+  log "log_file=${LOG_FILE}"
+  nohup env \
+    _NEOVERSE_DISTILL_BG=1 \
+    LAUNCH_MODE=foreground \
+    RUN_NAME="${RUN_NAME}" \
+    OUTPUT_PATH="${OUTPUT_PATH}" \
+    LOG_DIR="${LOG_DIR}" \
+    LOG_FILE="${LOG_FILE}" \
+    PID_FILE="${PID_FILE}" \
+    CONFIG_FILE="${CONFIG_FILE}" \
+    "$0" "$@" >"${LOG_FILE}" 2>&1 &
+  child_pid="$!"
+  printf '%s\n' "${child_pid}" > "${PID_FILE}"
+  log "pid=${child_pid}"
+  exit 0
+fi
+
+[[ -d "${CODE_DIR}" ]] || die "CODE_DIR does not exist: ${CODE_DIR}"
+[[ -d "${VENV_PATH}" ]] || die "VENV_PATH does not exist: ${VENV_PATH}"
+[[ -x "${ENV_PYTHON}" ]] || die "ENV_PYTHON is not executable: ${ENV_PYTHON}"
+[[ -x "${ACCELERATE}" ]] || die "ACCELERATE is not executable: ${ACCELERATE}"
+[[ -f "${CODE_DIR}/${CONFIG}" || -f "${CONFIG}" ]] || die "Missing config: ${CONFIG}"
+
+cd "${CODE_DIR}"
+
+if [[ -f "${VENV_PATH}/bin/activate" ]]; then
+  source "${VENV_PATH}/bin/activate"
+fi
+
+export PYTHONUNBUFFERED
+export TOKENIZERS_PARALLELISM
+export PYTORCH_CUDA_ALLOC_CONF
+export TORCH_NCCL_ASYNC_ERROR_HANDLING
+export PYTHONPATH="${CODE_DIR}:${PYTHONPATH:-}"
+if [[ -n "${CUDA_VISIBLE_DEVICES}" ]]; then
+  export CUDA_VISIBLE_DEVICES
+fi
+
+detect_local_gpu_count() {
+  if [[ -n "${CUDA_VISIBLE_DEVICES}" ]]; then
+    "${ENV_PYTHON}" - "${CUDA_VISIBLE_DEVICES}" <<'PY'
+import sys
+
+items = [item.strip() for item in sys.argv[1].split(",") if item.strip()]
+print(len(items))
+PY
+    return
+  fi
+
+  "${ENV_PYTHON}" - <<'PY'
+import torch
+
+print(torch.cuda.device_count())
+PY
+}
+
+if [[ "${USE_DISTRIBUTED}" == "auto" && -z "${DIST_NPROC_PER_NODE}" && "${DIST_NNODES}" == "1" ]]; then
+  auto_local_gpu_count="$(detect_local_gpu_count)"
+  if [[ "${auto_local_gpu_count}" =~ ^[0-9]+$ && "${auto_local_gpu_count}" -gt 0 ]]; then
+    DIST_NPROC_PER_NODE="${auto_local_gpu_count}"
+  fi
+fi
+
+if [[ -z "${DIST_NPROC_PER_NODE}" ]]; then
+  DIST_NPROC_PER_NODE=1
+fi
+
+is_distributed=0
+if [[ "${USE_DISTRIBUTED}" == "1" ]]; then
+  is_distributed=1
+elif [[ "${USE_DISTRIBUTED}" == "auto" ]]; then
+  if [[ "${DIST_NNODES}" != "1" || "${DIST_NPROC_PER_NODE}" != "1" ]]; then
+    is_distributed=1
+  fi
+fi
+
+if [[ "${DIST_NPROC_PER_NODE}" -le 0 || "${DIST_NNODES}" -le 0 ]]; then
+  die "Invalid distributed size: DIST_NPROC_PER_NODE=${DIST_NPROC_PER_NODE}, DIST_NNODES=${DIST_NNODES}"
+fi
+
+GLOBAL_NUM_PROCESSES=$((DIST_NPROC_PER_NODE * DIST_NNODES))
+
+TRAIN_OVERRIDES=(
+  "output_path=${OUTPUT_PATH}"
+  "num_views=${NUM_VIEWS:-81}"
+  "min_num_context_views=${MIN_NUM_CONTEXT_VIEWS:-10}"
+  "max_num_context_views=${MAX_NUM_CONTEXT_VIEWS:-20}"
+  "continuous_target_frames=${CONTINUOUS_TARGET_FRAMES:-true}"
+  "force_first_context=${FORCE_FIRST_CONTEXT:-true}"
+  "timestamp_unit=${TIMESTAMP_UNIT:-seconds}"
+  "pipeline_kwargs.mask_non_context_targets=${MASK_NON_CONTEXT_TARGETS:-false}"
+)
+
+append_override_if_set() {
+  local env_name="$1"
+  local key="$2"
+  local value="${!env_name:-}"
+  if [[ -n "${value}" ]]; then
+    TRAIN_OVERRIDES+=("${key}=${value}")
+  fi
+}
+
+append_override_if_set "MODEL_PATH" "model_path"
+append_override_if_set "RECONSTRUCTOR_PATH" "reconstructor_path"
+append_override_if_set "USE_CAMERA_ANNOTATIONS" "use_camera_annotations"
+append_override_if_set "BATCH_SIZE" "batch_size"
+append_override_if_set "NUM_WORKERS" "num_workers"
+append_override_if_set "MAX_STEPS" "max_steps"
+append_override_if_set "NUM_EPOCHS" "num_epochs"
+append_override_if_set "LEARNING_RATE" "learning_rate"
+append_override_if_set "SAVE_FREQ" "save_freq"
+append_override_if_set "PRINT_FREQ" "print_freq"
+append_override_if_set "VIS_FREQ" "vis_freq"
+append_override_if_set "AUTO_RESUME" "auto_resume"
+append_override_if_set "RESUME_FROM" "resume_from"
+append_override_if_set "RESUME_OPTIMIZER" "resume_optimizer"
+
+read -r -a accelerate_extra_args <<< "${ACCELERATE_EXTRA_ARGS}"
+
+cat > "${CONFIG_FILE}" <<EOF
+MODE=${MODE}
+LAUNCH_MODE=${LAUNCH_MODE}
+DRY_RUN=${DRY_RUN}
+CODE_DIR=${CODE_DIR}
+VENV_PATH=${VENV_PATH}
+ENV_PYTHON=${ENV_PYTHON}
+ACCELERATE=${ACCELERATE}
+CONFIG=${CONFIG}
+PROJECT_NAME=${PROJECT_NAME}
+RUN_DATE=${RUN_DATE}
+RUN_TIME=${RUN_TIME}
+RUN_NAME=${RUN_NAME}
+OUTPUT_PATH=${OUTPUT_PATH}
+LOG_DIR=${LOG_DIR}
+LOG_FILE=${LOG_FILE}
+PID_FILE=${PID_FILE}
+GPU_LIST=${GPU_LIST}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}
+MIXED_PRECISION=${MIXED_PRECISION}
+PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}
+USE_DISTRIBUTED=${USE_DISTRIBUTED}
+IS_DISTRIBUTED=${is_distributed}
+DIST_NPROC_PER_NODE=${DIST_NPROC_PER_NODE}
+DIST_NNODES=${DIST_NNODES}
+DIST_NODE_RANK=${DIST_NODE_RANK}
+DIST_MASTER_ADDR=${DIST_MASTER_ADDR}
+DIST_MASTER_PORT=${DIST_MASTER_PORT}
+GLOBAL_NUM_PROCESSES=${GLOBAL_NUM_PROCESSES}
+TRAIN_OVERRIDES=${TRAIN_OVERRIDES[*]}
+EXTRA_OVERRIDES=$*
+EOF
+
+log "mode=${MODE}"
+log "run_name=${RUN_NAME}"
+log "output_path=${OUTPUT_PATH}"
+log "log_file=${LOG_FILE}"
+log "config=${CONFIG}"
+log "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-unset}"
+log "is_distributed=${is_distributed}"
+log "global_num_processes=${GLOBAL_NUM_PROCESSES}"
+log "dist_nproc_per_node=${DIST_NPROC_PER_NODE}"
+log "dist_nnodes=${DIST_NNODES}"
+log "dist_node_rank=${DIST_NODE_RANK}"
+log "dist_master_addr=${DIST_MASTER_ADDR}"
+log "dist_master_port=${DIST_MASTER_PORT}"
+log "default_overrides=${TRAIN_OVERRIDES[*]}"
+log "extra_overrides=$*"
+log "config_file=${CONFIG_FILE}"
+
+run_cmd bash -n "$0"
+run_cmd "${ENV_PYTHON}" -m py_compile \
+  train_distill_control_latent.py \
+  diffsynth/models/student_adapters.py \
+  diffsynth/pipelines/wan_video_neoverse.py \
+  diffsynth/models/wan_video_neoverse_controller.py \
+  hooks/extract_vggt_tokens.py
+
+launch_cmd=(
+  "${ACCELERATE}" launch
+  --mixed_precision "${MIXED_PRECISION}"
+  --num_processes "${GLOBAL_NUM_PROCESSES}"
+)
+
+if [[ "${is_distributed}" == "1" ]]; then
+  launch_cmd+=(--multi_gpu)
+fi
+
+if [[ "${DIST_NNODES}" != "1" ]]; then
+  launch_cmd+=(
+    --num_machines "${DIST_NNODES}"
+    --machine_rank "${DIST_NODE_RANK}"
+    --main_process_ip "${DIST_MASTER_ADDR}"
+    --main_process_port "${DIST_MASTER_PORT}"
+    --same_network
+  )
+fi
+
+if [[ -n "${NUM_CPU_THREADS_PER_PROCESS}" ]]; then
+  launch_cmd+=(--num_cpu_threads_per_process "${NUM_CPU_THREADS_PER_PROCESS}")
+fi
+
+if [[ "${#accelerate_extra_args[@]}" -gt 0 ]]; then
+  launch_cmd+=("${accelerate_extra_args[@]}")
+fi
+
+launch_cmd+=(
+  train_distill_control_latent.py "${CONFIG}"
+  "${TRAIN_OVERRIDES[@]}"
+  "$@"
+)
+
+if [[ "${_NEOVERSE_DISTILL_BG:-0}" == "1" ]]; then
+  run_cmd "${launch_cmd[@]}"
+else
+  run_cmd "${launch_cmd[@]}" 2>&1 | tee -a "${LOG_FILE}"
+fi
+
+log "Finished successfully"

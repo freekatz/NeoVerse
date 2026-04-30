@@ -281,31 +281,62 @@ class WanVideoNeoVersePipeline(BasePipeline):
         device: Union[str, torch.device] = "cuda",
         torch_dtype: torch.dtype = torch.bfloat16,
         enable_vram_management: bool = False,
+        load_dit: bool = True,
+        load_text_encoder: bool = True,
+        load_vae: bool = True,
     ):
         # Initialize pipeline
         pipe = WanVideoNeoVersePipeline(device=device, torch_dtype=torch_dtype, pipeline_kwargs=pipeline_kwargs)
 
         # Load models
         model_configs = [
-            ModelConfig(path=reconstructor_path, offload_device="cpu" if enable_vram_management else device),
-            ModelConfig(local_model_path=local_model_path, model_id="NeoVerse", origin_file_pattern="diffusion_pytorch_model*.safetensors", offload_device="cpu" if enable_vram_management else device),
-            ModelConfig(local_model_path=local_model_path, model_id="NeoVerse", origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth", offload_device="cpu" if enable_vram_management else device),
-            ModelConfig(local_model_path=local_model_path, model_id="NeoVerse", origin_file_pattern="Wan2.1_VAE.pth", offload_device="cpu" if enable_vram_management else device),
+            (ModelConfig(path=reconstructor_path, offload_device="cpu" if enable_vram_management else device), None),
         ]
+        diffusion_model_names = None if load_dit else ["wan_video_neoverse_controller"]
+        model_configs.append((
+            ModelConfig(
+                local_model_path=local_model_path,
+                model_id="NeoVerse",
+                origin_file_pattern="diffusion_pytorch_model*.safetensors",
+                offload_device="cpu" if enable_vram_management else device,
+            ),
+            diffusion_model_names,
+        ))
+        if load_text_encoder:
+            model_configs.append((
+                ModelConfig(
+                    local_model_path=local_model_path,
+                    model_id="NeoVerse",
+                    origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth",
+                    offload_device="cpu" if enable_vram_management else device,
+                ),
+                None,
+            ))
+        if load_vae:
+            model_configs.append((
+                ModelConfig(
+                    local_model_path=local_model_path,
+                    model_id="NeoVerse",
+                    origin_file_pattern="Wan2.1_VAE.pth",
+                    offload_device="cpu" if enable_vram_management else device,
+                ),
+                None,
+            ))
         tokenizer_config = ModelConfig(local_model_path=local_model_path, model_id="NeoVerse", origin_file_pattern="google/*")
         model_manager = ModelManager()
-        for model_config in model_configs:
+        for model_config, model_names in model_configs:
             model_config.download_if_necessary()
             model_manager.load_model(
                 model_config.path,
+                model_names=model_names,
                 device=model_config.offload_device or device,
                 torch_dtype=model_config.offload_dtype or torch_dtype
             )
 
         # Load models
-        pipe.text_encoder = model_manager.fetch_model("wan_video_text_encoder")
-        pipe.dit = model_manager.fetch_model("wan_video_dit")
-        pipe.vae = model_manager.fetch_model("wan_video_vae")
+        pipe.text_encoder = model_manager.fetch_model("wan_video_text_encoder") if load_text_encoder else None
+        pipe.dit = model_manager.fetch_model("wan_video_dit") if load_dit else None
+        pipe.vae = model_manager.fetch_model("wan_video_vae") if load_vae else None
         pipe.control_branch = model_manager.fetch_model("wan_video_neoverse_controller")
         pipe.reconstructor = model_manager.fetch_model("reconstructor")
 
@@ -315,12 +346,15 @@ class WanVideoNeoVersePipeline(BasePipeline):
             pipe.width_division_factor = pipe.vae.upsampling_factor * 2
 
         # Initialize tokenizer
-        tokenizer_config.download_if_necessary()
-        pipe.prompter.fetch_models(pipe.text_encoder)
-        pipe.prompter.fetch_tokenizer(tokenizer_config.path)
+        if load_text_encoder:
+            tokenizer_config.download_if_necessary()
+            pipe.prompter.fetch_models(pipe.text_encoder)
+            pipe.prompter.fetch_tokenizer(tokenizer_config.path)
 
         # Load Distilled LoRA for faster inference
         if lora_path is not None:
+            if pipe.dit is None:
+                raise ValueError("LoRA loading requires load_dit=True.")
             assert os.path.exists(lora_path), f"LoRA path {lora_path} does not exist."
             pipe.load_lora(pipe.dit, lora_path, alpha=lora_alpha, lora_type="lightx2v")
             print(f"Loaded LoRA from {lora_path}")
@@ -428,6 +462,7 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
         occlusion_thresh=0.1,
         alpha_thresh=0.5,
         color_thresh=[50, 100],
+        mask_non_context_targets=True,
         **kwargs,
     ):
         super().__init__(
@@ -441,6 +476,7 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
         self.occlusion_thresh = occlusion_thresh
         self.alpha_thresh = alpha_thresh
         self.color_thresh = color_thresh
+        self.mask_non_context_targets = bool(mask_non_context_targets)
 
     def process(self, pipe: WanVideoNeoVersePipeline, source_views, target_rgb, target_depth, target_mask, target_poses, target_intrs):
         if source_views is None:
@@ -467,43 +503,72 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
                 "target_intrs": target_intrs,
             }
 
+        has_gt_cameras = (
+            isinstance(source_views.get("camera_poses"), torch.Tensor)
+            and isinstance(source_views.get("camera_intrs"), torch.Tensor)
+        )
+        context_num = (~source_views["is_target"]).sum()
+        context_num_int = int(context_num.item() if isinstance(context_num, torch.Tensor) else context_num)
+        if has_gt_cameras:
+            total_views = source_views["img"].shape[1]
+            recon_source_views = {}
+            for key, value in source_views.items():
+                if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[1] == total_views:
+                    recon_source_views[key] = value[:, :context_num_int]
+                else:
+                    recon_source_views[key] = value
+            recon_source_views["is_target"] = torch.zeros_like(source_views["is_target"][:, :context_num_int])
+        else:
+            recon_source_views = source_views
+
         pipe.load_models_to_device(self.onload_model_names)
         with torch.amp.autocast("cuda", dtype=pipe.torch_dtype):
-            recon_output = pipe.reconstructor(source_views, is_inference=False)
-        context_num = (~source_views["is_target"]).sum()
+            recon_output = pipe.reconstructor(recon_source_views, is_inference=False)
+        if has_gt_cameras:
+            render_extrinsics = source_views["camera_poses"]
+            render_intrinsics = source_views["camera_intrs"]
+            render_timestamps = source_views["timestamp"]
+            context_extrinsics = render_extrinsics[:, :context_num_int]
+            context_intrinsics = render_intrinsics[:, :context_num_int]
+        else:
+            render_extrinsics = recon_output["rendered_extrinsics"]
+            render_intrinsics = recon_output["rendered_intrinsics"]
+            render_timestamps = recon_output["rendered_timestamps"]
+            context_extrinsics = render_extrinsics[:, :context_num_int]
+            context_intrinsics = render_intrinsics[:, :context_num_int]
         novel_context_poses = self.novel_view_sampling(
-            recon_output["rendered_extrinsics"][:, :context_num],
+            context_extrinsics,
             recon_output["gs_depth"].squeeze(-1),
         )
         if np.random.rand() < self.culling_prob:
             kernel_size = 0
         else:
             kernel_size = np.random.randint(self.kernel_size_range[0], self.kernel_size_range[1]+1)
-        H, W = input_video.shape[-2:]
+        H, W = source_views["img"].shape[-2:]
         splats = self.degradation_simulation(
             recon_output["splats"],
             novel_context_poses,
-            recon_output["rendered_intrinsics"][:, :context_num],
+            context_intrinsics,
             (H, W),
             kernel_size=kernel_size,
             occlusion_thresh=self.occlusion_thresh,
         )
         target_rgb, target_depth, target_alpha = pipe.reconstructor.gs_renderer.rasterizer.forward(
             splats,
-            render_viewmats=homo_matrix_inverse(recon_output["rendered_extrinsics"]),   # c2w -> w2c
-            render_Ks=recon_output["rendered_intrinsics"],
-            render_timestamps=recon_output["rendered_timestamps"],
+            render_viewmats=homo_matrix_inverse(render_extrinsics),   # c2w -> w2c
+            render_Ks=render_intrinsics,
+            render_timestamps=render_timestamps,
             sh_degree=0, width=W, height=H,
         )
         target_mask = target_alpha > self.alpha_thresh
 
         # Sort renderings with timestamps: convert from "context + non-context" format to temporally ordered frames
-        target_poses = recon_output["rendered_extrinsics"]
-        target_intrs = recon_output["rendered_intrinsics"]
+        target_poses = render_extrinsics.clone()
+        target_intrs = render_intrinsics.clone()
         for b_idx in range(len(target_rgb)):
-            # mask out all non-context frames
-            target_mask[b_idx][context_num:] = False
-            order_indices = torch.argsort(recon_output["rendered_timestamps"][b_idx])
+            if self.mask_non_context_targets:
+                target_mask[b_idx][context_num_int:] = False
+            order_indices = torch.argsort(render_timestamps[b_idx])
             target_rgb[b_idx] = target_rgb[b_idx][order_indices]
             target_depth[b_idx] = target_depth[b_idx][order_indices]
             target_mask[b_idx] = target_mask[b_idx][order_indices]
@@ -719,6 +784,7 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
                         visible_gs_x, visible_gs_y, smoothed_gs_depths,
                         cur_intrinsic, cur_extrinsic
                     )
+                    world_coords = world_coords.to(dtype=cur_gaussian.means.dtype)
                     cur_gaussian.means[visible_indices] = world_coords
                     cur_gaussian.keep_indices(visible_indices)
         return gaussians
@@ -969,6 +1035,7 @@ def model_fn_wan_video(
     use_gradient_checkpointing_offload: bool = False,
     control_camera_latents_input = None,
     fuse_vae_embedding_in_latents: bool = False,
+    precomputed_control_hints = None,
     **kwargs,
 ):
     # Timestep
@@ -996,7 +1063,22 @@ def model_fn_wan_video(
         dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
     ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
-    if target_rgb is not None:
+    control_hints = None
+    if precomputed_control_hints is not None:
+        if isinstance(precomputed_control_hints, dict):
+            control_hints = []
+            for layer in control_branch.control_layers:
+                layer_key = f"layer_{layer}"
+                if layer_key in precomputed_control_hints:
+                    control_hints.append(precomputed_control_hints[layer_key])
+                elif layer in precomputed_control_hints:
+                    control_hints.append(precomputed_control_hints[layer])
+                else:
+                    control_hints.append(precomputed_control_hints[str(layer)])
+            control_hints = tuple(control_hints)
+        else:
+            control_hints = tuple(precomputed_control_hints)
+    elif target_rgb is not None:
         control_hints = control_branch(
             x, target_rgb, target_depth, target_camera_embed, target_mask,
             context, t_mod, freqs, use_gradient_checkpointing, use_gradient_checkpointing_offload,
@@ -1024,8 +1106,9 @@ def model_fn_wan_video(
         else:
             x = block(x, context, t_mod, freqs)
 
-        if target_rgb is not None and block_id in control_branch.control_layers_mapping:
+        if control_hints is not None and block_id in control_branch.control_layers_mapping:
             current_control_hint = control_hints[control_branch.control_layers_mapping[block_id]]
+            current_control_hint = current_control_hint.to(device=x.device, dtype=x.dtype)
             x = x + current_control_hint * control_scale
 
     x = dit.head(x, t)

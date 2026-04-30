@@ -1,5 +1,4 @@
 from typing import Dict, Tuple, Optional
-from jaxtyping import Float
 import numpy as np
 import torch
 import torch.nn as nn
@@ -14,6 +13,13 @@ from gsplat.strategy import DefaultStrategy
 from ..utils.frustum import calculate_unprojected_mask
 from ..utils.geometry import depth_to_world_coords_points, closed_form_inverse_se3, project_world_points_to_image
 from ..utils import sh_utils, act_gs
+
+try:
+    from jaxtyping import Float
+except ModuleNotFoundError:
+    class Float:
+        def __class_getitem__(cls, item):
+            return Tensor
 
 
 class Gaussians:
@@ -503,6 +509,7 @@ class GaussianSplatRenderer(nn.Module):
         B, _, _, H, W = images.shape
         S = context_predictions.get("imgs", images).shape[1] # context view nums
         V = images.shape[1] - S                              # target view nums
+        has_gt_cameras = "camera_poses" in views and "camera_intrs" in views
 
         # 1) Predict GS features from tokens, then convert to Gaussian parameters
         gs_feats_reshape = rearrange(gs_feats, "b s c h w -> (b s) c h w")
@@ -527,6 +534,14 @@ class GaussianSplatRenderer(nn.Module):
             unproject_masks = calculate_unprojected_mask(views, S)     # [B, V, H, W]
             valid_masks = torch.cat([gt_valid_masks_src, (gt_valid_masks_tgt & unproject_masks)], dim=1)
             render_timestamps = views["timestamp"]
+        elif not is_inference and has_gt_cameras:
+            # SpatialVID annotations provide camera poses/intrinsics. During
+            # distillation we keep the reconstructor frozen but still want the
+            # teacher render cameras to come from the annotation, not from target
+            # RGB frames passed through the camera head.
+            render_viewmats, render_Ks = self.prepare_cameras(views, S + V)
+            valid_masks = views.get("valid_mask", torch.ones(B, S + V, H, W, dtype=bool, device=images.device))
+            render_timestamps = views["timestamp"]
         else:
             # Re-predict the camera for novel views and perform translation scale alignment
             pred_all_extrinsic, pred_all_intrinsic = self.prepare_cameras(predictions, S + V)
@@ -548,6 +563,8 @@ class GaussianSplatRenderer(nn.Module):
         # 3) Generate splats from gs_params + predictions, and perform voxel merging
         if self.training:
             splats = self.prepare_splats(views, predictions, images, gs_params, S, position_from="gsdepth+gtcamera")
+        elif not is_inference and has_gt_cameras:
+            splats = self.prepare_splats(views, predictions, images, gs_params, S, context_predictions, position_from="gsdepth+gtcamera")
         elif not is_inference:
             splats = self.prepare_splats(views, predictions, images, gs_params, S, context_predictions, position_from="gsdepth+predcamera")
         else:

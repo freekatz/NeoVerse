@@ -14,6 +14,40 @@ from tqdm import tqdm
 from ..base_dataset import BaseDataset
 
 
+def _pose_vec_xyzw_to_c2w(pose_vec):
+    pose_vec = np.asarray(pose_vec, dtype=np.float32)
+    translation = pose_vec[:3]
+    x, y, z, w = pose_vec[3:7]
+    norm = np.sqrt(x * x + y * y + z * z + w * w)
+    if norm < 1e-8:
+        x, y, z, w = 0.0, 0.0, 0.0, 1.0
+    else:
+        x, y, z, w = x / norm, y / norm, z / norm, w / norm
+
+    rotation = np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float32,
+    )
+    c2w = np.eye(4, dtype=np.float32)
+    c2w[:3, :3] = rotation
+    c2w[:3, 3] = translation
+    return c2w
+
+
+def _intrinsics_vec_to_matrix(intr_vec, width, height):
+    fx, fy, cx, cy = np.asarray(intr_vec, dtype=np.float32)
+    intr = np.eye(3, dtype=np.float32)
+    intr[0, 0] = fx * width
+    intr[1, 1] = fy * height
+    intr[0, 2] = cx * width
+    intr[1, 2] = cy * height
+    return intr
+
+
 @contextmanager
 def VideoReader_contextmanager(*args, **kwargs):
     vr = VideoReader(*args, **kwargs)
@@ -25,70 +59,165 @@ def VideoReader_contextmanager(*args, **kwargs):
 
 
 class SpatialVID(BaseDataset):
-    def __init__(self, ROOT, *args, **kwargs):
+    def __init__(
+        self,
+        ROOT,
+        video_ids=None,
+        video_paths=None,
+        use_camera_annotations=False,
+        continuous_target_frames=False,
+        force_first_context=True,
+        timestamp_unit="seconds",
+        *args,
+        **kwargs,
+    ):
         self.ROOT = ROOT
+        self.video_ids = self._normalize_filter_values(video_ids)
+        self.video_paths = self._normalize_filter_values(video_paths)
+        self.use_camera_annotations = use_camera_annotations
+        self.continuous_target_frames = bool(continuous_target_frames)
+        self.force_first_context = bool(force_first_context)
+        if timestamp_unit not in {"seconds", "frames"}:
+            raise ValueError(f"Unsupported timestamp_unit={timestamp_unit!r}. Expected 'seconds' or 'frames'.")
+        self.timestamp_unit = timestamp_unit
         super().__init__(*args, **kwargs)
         self.loaded_data = self._load_data()
 
+    @staticmethod
+    def _normalize_filter_values(values):
+        if values is None:
+            return None
+        if isinstance(values, str):
+            values = [values]
+        return {str(value) for value in values}
+
     def _load_data(self):
         metadata = pd.read_csv(osp.join(self.ROOT, "data/train/SpatialVID_HQ_metadata.csv"))
-        min_anno_length = (self.num_views - 1) * self.min_interval + 1
-        annotation_interval = (0.2 * metadata["fps"]).astype(int)
-        min_clip_length = annotation_interval * (min_anno_length - 1) + 1
+        if self.continuous_target_frames:
+            min_clip_length = int(self.num_views)
+        else:
+            min_anno_length = (self.num_views - 1) * self.min_interval + 1
+            annotation_interval = (0.2 * metadata["fps"]).astype(int)
+            min_clip_length = annotation_interval * (min_anno_length - 1) + 1
         self.scenes = metadata[metadata["num frames"] >= min_clip_length]
+        if self.video_ids is not None:
+            self.scenes = self.scenes[self.scenes["id"].astype(str).isin(self.video_ids)]
+        if self.video_paths is not None:
+            self.scenes = self.scenes[self.scenes["video path"].astype(str).isin(self.video_paths)]
+        if len(self.scenes) == 0:
+            filters = []
+            if self.video_ids is not None:
+                filters.append(f"video_ids={sorted(self.video_ids)}")
+            if self.video_paths is not None:
+                filters.append(f"video_paths={sorted(self.video_paths)}")
+            filter_text = ", ".join(filters) if filters else "no filters"
+            raise ValueError(f"SpatialVID found no scenes after filtering ({filter_text}).")
 
     def __len__(self):
         return len(self.scenes)
+
+    def _context_local_indices(self, num_context_views):
+        num_context_views = int(np.clip(num_context_views, 1, self.num_views))
+        if num_context_views >= self.num_views:
+            return np.arange(self.num_views, dtype=np.int64)
+        if self.force_first_context:
+            indices = np.linspace(0, self.num_views - 1, num_context_views, dtype=int)
+            indices[0] = 0
+            return np.unique(indices).astype(np.int64)
+        return np.unique(np.linspace(0, self.num_views - 1, num_context_views, dtype=int)).astype(np.int64)
+
+    def _timestamp(self, sample_index, time_index, v, first_sample_index, first_time_index, reverse, fps):
+        if self.timestamp_unit == "seconds":
+            delta = sample_index[v] - first_sample_index
+            if reverse:
+                delta = -delta
+            return np.float32(delta / max(float(fps), 1e-6))
+        delta = time_index - first_time_index if not reverse else first_time_index - time_index
+        return np.float32(delta)
 
     def _get_views(self, idx, rng, num_context_views):
         scene_info = self.scenes.iloc[idx]
         video_path = osp.join(self.ROOT, "SpatialVid/HQ", scene_info["video path"])
         annotation_dir = osp.join(self.ROOT, "SpatialVid/HQ", scene_info["annotation path"])
+        poses_path = osp.join(annotation_dir, "poses.npy")
+        intrinsics_path = osp.join(annotation_dir, "intrinsics.npy")
+        has_camera_annotations = self.use_camera_annotations and osp.exists(poses_path) and osp.exists(intrinsics_path)
+        poses = np.load(poses_path).astype(np.float32) if has_camera_annotations else None
+        intrinsics = np.load(intrinsics_path).astype(np.float32) if has_camera_annotations else None
+        if has_camera_annotations:
+            annotation_length = min(len(poses), len(intrinsics))
+            poses = poses[:annotation_length]
+            intrinsics = intrinsics[:annotation_length]
 
         with VideoReader_contextmanager(video_path, num_threads=2) as video_reader:
             video_length = len(video_reader)
-            sample_index, reverse = self.sample_from_video(
-                video_length, self.num_views, self.min_interval, self.max_interval, rng
-            )
-            sample_context_index = sample_index[np.linspace(0, self.num_views - 1, num_context_views, dtype=int)]
+            fps = float(scene_info["fps"])
+            reverse = False
+            if self.continuous_target_frames:
+                clip_length = int(self.num_views)
+                start = rng.integers(0, max(video_length - clip_length, 0) + 1)
+                sample_index = np.arange(start, start + clip_length, dtype=np.int64)
+                if has_camera_annotations:
+                    video_lookup = np.linspace(0, video_length - 1, annotation_length)
+                    sample_anno_index = np.abs(video_lookup[None, :] - sample_index[:, None]).argmin(axis=1)
+                else:
+                    sample_anno_index = None
+            elif has_camera_annotations:
+                sample_anno_index, reverse = self.sample_from_video(
+                    annotation_length, self.num_views, self.min_interval, self.max_interval, rng
+                )
+                video_lookup = np.linspace(0, video_length - 1, annotation_length, dtype=int)
+                sample_index = video_lookup[sample_anno_index]
+            else:
+                sample_index, reverse = self.sample_from_video(
+                    video_length, self.num_views, self.min_interval, self.max_interval, rng
+                )
+                sample_anno_index = None
             images = video_reader.get_batch(sample_index).asnumpy()
 
         with open(osp.join(annotation_dir, "caption.json"), 'r') as f:
             captions = json.load(f)
             text_prompt = captions["SceneDescription"]
 
+        context_local_indices = set(self._context_local_indices(num_context_views).tolist())
+        first_sample_index = sample_index[0]
+        first_time_index = sample_anno_index[0] if has_camera_annotations else sample_index[0]
         context_views = []
         target_views = []
         for v, rgb_image in enumerate(images):
-            timestamp = sample_index[v] - sample_index[0] if not reverse else sample_index[0] - sample_index[v]
-            rgb_image, *_ = self._crop_resize_if_necessary(
-                rgb_image, (self.width, self.height), rng=rng, info=(idx, v),
+            time_index = sample_anno_index[v] if has_camera_annotations else sample_index[v]
+            timestamp = self._timestamp(sample_index, time_index, v, first_sample_index, first_time_index, reverse, fps)
+            original_height, original_width = rgb_image.shape[:2]
+            camera_pose = None
+            camera_intr = None
+            if has_camera_annotations:
+                anno_index = sample_anno_index[v]
+                camera_pose = _pose_vec_xyzw_to_c2w(poses[anno_index])
+                camera_intr = _intrinsics_vec_to_matrix(intrinsics[anno_index], original_width, original_height)
+            rgb_image, _, camera_intr = self._crop_resize_if_necessary(
+                rgb_image, (self.width, self.height), rng=rng, info=(idx, v), intrinsics=camera_intr,
             )
-            if sample_index[v] in sample_context_index:
+            view = dict(
+                img=rgb_image,
+                dataset="SpatialVID",
+                video_name=scene_info["id"],
+                image_name=f"frame_{sample_index[v]:06d}",
+                is_static=False,
+                timestamp=timestamp,
+                prompt=text_prompt,
+            )
+            if has_camera_annotations:
+                view["camera_poses"] = camera_pose.astype(np.float32)
+                view["camera_intrs"] = camera_intr.astype(np.float32)
+            if v in context_local_indices:
+                view["is_target"] = False
                 context_views.append(
-                    dict(
-                        img=rgb_image,
-                        dataset="SpatialVID",
-                        video_name=scene_info["id"],
-                        image_name=f"frame_{sample_index[v]:06d}",
-                        is_static=False,
-                        is_target=False,
-                        timestamp=timestamp,
-                        prompt=text_prompt,
-                    )
+                    view
                 )
             else:
+                view["is_target"] = True
                 target_views.append(
-                    dict(
-                        img=rgb_image,
-                        dataset="SpatialVID",
-                        video_name=scene_info["id"],
-                        image_name=f"frame_{sample_index[v]:06d}",
-                        is_static=False,
-                        is_target=True,
-                        timestamp=timestamp,
-                        prompt=text_prompt,
-                    )
+                    view
                 )
         views = context_views + target_views
         return views

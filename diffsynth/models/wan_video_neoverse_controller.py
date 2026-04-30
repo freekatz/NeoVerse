@@ -88,13 +88,51 @@ class NeoVerseControlBranch(torch.nn.Module):
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
     ):
+        c = self.encode_condition(
+            target_rgb_latents,
+            target_depth_latents,
+            target_cams,
+            target_masks,
+            sequence_length=x.shape[1],
+        )
+        return self.hints_from_condition(
+            c,
+            x,
+            context,
+            t_mod,
+            freqs,
+            use_gradient_checkpointing=use_gradient_checkpointing,
+            use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+        )
+
+    def encode_condition(
+        self,
+        target_rgb_latents,
+        target_depth_latents,
+        target_cams,
+        target_masks,
+        sequence_length: int = None,
+    ):
         target_latents = torch.cat((target_rgb_latents, target_depth_latents), dim=1)
         target_mask_cams = torch.cat((target_masks, target_cams), dim=2).permute(0, 2, 1, 3, 4) # [B, C, T, H, W]
         target_mask_cams = F.pad(target_mask_cams, self.control_mask_padding, mode="constant", value=0)
         target_mask_cams = self.control_mask_cam_embedding(target_mask_cams)
         c = self.control_patch_embedding(torch.cat((target_latents, target_mask_cams), dim=1))
         c = c.flatten(2).transpose(1, 2)
-        c = torch.cat((c, c.new_zeros(c.shape[0], x.shape[1] - c.shape[1], c.shape[2])), dim=1)
+        if sequence_length is not None:
+            c = torch.cat((c, c.new_zeros(c.shape[0], sequence_length - c.shape[1], c.shape[2])), dim=1)
+        return c
+
+    def hints_from_condition(
+        self,
+        c,
+        x,
+        context,
+        t_mod,
+        freqs,
+        use_gradient_checkpointing: bool = False,
+        use_gradient_checkpointing_offload: bool = False,
+    ):
 
         def create_custom_forward(module):
             def custom_forward(*inputs):

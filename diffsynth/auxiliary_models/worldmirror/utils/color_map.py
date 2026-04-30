@@ -3,9 +3,15 @@
 import torch
 from colorspacious import cspace_convert
 from einops import rearrange
-from jaxtyping import Float
 from matplotlib import cm
 from torch import Tensor
+
+try:
+    from jaxtyping import Float
+except ModuleNotFoundError:
+    class Float:
+        def __class_getitem__(cls, item):
+            return Tensor
 
 
 def apply_color_map(

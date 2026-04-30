@@ -1,10 +1,12 @@
 import argparse
+import copy
 import gc
 import io
 import json
 import os
 import threading
 import time
+import imageio
 import torch
 import numpy as np
 import uvicorn
@@ -22,6 +24,7 @@ from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
 from diffsynth import save_video
 from diffsynth.utils.auxiliary import CameraTrajectory, load_video, homo_matrix_inverse
 from diffsynth.utils.app import extract_point_cloud, build_scene_glb
+from diffsynth.auxiliary_models.worldmirror.models.utils.rotation import quat_to_rotmat, rotmat_to_quat
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--reconstructor_path", type=str,
@@ -29,6 +32,8 @@ parser.add_argument("--reconstructor_path", type=str,
                     help="Path to reconstructor checkpoint")
 parser.add_argument("--low_vram", action="store_true",
                     help="Enable low-VRAM mode with model offloading")
+parser.add_argument("--device", type=str, default=None,
+                    help="Torch device to use, for example cuda, cuda:1, or cpu")
 parser.add_argument("--server_name", type=str, default="0.0.0.0",
                     help="Host/IP for the Gradio server to bind to")
 parser.add_argument("--server_port", type=int, default=7860,
@@ -42,13 +47,17 @@ args, _ = parser.parse_known_args()
 # ---------------------------------------------------------------------------
 OUTPUT_ROOT = "outputs/gradio"
 os.makedirs(OUTPUT_ROOT, exist_ok=True)
+WORKFLOW_ROOT = os.path.join(OUTPUT_ROOT, "workflow")
+os.makedirs(WORKFLOW_ROOT, exist_ok=True)
 GLB_PATH = os.path.join(OUTPUT_ROOT, "scene.glb")
 PREVIEW_PATH = os.path.join(OUTPUT_ROOT, "preview.mp4")
 MASK_PATH = os.path.join(OUTPUT_ROOT, "mask.mp4")
 OUTPUT_PATH = os.path.join(OUTPUT_ROOT, "output.mp4")
 COMPARE_PATH = os.path.join(OUTPUT_ROOT, "render_vs_generated.mp4")
 JSON_PATH = os.path.join(OUTPUT_ROOT, "trajectory.json")
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+if str(device).startswith("cuda:") and torch.cuda.is_available():
+    torch.cuda.set_device(torch.device(device))
 VIEWER_LOCK = threading.RLock()
 LATEST_SCENE = {
     "state": None,
@@ -56,6 +65,26 @@ LATEST_SCENE = {
     "source": None,
     "updated_at": None,
 }
+SCENE_REGISTRY = {
+    "records": {},
+    "order": [],
+    "active_id": None,
+}
+PIPELINE_MODEL_NAMES = ("text_encoder", "dit", "vae", "control_branch", "reconstructor")
+RENDER_TARGET_KEYS = (
+    "target_rgb",
+    "target_depth",
+    "target_mask",
+    "target_poses",
+    "target_intrs",
+    "target_timestamps",
+)
+SCENE_TENSOR_KEYS = (
+    "input_intrs",
+    "input_cam2world",
+    "input_timestamps",
+)
+WORKFLOW_START_POLICIES = {"previous_end", "initial", "reconstruction_first"}
 print(f"Loading NeoVerse pipeline (reconstructor: {args.reconstructor_path})...")
 pipe = WanVideoNeoVersePipeline.from_pretrained(
     local_model_path="models",
@@ -69,10 +98,125 @@ pipe = WanVideoNeoVersePipeline.from_pretrained(
 print("Pipeline loaded.")
 
 
+def _cuda_cleanup():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _module_current_device(module):
+    for tensor in module.parameters(recurse=True):
+        return tensor.device
+    for tensor in module.buffers(recurse=True):
+        return tensor.device
+    return torch.device("cpu")
+
+
+def _set_model_phase(active_model_names=()):
+    if not str(device).startswith("cuda") or not torch.cuda.is_available():
+        return
+    active = set(active_model_names or ())
+    if pipe.vram_management_enabled:
+        pipe.load_models_to_device(list(active))
+        _cuda_cleanup()
+        return
+
+    for name in PIPELINE_MODEL_NAMES:
+        model = getattr(pipe, name, None)
+        if model is None:
+            continue
+        target_device = torch.device(device if name in active else "cpu")
+        if _module_current_device(model) != target_device:
+            model.to(target_device)
+    _cuda_cleanup()
+
+
+def _move_tensor_to_device(value, target_device):
+    if torch.is_tensor(value):
+        return value.to(device=target_device)
+    return value
+
+
+def _move_gaussian_to_device(gaussian, target_device):
+    for attr_name, attr_value in list(gaussian.__dict__.items()):
+        if torch.is_tensor(attr_value):
+            setattr(gaussian, attr_name, attr_value.to(device=target_device))
+    return gaussian
+
+
+def _move_state_gaussians_to_device(state, target_device):
+    if state is None or "gaussians" not in state:
+        return state
+    for batch in state["gaussians"]:
+        for gaussian in batch:
+            _move_gaussian_to_device(gaussian, target_device)
+    return state
+
+
+def _offload_registered_scene_gaussians_to_cpu():
+    with VIEWER_LOCK:
+        states = [record["state"] for record in SCENE_REGISTRY["records"].values()]
+    seen = set()
+    for scene_state in states:
+        if scene_state is None:
+            continue
+        state_id = id(scene_state)
+        if state_id in seen:
+            continue
+        seen.add(state_id)
+        _move_state_gaussians_to_device(scene_state, "cpu")
+    _cuda_cleanup()
+
+
+def _move_state_tensors_to_device(state, target_device, keys):
+    if state is None:
+        return state
+    for key in keys:
+        if key in state:
+            state[key] = _move_tensor_to_device(state[key], target_device)
+    return state
+
+
+def _ensure_scene_state_on_device(state):
+    _move_state_tensors_to_device(state, device, SCENE_TENSOR_KEYS)
+    _move_state_gaussians_to_device(state, device)
+    return state
+
+
+def _ensure_render_targets_on_device(state):
+    _move_state_tensors_to_device(state, device, RENDER_TARGET_KEYS)
+    return state
+
+
+def _clear_transient_render_state(state):
+    if state is None:
+        return state
+    for key in RENDER_TARGET_KEYS:
+        state.pop(key, None)
+    return state
+
+
+def _raise_cuda_oom(stage, exc):
+    try:
+        _set_model_phase(())
+    finally:
+        _cuda_cleanup()
+    raise gr.Error(
+        f"CUDA out of memory while {stage}. The workflow cleared cached tensors; "
+        "try fewer iterations, fewer frames, or restart with --low_vram if this repeats."
+    ) from exc
+
+
+def _export_scene_to(scene, output_path):
+    """Export a trimesh.Scene and return the path."""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    scene.export(file_obj=output_path)
+    return output_path
+
+
 def _export_scene(scene):
     """Export a trimesh.Scene to the fixed GLB path and return it."""
-    scene.export(file_obj=GLB_PATH)
-    return GLB_PATH
+    return _export_scene_to(scene, GLB_PATH)
 
 
 def _safe_normalize(vec, eps=1e-6):
@@ -195,6 +339,36 @@ def _build_side_by_side_frames(left_frames, right_frames, gap=8, background=(10,
     return output_frames
 
 
+def _concat_video_files(video_paths, output_path, fps=16):
+    paths = [path for path in video_paths if path and os.path.exists(path)]
+    if not paths:
+        return None
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    writer = imageio.get_writer(output_path, fps=fps, quality=9)
+    reference_size = None
+    try:
+        for path in paths:
+            reader = imageio.get_reader(path)
+            try:
+                for frame in reader:
+                    frame = np.asarray(frame)
+                    if frame.ndim == 2:
+                        frame = np.stack([frame] * 3, axis=-1)
+                    if frame.ndim == 3 and frame.shape[-1] == 4:
+                        frame = frame[..., :3]
+                    if reference_size is None:
+                        reference_size = (frame.shape[1], frame.shape[0])
+                    elif (frame.shape[1], frame.shape[0]) != reference_size:
+                        frame = np.asarray(Image.fromarray(frame).resize(reference_size, Image.BICUBIC))
+                    writer.append_data(frame)
+            finally:
+                reader.close()
+    finally:
+        writer.close()
+    return output_path
+
+
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
 
 
@@ -306,7 +480,122 @@ def _store_latest_scene(state, source):
         LATEST_SCENE["meta"] = meta
         LATEST_SCENE["source"] = source
         LATEST_SCENE["updated_at"] = time.time()
-    return meta
+        record = _register_scene_unlocked(
+            scene_id="latest",
+            label=f"Latest: {meta.get('source_label', source)}",
+            state=state,
+            meta=meta,
+            source=source,
+            make_active=True,
+        )
+        LATEST_SCENE["meta"] = record["meta"]
+    return record["meta"]
+
+
+def _public_scene_record(record):
+    meta = dict(record["meta"] or {})
+    meta["scene_id"] = record["scene_id"]
+    meta["scene_label"] = record["label"]
+    return {
+        "scene_id": record["scene_id"],
+        "label": record["label"],
+        "source": record.get("source"),
+        "run_id": record.get("run_id"),
+        "iteration": record.get("iteration"),
+        "generated_video": record.get("generated_video"),
+        "comparison_video": record.get("comparison_video"),
+        "glb_path": record.get("glb_path"),
+        "updated_at": record.get("updated_at"),
+        "meta": meta,
+    }
+
+
+def _scene_choices_from_records(records):
+    return [(record["label"], record["scene_id"]) for record in records]
+
+
+def _ordered_scene_records_unlocked(run_id=None):
+    records = []
+    for scene_id in SCENE_REGISTRY["order"]:
+        record = SCENE_REGISTRY["records"].get(scene_id)
+        if record is None:
+            continue
+        if run_id is not None and record.get("run_id") != run_id:
+            continue
+        records.append(record)
+    return records
+
+
+def _register_scene_unlocked(
+    scene_id,
+    label,
+    state,
+    meta=None,
+    source="workflow",
+    glb_path=None,
+    generated_video=None,
+    comparison_video=None,
+    run_id=None,
+    iteration=None,
+    make_active=False,
+):
+    if meta is None:
+        meta = _compute_scene_meta(state)
+    meta = dict(meta)
+    meta["scene_id"] = scene_id
+    meta["scene_label"] = label
+    state["viewer_meta"] = meta
+
+    record = {
+        "scene_id": scene_id,
+        "label": label,
+        "state": state,
+        "meta": meta,
+        "source": source,
+        "glb_path": glb_path,
+        "generated_video": generated_video,
+        "comparison_video": comparison_video,
+        "run_id": run_id,
+        "iteration": iteration,
+        "updated_at": time.time(),
+    }
+    if scene_id not in SCENE_REGISTRY["records"]:
+        SCENE_REGISTRY["order"].append(scene_id)
+    SCENE_REGISTRY["records"][scene_id] = record
+    if make_active:
+        SCENE_REGISTRY["active_id"] = scene_id
+    return record
+
+
+def _register_scene(*args, **kwargs):
+    with VIEWER_LOCK:
+        return _register_scene_unlocked(*args, **kwargs)
+
+
+def _get_scene_record_unlocked(scene_id=None):
+    if scene_id:
+        record = SCENE_REGISTRY["records"].get(scene_id)
+        if record is None:
+            raise KeyError(scene_id)
+        return record
+    active_id = SCENE_REGISTRY.get("active_id")
+    if active_id and active_id in SCENE_REGISTRY["records"]:
+        return SCENE_REGISTRY["records"][active_id]
+    if LATEST_SCENE["state"] is not None:
+        return {
+            "scene_id": "latest",
+            "label": "Latest scene",
+            "state": LATEST_SCENE["state"],
+            "meta": LATEST_SCENE["meta"],
+            "source": LATEST_SCENE["source"],
+            "glb_path": None,
+            "generated_video": None,
+            "comparison_video": None,
+            "run_id": None,
+            "iteration": None,
+            "updated_at": LATEST_SCENE["updated_at"],
+        }
+    return None
 
 
 @torch.no_grad()
@@ -330,6 +619,7 @@ def _render_view_image(
     if state is None or "gaussians" not in state:
         raise ValueError("Run reconstruction first.")
 
+    _ensure_scene_state_on_device(state)
     base_h, base_w = state["height"], state["width"]
     resolution_scale = float(np.clip(resolution_scale, 0.25, 1.0))
     render_h = max(64, int(round(base_h * resolution_scale)))
@@ -479,22 +769,19 @@ def handle_upload(files, scene_type):
 # 2. Reconstruction
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def _run_reconstruction_core(state, source="gradio"):
+def _run_reconstruction_core(state, source="gradio", store_latest=True, export_glb=True):
     if state is None or "images" not in state:
         raise ValueError("Please upload a video or images first.")
 
+    _set_model_phase(("reconstructor",))
     pil_images = state["images"]
     views = _build_source_views(pil_images, state.get("scene_type", "General scene"))
 
-    if pipe.vram_management_enabled:
-        pipe.reconstructor.to(device)
-
-    with torch.amp.autocast("cuda", dtype=pipe.torch_dtype):
-        predictions = pipe.reconstructor(views, is_inference=True, use_motion=False)
-
-    if pipe.vram_management_enabled:
-        pipe.reconstructor.cpu()
-        torch.cuda.empty_cache()
+    try:
+        with torch.amp.autocast("cuda", dtype=pipe.torch_dtype):
+            predictions = pipe.reconstructor(views, is_inference=True, use_motion=False)
+    finally:
+        _set_model_phase(())
 
     gaussians = predictions["splats"]
     input_intrs = predictions["rendered_intrinsics"][0]
@@ -502,7 +789,7 @@ def _run_reconstruction_core(state, source="gradio"):
     input_timestamps = predictions["rendered_timestamps"][0]
     points, colors, frame_indices = extract_point_cloud(predictions)
 
-    state["source_views"] = views
+    state.pop("source_views", None)
     state["gaussians"] = gaussians
     state["input_intrs"] = input_intrs
     state["input_cam2world"] = input_cam2world
@@ -517,9 +804,11 @@ def _run_reconstruction_core(state, source="gradio"):
     else:
         state["scene_center"] = input_cam2world[:, :3, 3].detach().cpu().numpy().mean(axis=0).astype(np.float32)
 
-    scene = build_scene_glb(points, colors, frame_indices, input_cam2world.detach().cpu().numpy())
-    glb_path = _export_scene(scene)
-    meta = _store_latest_scene(state, source=source)
+    glb_path = None
+    if export_glb:
+        scene = build_scene_glb(points, colors, frame_indices, input_cam2world.detach().cpu().numpy())
+        glb_path = _export_scene(scene)
+    meta = _store_latest_scene(state, source=source) if store_latest else _compute_scene_meta(state)
     return state, glb_path, meta
 
 
@@ -1378,6 +1667,76 @@ def _resolve_time_payload(num_frames, time_preset, time_keyframes_text):
     return payload, keyframes, time_curve
 
 
+def _write_json_file(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+    return path
+
+
+def _build_camera_params_json(
+    state,
+    t_type,
+    angle,
+    distance,
+    orbit_radius,
+    mode,
+    zoom_ratio,
+    use_first_frame,
+    time_preset,
+    time_keyframes_text,
+    num_frames=None,
+    name="gradio_traj",
+):
+    num_frames = int(num_frames or _get_num_frames_from_state(state))
+    num_frames = max(num_frames, 2)
+    last_frame = max(num_frames - 1, 0)
+    time_payload, _, _ = _resolve_time_payload(num_frames, time_preset, time_keyframes_text)
+    json_data = {
+        "name": name,
+        "mode": mode,
+        "num_frames": num_frames,
+        "zoom_ratio": float(zoom_ratio),
+        "use_first_frame": bool(use_first_frame),
+        "keyframes": [
+            {"0": [{"static": {}}]},
+            {
+                str(last_frame): [{
+                    t_type: {
+                        "angle": int(angle),
+                        "distance": float(distance),
+                        "orbit_radius": float(orbit_radius),
+                    }
+                }]
+            },
+        ],
+    }
+    json_data.update(time_payload)
+    return json_data
+
+
+def _prepare_uploaded_trajectory_json(
+    state,
+    t_file,
+    mode,
+    zoom_ratio,
+    use_first_frame,
+    time_preset,
+    time_keyframes_text,
+):
+    if t_file is None:
+        raise gr.Error("Upload a trajectory JSON first.")
+    with open(t_file, "r") as f:
+        json_data = json.load(f)
+    json_data["mode"] = mode
+    json_data["zoom_ratio"] = zoom_ratio
+    json_data["use_first_frame"] = use_first_frame
+    json_data.setdefault("num_frames", _get_num_frames_from_state(state))
+    time_payload, _, _ = _resolve_time_payload(int(json_data["num_frames"]), time_preset, time_keyframes_text)
+    json_data.update(time_payload)
+    return json_data
+
+
 def _resample_camera_sequence(cam2world, num_frames):
     if cam2world.shape[0] == num_frames:
         return cam2world
@@ -1418,6 +1777,164 @@ def _should_copy_first_frame(use_first_frame, render_timestamps, input_timestamp
     if abs(float(render_timestamps[0].item()) - float(input_timestamps[0].item())) > 1e-4:
         return False
     return _poses_are_aligned(input_cam2world[0], target_cam2world[0])
+
+
+def _mask_tensor_to_pil_frames(target_mask):
+    frames = []
+    for i in range(target_mask.shape[1]):
+        mask_f = (target_mask[0, i].clamp(0, 1) * 255).to(torch.uint8).cpu().numpy()
+        if mask_f.ndim == 3 and mask_f.shape[2] == 1:
+            mask_f = np.repeat(mask_f, 3, axis=2)
+        elif mask_f.ndim == 2:
+            mask_f = np.stack([mask_f] * 3, axis=-1)
+        frames.append(Image.fromarray(mask_f))
+    return frames
+
+
+@torch.no_grad()
+def _render_trajectory_core(
+    state,
+    json_data,
+    alpha_threshold,
+    trajectory_path,
+    preview_path=None,
+    mask_path=None,
+    glb_path=None,
+    relative_anchor_pose=None,
+):
+    if state is None or "gaussians" not in state:
+        raise gr.Error("Run reconstruction first.")
+
+    _ensure_scene_state_on_device(state)
+    _write_json_file(trajectory_path, json_data)
+    cam_traj = CameraTrajectory.from_json(trajectory_path)
+
+    static_flag = state.get("scene_type", "General scene") == "Static scene"
+    input_cam2world = state["input_cam2world"]
+    target_cam2world = cam_traj.c2w.to(device)
+    num_frames = target_cam2world.shape[0]
+    if cam_traj.mode == "relative":
+        if relative_anchor_pose is not None:
+            anchor_pose = relative_anchor_pose.to(device=target_cam2world.device, dtype=target_cam2world.dtype)
+            target_cam2world = anchor_pose.unsqueeze(0) @ target_cam2world
+        elif static_flag:
+            target_cam2world = input_cam2world[0:1] @ target_cam2world
+        else:
+            source_cam2world = _resample_camera_sequence(input_cam2world, num_frames)
+            target_cam2world = source_cam2world @ target_cam2world
+
+    gaussians = state["gaussians"]
+    input_intrs = state["input_intrs"]
+    timestamps = state["input_timestamps"]
+    H, W = state["height"], state["width"]
+
+    if static_flag:
+        K_render = input_intrs[:1].repeat(num_frames, 1, 1)
+        render_timestamps = timestamps[:1].repeat(num_frames)
+    else:
+        K_render = _resample_intrinsics(input_intrs, num_frames)
+        render_timestamps = cam_traj.time_curve.to(device=device, dtype=timestamps.dtype)
+        render_timestamps = render_timestamps.clamp(
+            min=float(timestamps.min().item()),
+            max=float(timestamps.max().item()),
+        )
+
+    ratio = torch.linspace(1, cam_traj.zoom_ratio, K_render.shape[0], device=K_render.device, dtype=K_render.dtype)
+    K_zoomed = K_render.clone()
+    K_zoomed[:, 0, 0] *= ratio
+    K_zoomed[:, 1, 1] *= ratio
+
+    target_world2cam = homo_matrix_inverse(target_cam2world)
+    target_rgb, target_depth, target_alpha = pipe.reconstructor.gs_renderer.rasterizer.forward(
+        gaussians,
+        render_viewmats=[target_world2cam],
+        render_Ks=[K_zoomed],
+        render_timestamps=[render_timestamps],
+        sh_degree=0, width=W, height=H,
+    )
+
+    target_mask = (target_alpha > alpha_threshold).float()
+    if _should_copy_first_frame(cam_traj.use_first_frame, render_timestamps, timestamps, target_cam2world, input_cam2world):
+        first_frame_rgb = F.to_tensor(state["images"][0]).permute(1, 2, 0).to(device)
+        target_rgb[0, 0] = first_frame_rgb
+        target_mask[0, 0] = 1.0
+
+    state["target_rgb"] = target_rgb
+    state["target_depth"] = target_depth
+    state["target_mask"] = target_mask
+    state["target_poses"] = target_cam2world.unsqueeze(0)
+    state["target_intrs"] = K_zoomed.unsqueeze(0)
+    state["target_timestamps"] = render_timestamps.unsqueeze(0)
+
+    if preview_path is not None:
+        os.makedirs(os.path.dirname(preview_path), exist_ok=True)
+        save_video(_target_rgb_to_pil_frames(target_rgb), preview_path, fps=16)
+    if mask_path is not None:
+        os.makedirs(os.path.dirname(mask_path), exist_ok=True)
+        save_video(_mask_tensor_to_pil_frames(target_mask), mask_path, fps=16)
+    if glb_path is not None:
+        scene = build_scene_glb(
+            state["points"],
+            state["colors"],
+            state["frame_indices"],
+            target_cam2world.detach().cpu().numpy(),
+        )
+        _export_scene_to(scene, glb_path)
+
+    return {
+        "state": state,
+        "cam_traj": cam_traj,
+        "target_cam2world": target_cam2world,
+        "target_intrs": K_zoomed,
+        "target_timestamps": render_timestamps,
+        "preview_path": preview_path,
+        "mask_path": mask_path,
+        "glb_path": glb_path,
+        "trajectory_path": trajectory_path,
+    }
+
+
+@torch.no_grad()
+def _generate_video_core(state, prompt, negative_prompt, seed, output_path, compare_path=None):
+    if state is None or "target_rgb" not in state:
+        raise gr.Error("Run Render Preview first.")
+
+    _ensure_render_targets_on_device(state)
+    _set_model_phase(("text_encoder", "dit", "vae", "control_branch"))
+    H, W = state["height"], state["width"]
+    num_frames = int(state["target_rgb"].shape[1])
+    wrapped_data = {
+        "source_views": None,
+        "target_rgb": state["target_rgb"],
+        "target_depth": state["target_depth"],
+        "target_mask": state["target_mask"],
+        "target_poses": state["target_poses"],
+        "target_intrs": state["target_intrs"],
+    }
+
+    try:
+        generated_frames = pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            seed=int(seed), rand_device=device,
+            height=H, width=W, num_frames=num_frames,
+            cfg_scale=1.0, num_inference_steps=4, tiled=False,
+            **wrapped_data,
+        )
+    finally:
+        _set_model_phase(())
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    save_video(generated_frames, output_path, fps=16)
+    if compare_path is not None:
+        os.makedirs(os.path.dirname(compare_path), exist_ok=True)
+        comparison_frames = _build_side_by_side_frames(
+            _target_rgb_to_pil_frames(state["target_rgb"]),
+            generated_frames,
+        )
+        save_video(comparison_frames, compare_path, fps=16)
+    _cuda_cleanup()
+    return generated_frames, output_path, compare_path
 
 
 # ---------------------------------------------------------------------------
@@ -1491,116 +2008,38 @@ def preview(state, selected_tab, t_file, t_type, angle, distance, orbit_r,
     if state is None or "gaussians" not in state:
         raise gr.Error("Run reconstruction first.")
     if selected_tab == TAB_TRAJ_FILE:
-        if t_file is None:
-            raise gr.Error("Upload a trajectory JSON first.")
-        with open(t_file, "r") as f:
-            json_data = json.load(f)
-    else:
-        num_frames = _get_num_frames_from_state(state)
-        json_data = {
-            "name": "gradio_traj",
-            "mode": mode,
-            "num_frames": num_frames,
-            "zoom_ratio": zoom,
-            "use_first_frame": use_ff,
-            "keyframes": [
-                {"0": [{"static": {}}]},
-                {
-                    str(num_frames - 1): [{
-                        t_type: {
-                            "angle": int(angle),
-                            "distance": float(distance),
-                            "orbit_radius": float(orbit_r),
-                        }
-                    }]
-                },
-            ],
-        }
-
-    json_data["mode"] = mode
-    json_data["zoom_ratio"] = zoom
-    json_data["use_first_frame"] = use_ff
-    json_data.setdefault("num_frames", _get_num_frames_from_state(state))
-    time_payload, _, _ = _resolve_time_payload(int(json_data["num_frames"]), time_preset, time_keyframes_text)
-    json_data.update(time_payload)
-    with open(JSON_PATH, "w") as f:
-        json.dump(json_data, f, indent=2)
-    cam_traj = CameraTrajectory.from_json(JSON_PATH)
-
-    static_flag = state.get("scene_type", "General scene") == "Static scene"
-    input_cam2world = state["input_cam2world"]
-    target_cam2world = cam_traj.c2w.to(device)
-    num_frames = target_cam2world.shape[0]
-    if cam_traj.mode == "relative":
-        if static_flag:
-            target_cam2world = input_cam2world[0:1] @ target_cam2world
-        else:
-            source_cam2world = _resample_camera_sequence(input_cam2world, num_frames)
-            target_cam2world = source_cam2world @ target_cam2world
-
-    scene = build_scene_glb(state["points"], state["colors"], state["frame_indices"],
-                            target_cam2world.cpu().numpy())
-    glb_path = _export_scene(scene)
-    gaussians = state["gaussians"]
-    input_intrs = state["input_intrs"]              # [S, 3, 3] tensor
-    timestamps = state["input_timestamps"]           # [S] tensor
-    H, W = state["height"], state["width"]
-
-    if static_flag:
-        K_render = input_intrs[:1].repeat(num_frames, 1, 1)
-        render_timestamps = timestamps[:1].repeat(num_frames)
-    else:
-        K_render = _resample_intrinsics(input_intrs, num_frames)
-        render_timestamps = cam_traj.time_curve.to(device=device, dtype=timestamps.dtype)
-        render_timestamps = render_timestamps.clamp(
-            min=float(timestamps.min().item()),
-            max=float(timestamps.max().item()),
+        json_data = _prepare_uploaded_trajectory_json(
+            state,
+            t_file,
+            mode,
+            zoom,
+            use_ff,
+            time_preset,
+            time_keyframes_text,
         )
-
-    # Apply zoom_ratio (matches inference.py)
-    ratio = torch.linspace(1, cam_traj.zoom_ratio, K_render.shape[0], device=K_render.device, dtype=K_render.dtype)
-    K_zoomed = K_render.clone()
-    K_zoomed[:, 0, 0] *= ratio
-    K_zoomed[:, 1, 1] *= ratio
-
-    target_world2cam = homo_matrix_inverse(target_cam2world)
-    target_rgb, target_depth, target_alpha = pipe.reconstructor.gs_renderer.rasterizer.forward(
-        gaussians,
-        render_viewmats=[target_world2cam],
-        render_Ks=[K_zoomed],
-        render_timestamps=[render_timestamps],
-        sh_degree=0, width=W, height=H,
+    else:
+        json_data = _build_camera_params_json(
+            state,
+            t_type,
+            angle,
+            distance,
+            orbit_r,
+            mode,
+            zoom,
+            use_ff,
+            time_preset,
+            time_keyframes_text,
+        )
+    result = _render_trajectory_core(
+        state,
+        json_data,
+        alpha_threshold,
+        trajectory_path=JSON_PATH,
+        preview_path=PREVIEW_PATH,
+        mask_path=MASK_PATH,
+        glb_path=GLB_PATH,
     )
-
-    target_mask = (target_alpha > alpha_threshold).float()
-    if _should_copy_first_frame(cam_traj.use_first_frame, render_timestamps, timestamps, target_cam2world, input_cam2world):
-        pil_images = state["images"]
-        first_frame_rgb = F.to_tensor(pil_images[0]).permute(1, 2, 0).to(device)
-        target_rgb[0, 0] = first_frame_rgb
-        target_mask[0, 0] = 1.0
-
-    frames = []
-    mask_frames = []
-    for i in range(target_rgb.shape[1]):
-        frame = (target_rgb[0, i].clamp(0, 1) * 255).to(torch.uint8).cpu().numpy()
-        frames.append(Image.fromarray(frame))
-        mask_f = (target_mask[0, i].clamp(0, 1) * 255).to(torch.uint8).cpu().numpy()
-        if mask_f.ndim == 3 and mask_f.shape[2] == 1:
-            mask_f = np.repeat(mask_f, 3, axis=2)
-        elif mask_f.ndim == 2:
-            mask_f = np.stack([mask_f] * 3, axis=-1)
-        mask_frames.append(Image.fromarray(mask_f))
-
-    state["target_rgb"] = target_rgb
-    state["target_depth"] = target_depth
-    state["target_mask"] = target_mask
-    state["target_poses"] = target_cam2world.unsqueeze(0)
-    state["target_intrs"] = K_zoomed.unsqueeze(0)
-    state["target_timestamps"] = render_timestamps.unsqueeze(0)
-
-    save_video(frames, PREVIEW_PATH, fps=16)
-    save_video(mask_frames, MASK_PATH, fps=16)
-    return state, glb_path, PREVIEW_PATH, MASK_PATH, gr.update(interactive=True), JSON_PATH, gr.update(value=None)
+    return result["state"], result["glb_path"], PREVIEW_PATH, MASK_PATH, gr.update(interactive=True), JSON_PATH, gr.update(value=None)
 
 
 # ---------------------------------------------------------------------------
@@ -1674,39 +2113,684 @@ def render_dynamic_view(state, viewer_mode, time_index, yaw, pitch, roll, radius
 @torch.no_grad()
 def generate_final(state, prompt, negative_prompt, seed):
     """Run diffusion generation using rendered conditioning."""
-    if state is None or "target_rgb" not in state:
-        raise gr.Error("Run Render Preview first.")
+    _generate_video_core(state, prompt, negative_prompt, seed, OUTPUT_PATH, COMPARE_PATH)
+    return OUTPUT_PATH, COMPARE_PATH
 
-    H, W = state["height"], state["width"]
-    num_frames = int(state["target_rgb"].shape[1])
-    wrapped_data = {
-        "source_views": state["source_views"],
-        "target_rgb": state["target_rgb"],
-        "target_depth": state["target_depth"],
-        "target_mask": state["target_mask"],
-        "target_poses": state["target_poses"],
-        "target_intrs": state["target_intrs"],
+
+# ---------------------------------------------------------------------------
+# 6. Multi-round workflow
+# ---------------------------------------------------------------------------
+def _gaussian_count(gaussians):
+    total = 0
+    for batch in gaussians:
+        for gs in batch:
+            total += int(gs.means.shape[0])
+    return total
+
+
+def _transform_points_np(points, transform):
+    if points.shape[0] == 0:
+        return points.copy()
+    transform_np = transform.detach().cpu().float().numpy()
+    return (points @ transform_np[:3, :3].T + transform_np[:3, 3]).astype(np.float32)
+
+
+def _transform_gaussian(gs, transform):
+    transformed = copy.copy(gs)
+    for name, value in gs.__dict__.items():
+        if torch.is_tensor(value):
+            setattr(transformed, name, value.detach().clone())
+        else:
+            setattr(transformed, name, copy.deepcopy(value))
+
+    R = transform[:3, :3].to(device=transformed.means.device, dtype=transformed.means.dtype)
+    t = transform[:3, 3].to(device=transformed.means.device, dtype=transformed.means.dtype)
+    transformed.means = transformed.means @ R.transpose(0, 1) + t
+
+    if getattr(transformed, "rotations", None) is not None and transformed.rotations.numel() > 0:
+        rotation_dtype = transformed.rotations.dtype
+        rotation_device = transformed.rotations.device
+        R_float = R.to(device=rotation_device, dtype=torch.float32)
+        # Gaussians store quaternions as WXYZ, while the local utility uses XYZW.
+        rotations_xyzw = transformed.rotations[..., [1, 2, 3, 0]].to(dtype=torch.float32)
+        rotmats = quat_to_rotmat(rotations_xyzw)
+        transformed_xyzw = rotmat_to_quat(R_float.unsqueeze(0) @ rotmats)
+        transformed.rotations = transformed_xyzw[..., [3, 0, 1, 2]].to(
+            device=rotation_device,
+            dtype=rotation_dtype,
+        )
+
+    for velocity_name in ("forward_vel", "backward_vel"):
+        velocity = getattr(transformed, velocity_name, None)
+        if torch.is_tensor(velocity):
+            R_vel = R.to(device=velocity.device, dtype=velocity.dtype)
+            setattr(transformed, velocity_name, velocity @ R_vel.transpose(0, 1))
+    return transformed
+
+
+def _transform_reconstructed_state(state, transform):
+    aligned = dict(state)
+    transform = transform.to(device=state["input_cam2world"].device, dtype=state["input_cam2world"].dtype)
+
+    aligned["input_cam2world"] = transform.unsqueeze(0) @ state["input_cam2world"]
+    aligned["gaussians"] = [
+        [_transform_gaussian(gs, transform) for gs in batch]
+        for batch in state["gaussians"]
+    ]
+    aligned["points"] = _transform_points_np(state["points"], transform)
+    aligned["colors"] = state["colors"].copy()
+    aligned["frame_indices"] = state["frame_indices"].copy()
+    aligned["scene_center"] = _transform_points_np(
+        np.asarray(state["scene_center"], dtype=np.float32)[None],
+        transform,
+    )[0]
+    aligned.pop("viewer_meta", None)
+    return aligned
+
+
+def _align_state_to_target_anchor(state, target_anchor_pose):
+    new_anchor_pose = state["input_cam2world"][0].to(device=target_anchor_pose.device, dtype=target_anchor_pose.dtype)
+    transform = target_anchor_pose @ homo_matrix_inverse(new_anchor_pose.unsqueeze(0))[0]
+    return _transform_reconstructed_state(state, transform), transform
+
+
+def _merge_arrays(first, second, dtype=None):
+    if first.shape[0] == 0:
+        merged = second.copy()
+    elif second.shape[0] == 0:
+        merged = first.copy()
+    else:
+        merged = np.concatenate([first, second], axis=0)
+    if dtype is not None:
+        merged = merged.astype(dtype)
+    return merged
+
+
+def _fuse_reconstructed_state(fused_state, aligned_state):
+    fused = dict(aligned_state)
+    fused.pop("source_views", None)
+    _clear_transient_render_state(fused)
+    base_gaussians = list(fused_state["gaussians"][0])
+    new_gaussians = list(aligned_state["gaussians"][0])
+    fused["gaussians"] = [base_gaussians + new_gaussians]
+
+    base_frame_indices = fused_state["frame_indices"]
+    new_frame_indices = aligned_state["frame_indices"]
+    frame_offset = int(base_frame_indices.max() + 1) if base_frame_indices.shape[0] > 0 else 0
+    fused["points"] = _merge_arrays(fused_state["points"], aligned_state["points"], dtype=np.float32)
+    fused["colors"] = _merge_arrays(fused_state["colors"], aligned_state["colors"], dtype=np.uint8)
+    fused["frame_indices"] = _merge_arrays(
+        base_frame_indices,
+        new_frame_indices + frame_offset,
+        dtype=np.int32,
+    )
+
+    old_history = fused_state.get("camera_history_cam2world")
+    if old_history is None:
+        old_history = fused_state["input_cam2world"].detach().cpu().numpy()
+    new_history = aligned_state["input_cam2world"].detach().cpu().numpy()
+    fused["camera_history_cam2world"] = np.concatenate([old_history, new_history], axis=0)
+    fused["source_label"] = "workflow fused scene"
+    fused["scene_type"] = "General scene"
+    if fused["points"].shape[0] > 0:
+        fused["scene_center"] = np.median(fused["points"], axis=0).astype(np.float32)
+    else:
+        fused["scene_center"] = fused["input_cam2world"][:, :3, 3].detach().cpu().numpy().mean(axis=0).astype(np.float32)
+    fused.pop("viewer_meta", None)
+    return fused
+
+
+def _export_fused_scene(state, output_path):
+    cam2world = state.get("camera_history_cam2world")
+    if cam2world is None:
+        cam2world = state["input_cam2world"].detach().cpu().numpy()
+    scene = build_scene_glb(
+        state["points"],
+        state["colors"],
+        state["frame_indices"],
+        np.asarray(cam2world, dtype=np.float32),
+        vis_frame_num=21,
+    )
+    return _export_scene_to(scene, output_path)
+
+
+def _workflow_media_state_from_first_frame(state):
+    if state is None or "images" not in state or not state["images"]:
+        raise gr.Error("Upload a video or image first.")
+    return {
+        "images": [state["images"][0].copy()],
+        "scene_type": "Static scene",
+        "source_label": f"{state.get('source_label', 'input')} first frame",
     }
 
-    seed = int(seed)
-    generated_frames = pipe(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        seed=seed, rand_device=device,
-        height=H, width=W, num_frames=num_frames,
-        cfg_scale=1.0, num_inference_steps=4, tiled=False,
-        **wrapped_data,
+
+def _workflow_initial_state(state, first_frame_only):
+    if state is None or "images" not in state:
+        raise gr.Error("Upload a video or image first.")
+    if first_frame_only:
+        workflow_state = _workflow_media_state_from_first_frame(state)
+        workflow_state, _, _ = _run_reconstruction_core(
+            workflow_state,
+            source="workflow_initial",
+            store_latest=False,
+            export_glb=False,
+        )
+        return workflow_state
+    if "gaussians" in state:
+        workflow_state = dict(state)
+    else:
+        workflow_state = dict(state)
+        workflow_state, _, _ = _run_reconstruction_core(
+            workflow_state,
+            source="workflow_initial",
+            store_latest=False,
+            export_glb=False,
+        )
+    workflow_state["camera_history_cam2world"] = workflow_state["input_cam2world"].detach().cpu().numpy()
+    return workflow_state
+
+
+def _normalize_iteration_plan(raw_iterations, iteration_count):
+    if not isinstance(raw_iterations, list) or len(raw_iterations) == 0:
+        raise gr.Error("Workflow plan must be a non-empty JSON list or an object with an 'iterations' list.")
+
+    requested_count = len(raw_iterations) if iteration_count is None else int(iteration_count)
+    count = int(np.clip(requested_count, 1, 20))
+    iterations = [copy.deepcopy(item) for item in raw_iterations[:count]]
+    while len(iterations) < count:
+        next_item = copy.deepcopy(iterations[-1])
+        next_item["seed"] = int(next_item.get("seed", 42)) + 1
+        iterations.append(next_item)
+
+    normalized = []
+    for idx, item in enumerate(iterations):
+        if not isinstance(item, dict):
+            raise gr.Error(f"Workflow iteration {idx + 1} must be a JSON object.")
+        motion = item.get("camera_motion", item.get("trajectory", "orbit_left"))
+        if isinstance(motion, dict):
+            motion = "orbit_left"
+        if motion not in CameraTrajectory.VALID_TRAJECTORY_TYPES:
+            motion = "orbit_left"
+        mode = item.get("mode", "relative")
+        if mode not in ("relative", "global"):
+            mode = "relative"
+        time_preset = item.get("time_preset", "linear")
+        if time_preset not in TIME_PRESETS:
+            time_preset = "linear"
+        start_policy = item.get("start_policy", "previous_end")
+        if start_policy not in WORKFLOW_START_POLICIES:
+            start_policy = "previous_end"
+        normalized.append({
+            **item,
+            "prompt": str(item.get("prompt", "A smooth video with complete scene content.")),
+            "negative_prompt": str(item.get("negative_prompt", "")),
+            "seed": int(item.get("seed", 42 + idx)),
+            "num_frames": max(2, int(item.get("num_frames", DEFAULT_TRAJECTORY_FRAMES))),
+            "camera_motion": motion,
+            "angle": float(item.get("angle", 15)),
+            "distance": float(item.get("distance", 0.1)),
+            "orbit_radius": float(item.get("orbit_radius", 1.0)),
+            "mode": mode,
+            "zoom_ratio": float(item.get("zoom_ratio", 1.0)),
+            "use_first_frame": bool(item.get("use_first_frame", True)),
+            "alpha_threshold": float(item.get("alpha_threshold", 1.0)),
+            "time_preset": time_preset,
+            "start_policy": start_policy,
+        })
+    return normalized
+
+
+def _parse_workflow_plan(plan_text, iteration_count):
+    try:
+        parsed = json.loads((plan_text or "").strip())
+    except json.JSONDecodeError as exc:
+        raise gr.Error(f"Invalid workflow plan JSON: {exc}") from exc
+    raw_iterations = parsed.get("iterations") if isinstance(parsed, dict) else parsed
+    return _normalize_iteration_plan(raw_iterations, iteration_count)
+
+
+def _iteration_time_keyframes_text(iteration):
+    if "time_keyframes" not in iteration:
+        return ""
+    value = iteration["time_keyframes"]
+    if isinstance(value, str):
+        return value
+    return json.dumps(value)
+
+
+def _trajectory_json_from_iteration(state, iteration, index):
+    if "keyframes" in iteration or isinstance(iteration.get("trajectory"), dict):
+        json_data = {
+            "name": iteration.get("name", f"workflow_iter_{index + 1:02d}"),
+            "mode": iteration["mode"],
+            "num_frames": iteration["num_frames"],
+            "zoom_ratio": iteration["zoom_ratio"],
+            "use_first_frame": iteration["use_first_frame"],
+        }
+        if "keyframes" in iteration:
+            json_data["keyframes"] = iteration["keyframes"]
+        else:
+            json_data["trajectory"] = iteration["trajectory"]
+        time_payload, _, _ = _resolve_time_payload(
+            iteration["num_frames"],
+            iteration["time_preset"],
+            _iteration_time_keyframes_text(iteration),
+        )
+        json_data.update(time_payload)
+        return json_data
+
+    return _build_camera_params_json(
+        state,
+        iteration["camera_motion"],
+        iteration["angle"],
+        iteration["distance"],
+        iteration["orbit_radius"],
+        iteration["mode"],
+        iteration["zoom_ratio"],
+        iteration["use_first_frame"],
+        iteration["time_preset"],
+        _iteration_time_keyframes_text(iteration),
+        num_frames=iteration["num_frames"],
+        name=iteration.get("name", f"workflow_iter_{index + 1:02d}"),
     )
 
-    save_video(generated_frames, OUTPUT_PATH, fps=16)
-    comparison_frames = _build_side_by_side_frames(
-        _target_rgb_to_pil_frames(state["target_rgb"]),
-        generated_frames,
+
+def _write_resolved_trajectory_json(render_result, output_path):
+    target_cam2world = render_result["target_cam2world"].detach().cpu().float().numpy()
+    frame_indices = list(range(target_cam2world.shape[0]))
+    payload = {
+        "name": "resolved_world_trajectory",
+        "mode": "global",
+        "num_frames": int(target_cam2world.shape[0]),
+        "trajectory": {
+            "frame_indices": frame_indices,
+            "frame_matrices": target_cam2world.tolist(),
+        },
+        "time_curve": render_result["target_timestamps"].detach().cpu().float().tolist(),
+    }
+    return _write_json_file(output_path, payload)
+
+
+WORKFLOW_PLAN_PRESET_LIBRARY = {
+    "World expansion sweep": [
+        {"camera_motion": "pull_out", "angle": 0, "distance": 0.22, "orbit_radius": 1.0, "time_preset": "ease_out", "prompt_addition": "Reveal a wider view of the surrounding world."},
+        {"camera_motion": "orbit_left", "angle": 45, "distance": 0.0, "orbit_radius": 1.1, "time_preset": "ease_in_out", "prompt_addition": "Reveal coherent side details and preserve the scene layout."},
+        {"camera_motion": "orbit_left", "angle": 105, "distance": 0.0, "orbit_radius": 1.2, "time_preset": "linear", "prompt_addition": "Turn toward the back side and complete unseen geometry naturally."},
+        {"camera_motion": "push_in", "angle": 0, "distance": 0.18, "orbit_radius": 1.0, "time_preset": "ease_in", "prompt_addition": "Move forward into newly revealed space with stable details."},
+        {"camera_motion": "move_right", "angle": 0, "distance": 0.18, "orbit_radius": 1.0, "time_preset": "linear", "prompt_addition": "Translate laterally and extend the world beyond the current border."},
+        {"camera_motion": "orbit_right", "angle": 60, "distance": 0.0, "orbit_radius": 1.15, "time_preset": "ease_in_out", "prompt_addition": "Revisit the scene from a diagonal view and keep all additions consistent."},
+    ],
+    "Full orbit survey": [
+        {"camera_motion": "orbit_left", "angle": 45, "distance": 0.0, "orbit_radius": 1.1, "time_preset": "linear", "prompt_addition": "Rotate left and expose the nearby side of the scene."},
+        {"camera_motion": "orbit_left", "angle": 90, "distance": 0.0, "orbit_radius": 1.2, "time_preset": "linear", "prompt_addition": "Continue around the subject and complete the side geometry."},
+        {"camera_motion": "orbit_left", "angle": 135, "distance": 0.0, "orbit_radius": 1.25, "time_preset": "ease_in_out", "prompt_addition": "Reach the back-side view with coherent lighting and structure."},
+        {"camera_motion": "orbit_left", "angle": 180, "distance": 0.0, "orbit_radius": 1.3, "time_preset": "ease_out", "prompt_addition": "Show the opposite side and fill all previously unseen regions."},
+        {"camera_motion": "pull_out", "angle": 0, "distance": 0.18, "orbit_radius": 1.0, "time_preset": "linear", "prompt_addition": "Pull back to stabilize the complete reconstructed world."},
+        {"camera_motion": "orbit_right", "angle": 45, "distance": 0.0, "orbit_radius": 1.15, "time_preset": "ease_in_out", "prompt_addition": "Return toward a three-quarter view while preserving all fused details."},
+    ],
+    "Forward exploration": [
+        {"camera_motion": "push_in", "angle": 0, "distance": 0.18, "orbit_radius": 1.0, "time_preset": "ease_in", "prompt_addition": "Move forward and reveal the next part of the world."},
+        {"camera_motion": "move_right", "angle": 0, "distance": 0.16, "orbit_radius": 1.0, "time_preset": "linear", "prompt_addition": "Shift right while extending the visible environment."},
+        {"camera_motion": "pan_left", "angle": 25, "distance": 0.0, "orbit_radius": 1.0, "time_preset": "ease_in_out", "prompt_addition": "Turn the camera left to inspect newly created space."},
+        {"camera_motion": "push_in", "angle": 0, "distance": 0.16, "orbit_radius": 1.0, "time_preset": "linear", "prompt_addition": "Advance again and maintain temporal stability."},
+        {"camera_motion": "move_left", "angle": 0, "distance": 0.14, "orbit_radius": 1.0, "time_preset": "ease_out", "prompt_addition": "Shift left to cover the opposite side of the path."},
+        {"camera_motion": "pull_out", "angle": 0, "distance": 0.2, "orbit_radius": 1.0, "time_preset": "ease_in_out", "prompt_addition": "Pull back and show the expanded route as a coherent scene."},
+    ],
+    "Vertical and scale pass": [
+        {"camera_motion": "boom_up", "angle": 0, "distance": 0.16, "orbit_radius": 1.0, "time_preset": "ease_out", "prompt_addition": "Move upward and reveal overhead structure."},
+        {"camera_motion": "tilt_down", "angle": 25, "distance": 0.0, "orbit_radius": 1.0, "time_preset": "linear", "prompt_addition": "Tilt downward to connect upper and lower geometry."},
+        {"camera_motion": "orbit_right", "angle": 55, "distance": 0.0, "orbit_radius": 1.15, "time_preset": "ease_in_out", "prompt_addition": "Orbit right from the elevated view and complete side content."},
+        {"camera_motion": "boom_down", "angle": 0, "distance": 0.14, "orbit_radius": 1.0, "time_preset": "linear", "prompt_addition": "Descend into the reconstructed space with stable scale."},
+        {"camera_motion": "tilt_up", "angle": 20, "distance": 0.0, "orbit_radius": 1.0, "time_preset": "ease_out", "prompt_addition": "Tilt upward and preserve continuity with the overhead pass."},
+        {"camera_motion": "pull_out", "angle": 0, "distance": 0.18, "orbit_radius": 1.0, "time_preset": "ease_in_out", "prompt_addition": "Pull out to inspect the full vertical reconstruction."},
+    ],
+}
+WORKFLOW_PLAN_PRESET_CHOICES = ["World expansion sweep", "Full orbit survey", "Forward exploration", "Vertical and scale pass", "Use current controls"]
+WORKFLOW_PLAN_PRESET_DESCRIPTIONS = {
+    "World expansion sweep": "默认 6 步：拉远 -> 左绕到侧面 -> 继续转向背面 -> 前进 -> 右移扩展边界 -> 右绕回斜侧视角。",
+    "Full orbit survey": "默认 6 步：围绕主体持续左绕 45/90/135/180 度，补全背面，再拉远并右绕回三分之四视角。",
+    "Forward exploration": "默认 6 步：前进探索 -> 右移 -> 左转检查新空间 -> 再前进 -> 左移覆盖另一侧 -> 拉远查看扩展路线。",
+    "Vertical and scale pass": "默认 6 步：上升 -> 下俯 -> 高位右绕 -> 下降 -> 上仰 -> 拉远检查垂直方向和尺度。",
+    "Use current controls": "按当前 Trajectory 控件里的相机运动、距离、角度和时间曲线重复 N 次，适合手动精调单一策略。",
+}
+
+
+def workflow_preset_summary(plan_preset):
+    base = WORKFLOW_PLAN_PRESET_DESCRIPTIONS.get(plan_preset, WORKFLOW_PLAN_PRESET_DESCRIPTIONS["World expansion sweep"])
+    return f"{base} 每步默认从上一轮相机终点继续。"
+
+
+def _workflow_time_keyframes_for_preset(time_preset, fallback_text=""):
+    if time_preset == "custom" and (fallback_text or "").strip():
+        return _parse_time_keyframes_text(fallback_text, DEFAULT_TRAJECTORY_FRAMES)
+    effective_preset = time_preset if time_preset in TIME_PRESETS and time_preset != "custom" else "linear"
+    return _build_time_preset_keyframes(effective_preset, DEFAULT_TRAJECTORY_FRAMES)
+
+
+def _compose_workflow_plan_text(
+    plan_preset,
+    iteration_count,
+    prompt_text,
+    negative_prompt,
+    seed_value,
+    current_step,
+    fallback_time_keyframes_text="",
+):
+    requested_count = 6 if iteration_count is None else int(iteration_count)
+    count = int(np.clip(requested_count, 1, 20))
+    if plan_preset == "Use current controls":
+        steps = [current_step] * count
+    else:
+        preset_steps = WORKFLOW_PLAN_PRESET_LIBRARY.get(plan_preset, WORKFLOW_PLAN_PRESET_LIBRARY["World expansion sweep"])
+        steps = [preset_steps[idx % len(preset_steps)] for idx in range(count)]
+
+    plan = []
+    for idx, step in enumerate(steps):
+        step_time_preset = step.get("time_preset", current_step.get("time_preset", "linear"))
+        prompt_addition = step.get("prompt_addition", "")
+        prompt_full = prompt_text if not prompt_addition else f"{prompt_text} {prompt_addition}"
+        plan.append({
+            "name": f"workflow_iter_{idx + 1:02d}",
+            "prompt": prompt_full,
+            "negative_prompt": negative_prompt,
+            "seed": int(seed_value) + idx,
+            "num_frames": DEFAULT_TRAJECTORY_FRAMES,
+            "camera_motion": step.get("camera_motion", current_step["camera_motion"]),
+            "angle": float(step.get("angle", current_step["angle"])),
+            "distance": float(step.get("distance", current_step["distance"])),
+            "orbit_radius": float(step.get("orbit_radius", current_step["orbit_radius"])),
+            "mode": step.get("mode", current_step["mode"]),
+            "zoom_ratio": float(step.get("zoom_ratio", current_step["zoom_ratio"])),
+            "use_first_frame": bool(step.get("use_first_frame", current_step["use_first_frame"])),
+            "alpha_threshold": float(step.get("alpha_threshold", current_step["alpha_threshold"])),
+            "time_preset": step_time_preset,
+            "start_policy": step.get("start_policy", "previous_end"),
+            "time_keyframes": _workflow_time_keyframes_for_preset(step_time_preset, fallback_time_keyframes_text),
+        })
+    return json.dumps({"preset": plan_preset, "iterations": plan}, indent=2)
+
+
+def build_workflow_plan_text(
+    plan_preset,
+    iteration_count,
+    prompt_text,
+    negative_prompt,
+    seed_value,
+    t_type,
+    angle,
+    distance,
+    orbit_radius,
+    mode,
+    zoom_ratio,
+    use_first_frame,
+    alpha_threshold,
+    time_preset,
+    time_keyframes_text,
+):
+    motion = t_type if t_type in CameraTrajectory.VALID_TRAJECTORY_TYPES and t_type != "static" else "orbit_left"
+    current_step = {
+        "camera_motion": motion,
+        "angle": float(angle),
+        "distance": float(distance),
+        "orbit_radius": float(orbit_radius),
+        "mode": mode,
+        "zoom_ratio": float(zoom_ratio),
+        "use_first_frame": bool(use_first_frame),
+        "alpha_threshold": float(alpha_threshold),
+        "time_preset": time_preset,
+    }
+    return _compose_workflow_plan_text(
+        plan_preset,
+        iteration_count,
+        prompt_text,
+        negative_prompt,
+        seed_value,
+        current_step,
+        fallback_time_keyframes_text=time_keyframes_text,
     )
-    save_video(comparison_frames, COMPARE_PATH, fps=16)
-    gc.collect()
-    torch.cuda.empty_cache()
-    return OUTPUT_PATH, COMPARE_PATH
+
+
+@torch.no_grad()
+def run_workflow(state, iteration_count, first_frame_only, plan_text):
+    iterations = _parse_workflow_plan(plan_text, iteration_count)
+    _offload_registered_scene_gaussians_to_cpu()
+    run_id = time.strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(WORKFLOW_ROOT, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+
+    status_lines = [f"run_id={run_id}", "initializing scene"]
+    try:
+        fused_state = _workflow_initial_state(state, first_frame_only)
+    except torch.cuda.OutOfMemoryError as exc:
+        _raise_cuda_oom("initializing the workflow scene", exc)
+    initial_anchor_pose = fused_state["input_cam2world"][0].detach().cpu().clone()
+    workflow_anchor_pose = initial_anchor_pose.clone()
+    initial_scene_path = _export_fused_scene(fused_state, os.path.join(run_dir, "initial_scene.glb"))
+    initial_scene_id = f"{run_id}_initial"
+    _register_scene(
+        scene_id=initial_scene_id,
+        label=f"{run_id} | Initial",
+        state=fused_state,
+        source="workflow_initial",
+        glb_path=initial_scene_path,
+        run_id=run_id,
+        iteration=0,
+        make_active=True,
+    )
+    manifest = {
+        "run_id": run_id,
+        "initial_scene_id": initial_scene_id,
+        "initial_scene": initial_scene_path,
+        "first_frame_only": bool(first_frame_only),
+        "iterations": [],
+    }
+
+    last_output_path = None
+    last_compare_path = None
+    generated_paths = []
+    compare_paths = []
+    final_scene_path = initial_scene_path
+
+    for idx, iteration in enumerate(iterations):
+        iter_dir = os.path.join(run_dir, f"iter_{idx + 1:02d}")
+        os.makedirs(iter_dir, exist_ok=True)
+        start_policy = iteration.get("start_policy", "previous_end")
+        if start_policy == "initial":
+            relative_anchor_pose = initial_anchor_pose
+        elif start_policy == "reconstruction_first":
+            relative_anchor_pose = None
+        else:
+            start_policy = "previous_end"
+            relative_anchor_pose = workflow_anchor_pose
+        status_lines.append(
+            f"iter {idx + 1}/{len(iterations)}: render target trajectory "
+            f"(start_policy={start_policy})"
+        )
+
+        trajectory_json = _trajectory_json_from_iteration(fused_state, iteration, idx)
+        try:
+            render_result = _render_trajectory_core(
+                fused_state,
+                trajectory_json,
+                iteration["alpha_threshold"],
+                trajectory_path=os.path.join(iter_dir, "trajectory.json"),
+                preview_path=os.path.join(iter_dir, "preview.mp4"),
+                mask_path=os.path.join(iter_dir, "mask.mp4"),
+                glb_path=os.path.join(iter_dir, "target_trajectory.glb"),
+                relative_anchor_pose=relative_anchor_pose,
+            )
+        except torch.cuda.OutOfMemoryError as exc:
+            _raise_cuda_oom(f"rendering workflow iteration {idx + 1}", exc)
+        target_anchor_pose = render_result["target_cam2world"][0].detach().cpu().clone()
+        target_end_pose = render_result["target_cam2world"][-1].detach().cpu().clone()
+        resolved_trajectory_path = _write_resolved_trajectory_json(
+            render_result,
+            os.path.join(iter_dir, "target_trajectory_resolved.json"),
+        )
+        _offload_registered_scene_gaussians_to_cpu()
+
+        status_lines.append(f"iter {idx + 1}/{len(iterations)}: generate video")
+        try:
+            generated_frames, output_path, compare_path = _generate_video_core(
+                fused_state,
+                iteration["prompt"],
+                iteration["negative_prompt"],
+                iteration["seed"],
+                output_path=os.path.join(iter_dir, "generated.mp4"),
+                compare_path=os.path.join(iter_dir, "render_vs_generated.mp4"),
+            )
+        except torch.cuda.OutOfMemoryError as exc:
+            _clear_transient_render_state(fused_state)
+            _raise_cuda_oom(f"generating video for workflow iteration {idx + 1}", exc)
+        last_output_path = output_path
+        last_compare_path = compare_path
+        generated_paths.append(output_path)
+        compare_paths.append(compare_path)
+        _clear_transient_render_state(fused_state)
+        _cuda_cleanup()
+
+        status_lines.append(f"iter {idx + 1}/{len(iterations)}: reconstruct generated video")
+        reconstructed_state = {
+            "images": generated_frames,
+            "scene_type": "General scene",
+            "source_label": os.path.basename(output_path),
+        }
+        try:
+            reconstructed_state, _, _ = _run_reconstruction_core(
+                reconstructed_state,
+                source=f"workflow_iter_{idx + 1:02d}",
+                store_latest=False,
+                export_glb=False,
+            )
+        except torch.cuda.OutOfMemoryError as exc:
+            _raise_cuda_oom(f"reconstructing generated video for workflow iteration {idx + 1}", exc)
+
+        aligned_state, align_transform = _align_state_to_target_anchor(reconstructed_state, target_anchor_pose)
+        fused_state = _fuse_reconstructed_state(fused_state, aligned_state)
+        final_scene_path = _export_fused_scene(fused_state, os.path.join(iter_dir, "fused_scene.glb"))
+        scene_id = f"{run_id}_iter_{idx + 1:02d}"
+        _register_scene(
+            scene_id=scene_id,
+            label=f"{run_id} | After iter {idx + 1}",
+            state=fused_state,
+            source=f"workflow_iter_{idx + 1:02d}",
+            glb_path=final_scene_path,
+            generated_video=output_path,
+            comparison_video=compare_path,
+            run_id=run_id,
+            iteration=idx + 1,
+            make_active=True,
+        )
+
+        iteration_record = {
+            "index": idx + 1,
+            "scene_id": scene_id,
+            "prompt": iteration["prompt"],
+            "seed": iteration["seed"],
+            "trajectory": render_result["trajectory_path"],
+            "resolved_trajectory": resolved_trajectory_path,
+            "preview": render_result["preview_path"],
+            "mask": render_result["mask_path"],
+            "generated": output_path,
+            "comparison": compare_path,
+            "fused_scene": final_scene_path,
+            "start_policy": start_policy,
+            "align_transform": align_transform.detach().cpu().float().tolist(),
+            "trajectory_start_pose": target_anchor_pose.float().tolist(),
+            "trajectory_end_pose": target_end_pose.float().tolist(),
+            "fused_gaussians": _gaussian_count(fused_state["gaussians"]),
+            "fused_points": int(fused_state["points"].shape[0]),
+        }
+        manifest["iterations"].append(iteration_record)
+        workflow_anchor_pose = target_end_pose
+        status_lines.append(
+            f"iter {idx + 1}/{len(iterations)}: fused "
+            f"{iteration_record['fused_gaussians']} gaussians, {iteration_record['fused_points']} points"
+        )
+        _offload_registered_scene_gaussians_to_cpu()
+
+    manifest["final_scene"] = final_scene_path
+    all_generated_path = _concat_video_files(
+        generated_paths,
+        os.path.join(run_dir, "generated_all_iterations.mp4"),
+        fps=16,
+    )
+    all_compare_path = _concat_video_files(
+        compare_paths,
+        os.path.join(run_dir, "render_vs_generated_all_iterations.mp4"),
+        fps=16,
+    )
+    manifest["final_video"] = all_generated_path or last_output_path
+    manifest["final_comparison"] = all_compare_path or last_compare_path
+    manifest["last_iteration_video"] = last_output_path
+    manifest["last_iteration_comparison"] = last_compare_path
+    manifest["all_generated"] = all_generated_path
+    manifest["all_comparison"] = all_compare_path
+    _store_latest_scene(fused_state, source="workflow")
+    all_scene_id = f"{run_id}_all"
+    _register_scene(
+        scene_id=all_scene_id,
+        label=f"{run_id} | All iterations",
+        state=fused_state,
+        source="workflow_all_iterations",
+        glb_path=final_scene_path,
+        generated_video=manifest["final_video"],
+        comparison_video=manifest["final_comparison"],
+        run_id=run_id,
+        iteration="all",
+        make_active=True,
+    )
+    manifest["all_scene_id"] = all_scene_id
+    manifest_path = _write_json_file(os.path.join(run_dir, "manifest.json"), manifest)
+    with VIEWER_LOCK:
+        SCENE_REGISTRY["active_id"] = all_scene_id
+    _export_fused_scene(fused_state, GLB_PATH)
+
+    status_lines.append(f"done: {run_dir}")
+    with VIEWER_LOCK:
+        result_records = _ordered_scene_records_unlocked(run_id=run_id)
+    result_choices = _scene_choices_from_records(result_records)
+    result_value = all_scene_id
+    return (
+        fused_state,
+        final_scene_path,
+        manifest["final_video"],
+        manifest["final_comparison"],
+        manifest_path,
+        "\n".join(status_lines),
+        gr.update(choices=result_choices, value=result_value, interactive=True),
+        gr.update(interactive=True),
+        gr.update(interactive=True),
+    )
+
+
+def select_workflow_result(scene_id):
+    if not scene_id:
+        raise gr.Error("Select a workflow result first.")
+    with VIEWER_LOCK:
+        record = SCENE_REGISTRY["records"].get(scene_id)
+        if record is None:
+            raise gr.Error(f"Workflow result is not available in memory: {scene_id}")
+        SCENE_REGISTRY["active_id"] = scene_id
+        LATEST_SCENE["state"] = record["state"]
+        LATEST_SCENE["meta"] = record["meta"]
+        LATEST_SCENE["source"] = record["source"]
+        LATEST_SCENE["updated_at"] = time.time()
+
+    status = (
+        f"selected={record['label']} | "
+        f"scene_id={record['scene_id']} | "
+        f"video={record.get('generated_video') or 'none'}"
+    )
+    return (
+        record["state"],
+        record.get("glb_path"),
+        record.get("generated_video"),
+        record.get("comparison_video"),
+        status,
+        gr.update(interactive=True),
+        gr.update(interactive=True),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1719,6 +2803,29 @@ TAB_TRAJ_FILE = "tab_traj_file"
 DEFAULT_TIME_PRESET, DEFAULT_TIME_TEXT, DEFAULT_TIME_SUMMARY = _build_time_controls(
     DEFAULT_TRAJECTORY_FRAMES,
     preset="linear",
+)
+DEFAULT_WORKFLOW_PROMPT = (
+    "A smooth video with complete scene content. "
+    "Inpaint any missing regions or margins naturally to match the surrounding scene."
+)
+DEFAULT_WORKFLOW_CURRENT_STEP = {
+    "camera_motion": "orbit_left",
+    "angle": 15,
+    "distance": 0.1,
+    "orbit_radius": 1.0,
+    "mode": "relative",
+    "zoom_ratio": 1.0,
+    "use_first_frame": True,
+    "alpha_threshold": 1.0,
+    "time_preset": "linear",
+}
+DEFAULT_WORKFLOW_PLAN_TEXT = _compose_workflow_plan_text(
+    "World expansion sweep",
+    6,
+    DEFAULT_WORKFLOW_PROMPT,
+    "",
+    42,
+    DEFAULT_WORKFLOW_CURRENT_STEP,
 )
 
 with gr.Blocks(title="NeoVerse Interactive Demo") as demo:
@@ -1906,10 +3013,47 @@ with gr.Blocks(title="NeoVerse Interactive Demo") as demo:
             output_video = gr.Video(label="Generated Video")
             compare_video = gr.Video(label="Render vs Generated", height=300)
             generate_btn = gr.Button("Generate", variant="primary", interactive=False)
+            with gr.Accordion("Multi-round Workflow", open=False):
+                workflow_plan_preset = gr.Dropdown(
+                    label="Plan Preset",
+                    choices=WORKFLOW_PLAN_PRESET_CHOICES,
+                    value="World expansion sweep",
+                )
+                workflow_preset_info = gr.Textbox(
+                    label="Plan Preset Summary",
+                    value=workflow_preset_summary("World expansion sweep"),
+                    interactive=False,
+                    lines=2,
+                )
+                workflow_iterations = gr.Number(label="Iteration Count", value=6, precision=0)
+                workflow_first_frame_only = gr.Checkbox(
+                    value=False,
+                    label="Use Input First Frame Only",
+                )
+                workflow_build_plan_btn = gr.Button("Build / Refresh Plan", variant="secondary")
+                workflow_plan_text = gr.Textbox(
+                    label="Iteration Plan JSON",
+                    value=DEFAULT_WORKFLOW_PLAN_TEXT,
+                    lines=22,
+                )
+                workflow_run_btn = gr.Button("Run Workflow", variant="primary")
+                workflow_result_select = gr.Dropdown(
+                    label="Workflow Results",
+                    choices=[],
+                    interactive=False,
+                )
+                workflow_status = gr.Textbox(label="Workflow Status", lines=10, interactive=False)
+                workflow_manifest = gr.File(label="Workflow Manifest", interactive=False)
 
     # ================================================================
     # Wiring
     # ================================================================
+
+    workflow_plan_preset.change(
+        fn=workflow_preset_summary,
+        inputs=[workflow_plan_preset],
+        outputs=[workflow_preset_info],
+    )
 
     # Sync default params when camera motion type changes
     _DEFAULT_PARAMS = {
@@ -2052,6 +3196,80 @@ with gr.Blocks(title="NeoVerse Interactive Demo") as demo:
         fn=generate_final,
         inputs=[app_state, prompt, neg_prompt, seed],
         outputs=[output_video, compare_video],
+    )
+
+    workflow_build_plan_btn.click(
+        fn=build_workflow_plan_text,
+        inputs=[
+            workflow_plan_preset,
+            workflow_iterations,
+            prompt,
+            neg_prompt,
+            seed,
+            traj_type,
+            traj_angle,
+            traj_distance,
+            traj_orbit,
+            traj_mode,
+            zoom_ratio_input,
+            use_first_frame_input,
+            alpha_threshold_input,
+            time_preset_input,
+            time_keyframes_input,
+        ],
+        outputs=[workflow_plan_text],
+    )
+
+    workflow_plan_preset.change(
+        fn=build_workflow_plan_text,
+        inputs=[
+            workflow_plan_preset,
+            workflow_iterations,
+            prompt,
+            neg_prompt,
+            seed,
+            traj_type,
+            traj_angle,
+            traj_distance,
+            traj_orbit,
+            traj_mode,
+            zoom_ratio_input,
+            use_first_frame_input,
+            alpha_threshold_input,
+            time_preset_input,
+            time_keyframes_input,
+        ],
+        outputs=[workflow_plan_text],
+    )
+
+    workflow_run_btn.click(
+        fn=run_workflow,
+        inputs=[app_state, workflow_iterations, workflow_first_frame_only, workflow_plan_text],
+        outputs=[
+            app_state,
+            model3d,
+            output_video,
+            compare_video,
+            workflow_manifest,
+            workflow_status,
+            workflow_result_select,
+            preview_btn,
+            viewer_btn,
+        ],
+    )
+
+    workflow_result_select.change(
+        fn=select_workflow_result,
+        inputs=[workflow_result_select],
+        outputs=[
+            app_state,
+            model3d,
+            output_video,
+            compare_video,
+            workflow_status,
+            preview_btn,
+            viewer_btn,
+        ],
     )
 
     viewer_btn.click(
@@ -2493,6 +3711,10 @@ VIEWER_HTML = """
 
         <section>
           <p class="section-label">Scene</p>
+          <div class="field">
+            <label for="scene-select">Available Scene</label>
+            <select id="scene-select"></select>
+          </div>
           <div class="scene-facts" id="scene-facts">
             <div><strong>Source</strong><span id="fact-source">No scene</span></div>
             <div><strong>Frames</strong><span id="fact-frames">-</span></div>
@@ -2575,6 +3797,8 @@ VIEWER_HTML = """
       playbackLastTs: null,
       lastPlaybackEnqueueAt: 0,
       scene: null,
+      sceneId: '',
+      scenes: [],
       examples: [],
       dragging: false,
       dragMode: 'orbit',
@@ -2588,6 +3812,7 @@ VIEWER_HTML = """
       useExampleBtn: document.getElementById('use-example-btn'),
       pathInput: document.getElementById('path-input'),
       sceneType: document.getElementById('scene-type'),
+      sceneSelect: document.getElementById('scene-select'),
       reconstructBtn: document.getElementById('reconstruct-btn'),
       resetViewBtn: document.getElementById('reset-view-btn'),
       viewerMode: document.getElementById('viewer-mode'),
@@ -2670,6 +3895,7 @@ VIEWER_HTML = """
 
     function snapshotRenderState() {
       return {
+        sceneId: state.sceneId,
         viewerMode: state.viewerMode,
         modality: state.modality,
         timeValue: state.timeValue,
@@ -2710,6 +3936,7 @@ VIEWER_HTML = """
       setLoading(true, job.resolutionScale < 1 ? 'preview' : 'rendering');
 
       const params = new URLSearchParams({
+        scene_id: job.snapshot.sceneId || '',
         viewer_mode: job.snapshot.viewerMode,
         modality: job.snapshot.modality,
         time_value: String(job.snapshot.timeValue),
@@ -2789,6 +4016,7 @@ VIEWER_HTML = """
 
     function applyScene(scene) {
       state.scene = scene;
+      state.sceneId = scene.scene_id || state.sceneId || 'latest';
       state.ready = true;
       state.pendingRender = null;
       clearTimeout(state.fullRenderTimer);
@@ -2801,6 +4029,9 @@ VIEWER_HTML = """
       el.factFrames.textContent = scene.static_scene ? 'static' : String(scene.num_frames);
       el.factResolution.textContent = scene.width + ' x ' + scene.height;
       el.factScale.textContent = scene.scene_scale.toFixed(2);
+      if (el.sceneSelect.value !== state.sceneId) {
+        el.sceneSelect.value = state.sceneId;
+      }
       el.hintBox.textContent = 'Scene ready. Drag in the viewport to orbit. Shift-drag or right-drag pans the pivot. Mouse wheel changes radius. Space toggles playback.';
       setStatus('Scene reconstructed. Ready for live viewpoint queries.');
     }
@@ -2828,8 +4059,40 @@ VIEWER_HTML = """
       }
     }
 
-    async function fetchSceneIfAvailable() {
-      const response = await fetch('/api/scene');
+    async function fetchScenes(preferredSceneId) {
+      const response = await fetch('/api/scenes', { cache: 'no-store' });
+      const payload = await response.json();
+      state.scenes = payload.scenes || [];
+      el.sceneSelect.innerHTML = '';
+      if (state.scenes.length === 0) {
+        const option = document.createElement('option');
+        option.value = '';
+        option.textContent = 'No scene available';
+        el.sceneSelect.appendChild(option);
+        state.sceneId = '';
+        return '';
+      }
+
+      state.scenes.forEach((record) => {
+        const option = document.createElement('option');
+        option.value = record.scene_id;
+        option.textContent = record.label;
+        el.sceneSelect.appendChild(option);
+      });
+
+      const preferred = preferredSceneId || state.sceneId || payload.active_id || state.scenes[state.scenes.length - 1].scene_id;
+      const selected = state.scenes.some((record) => record.scene_id === preferred)
+        ? preferred
+        : state.scenes[state.scenes.length - 1].scene_id;
+      state.sceneId = selected;
+      el.sceneSelect.value = selected;
+      return selected;
+    }
+
+    async function fetchSceneIfAvailable(sceneId) {
+      const selectedSceneId = sceneId || state.sceneId;
+      const suffix = selectedSceneId ? '?scene_id=' + encodeURIComponent(selectedSceneId) : '';
+      const response = await fetch('/api/scene' + suffix, { cache: 'no-store' });
       const payload = await response.json();
       if (payload.ready) {
         applyScene(payload.scene);
@@ -2860,6 +4123,7 @@ VIEWER_HTML = """
         if (!response.ok) {
           throw new Error(payload.detail || 'Reconstruction failed.');
         }
+        await fetchScenes(payload.scene.scene_id || 'latest');
         applyScene(payload.scene);
         setRenderInfo('reconstruction ' + payload.elapsed_s.toFixed(2) + ' s');
         setStatus('Reconstruction finished in ' + payload.elapsed_s.toFixed(2) + ' s. Rendering first view.');
@@ -2961,6 +4225,15 @@ VIEWER_HTML = """
     });
 
     el.reconstructBtn.addEventListener('click', reconstructScene);
+    el.sceneSelect.addEventListener('change', () => {
+      const sceneId = el.sceneSelect.value;
+      if (!sceneId) {
+        return;
+      }
+      stopPlayback(false);
+      state.sceneId = sceneId;
+      void fetchSceneIfAvailable(sceneId);
+    });
     el.resetViewBtn.addEventListener('click', () => {
       resetViewFromScene();
       queueFullRender(30);
@@ -3081,9 +4354,12 @@ VIEWER_HTML = """
     });
 
     updateOverlayLabels();
-    fetchExamples().then(fetchSceneIfAvailable).catch((error) => {
+    fetchExamples().then(() => fetchScenes()).then((sceneId) => fetchSceneIfAvailable(sceneId)).catch((error) => {
       setStatus(String(error.message || error));
     });
+    window.setInterval(() => {
+      fetchScenes(state.sceneId).catch(() => {});
+    }, 4000);
   </script>
 </body>
 </html>
@@ -3118,11 +4394,23 @@ async def api_examples():
 
 
 @server_app.get("/api/scene")
-async def api_scene():
+async def api_scene(scene_id: str = ""):
     with VIEWER_LOCK:
-        ready = LATEST_SCENE["state"] is not None
-        scene = LATEST_SCENE["meta"]
+        try:
+            record = _get_scene_record_unlocked(scene_id or None)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"Scene not found: {scene_id}") from exc
+        ready = record is not None
+        scene = _public_scene_record(record)["meta"] if record is not None else None
     return {"ready": ready, "scene": scene}
+
+
+@server_app.get("/api/scenes")
+async def api_scenes():
+    with VIEWER_LOCK:
+        records = [_public_scene_record(record) for record in _ordered_scene_records_unlocked()]
+        active_id = SCENE_REGISTRY.get("active_id")
+    return {"ready": bool(records), "active_id": active_id, "scenes": records}
 
 
 @server_app.post("/api/reconstruct")
@@ -3152,6 +4440,7 @@ async def api_reconstruct(request: Request):
 
 @server_app.get("/api/render")
 async def api_render(
+    scene_id: str = "",
     viewer_mode: str = "Orbit Viewer",
     modality: str = "rgb",
     time_value: float = 0.0,
@@ -3167,9 +4456,13 @@ async def api_render(
     resolution_scale: float = 1.0,
 ):
     with VIEWER_LOCK:
-        state = LATEST_SCENE["state"]
-        if state is None:
+        try:
+            record = _get_scene_record_unlocked(scene_id or None)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"Scene not found: {scene_id}") from exc
+        if record is None:
             raise HTTPException(status_code=400, detail="No reconstructed scene is available yet.")
+        state = record["state"]
 
         started_at = time.perf_counter()
         try:
@@ -3201,6 +4494,7 @@ async def api_render(
         headers={
             "X-Render-Ms": f"{render_ms:.1f}",
             "X-Status": status,
+            "X-Scene-Id": record["scene_id"],
             "X-Camera-Pos": ", ".join(f"{v:.3f}" for v in meta["camera_position"]),
             "X-Frame-Index": str(meta["frame_index"]),
             "X-Timestamp": f"{meta['timestamp']:.3f}",

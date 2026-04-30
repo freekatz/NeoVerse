@@ -1,0 +1,107 @@
+seed: 0
+torch_dtype: bfloat16
+model_path: ./models
+reconstructor_path: ./models/NeoVerse/reconstructor.ckpt
+lora_path: null
+lora_alpha: 1.0
+enable_vram_management: true
+load_dit: false
+load_text_encoder: false
+load_vae: true
+control_dim: 5120
+
+height: 336
+width: 560
+num_views: 81
+min_num_context_views: 10
+max_num_context_views: 20
+use_camera_annotations: false
+continuous_target_frames: true
+force_first_context: true
+timestamp_unit: seconds
+train_dataset: SpatialVID(split=None, ROOT="data/SpatialVID", use_camera_annotations=${use_camera_annotations}, continuous_target_frames=${continuous_target_frames}, force_first_context=${force_first_context}, timestamp_unit="${timestamp_unit}", min_interval=1, max_interval=1, height=${height}, width=${width}, num_views=${num_views}, min_num_context_views=${min_num_context_views}, max_num_context_views=${max_num_context_views}, seed=${seed})
+
+pipeline_kwargs:
+  novel_view_sampling_trans: [0.01, 0.1]
+  novel_view_sampling_max_rot: 0.0
+  culling_prob: 0.3
+  kernel_size_range: [11, 51]
+  occlusion_thresh: 0.1
+  alpha_thresh: 0.5
+  color_thresh: [50, 100]
+  mask_non_context_targets: false
+  prompt_drop_prob: 0.1
+  mask_drop_prob: 0.2
+  condition_drop_prob: 0.05
+
+token:
+  layer_indices: [4, 11, 17, 23]
+  include_camera_token: auto
+  context_only: true
+  ref_view_strategy: saddle_balanced
+  autocast_dtype: bfloat16
+  # The bundled NeoVerse reconstructor checkpoint is WorldMirror and returns
+  # 2048-channel intermediate tokens.
+  # include_camera_token=auto appends the broadcast camera token, so L=5.
+  token_dim: 2048
+  token_groups: 5
+
+adapter:
+  type: conv
+  output_mode: condition_embedding
+  input_channels: null
+  hidden_dim: 512
+  num_res_blocks: 4
+  dropout: 0.0
+  condition_time_dim: 128
+  use_text_context: false
+  use_dit_state: false
+  # For cross-attention ablation:
+  # type: cross_attention_rope
+  # output_mode: condition_embedding
+  # token_dim: null
+  # hidden_dim: 512
+  # num_heads: 8
+  # num_blocks: 2
+  # source_pool_hw: [16, 16]
+  # max_source_tokens: 32768
+  # query_chunk_size: 4096
+  # use_rope: true
+  # use_dit_state: false
+
+target_latent_shapes: condition_embedding_auto
+
+loss:
+  l1_weight: 1.0
+  l2_weight: 0.0
+  cosine_weight: 0.0
+  stat_weight: 0.01
+  layer_weights:
+    condition: 1.0
+
+scheduler_train_steps: 1000
+min_timestep_boundary: 0.0
+max_timestep_boundary: 1.0
+fuse_vae_embedding_in_latents: false
+
+vae_tiled: false
+tile_size: [30, 52]
+tile_stride: [15, 26]
+
+learning_rate: 1.0e-4
+weight_decay: 0.01
+num_epochs: 2000
+max_steps: 20000
+batch_size: 1
+num_workers: 1
+pin_memory: false
+gradient_accumulation_steps: 1
+clip_grad: 1.0
+
+output_path: ./outputs/NeoVerseControlLatentDistill/manual
+auto_resume: true
+resume_from: null
+resume_optimizer: true
+print_freq: 10
+save_freq: 500
+vis_freq: 500

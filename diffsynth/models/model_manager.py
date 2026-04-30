@@ -53,6 +53,20 @@ from ..configs.model_config import model_loader_configs, huggingface_model_loade
 from .utils import load_state_dict, init_weights_on_device, hash_state_dict_keys, split_state_dict_with_prefix
 
 
+def _filter_allowed_models(model_names, model_classes, allowed_model_names=None):
+    if allowed_model_names is None:
+        return model_names, model_classes
+    allowed = {allowed_model_names} if isinstance(allowed_model_names, str) else set(allowed_model_names)
+    filtered = [
+        (model_name, model_class)
+        for model_name, model_class in zip(model_names, model_classes)
+        if model_name in allowed
+    ]
+    if not filtered:
+        return [], []
+    return [item[0] for item in filtered], [item[1] for item in filtered]
+
+
 def load_model_from_single_file(state_dict, model_names, model_classes, model_resource, torch_dtype, device):
     loaded_model_names, loaded_models = [], []
     for model_name, model_class in zip(model_names, model_classes):
@@ -189,6 +203,9 @@ class ModelDetectorFromSingleFile:
         keys_hash_with_shape = hash_state_dict_keys(state_dict, with_shape=True)
         if keys_hash_with_shape in self.keys_hash_with_shape_dict:
             model_names, model_classes, model_resource = self.keys_hash_with_shape_dict[keys_hash_with_shape]
+            model_names, model_classes = _filter_allowed_models(
+                model_names, model_classes, kwargs.get("allowed_model_names", None)
+            )
             loaded_model_names, loaded_models = load_model_from_single_file(state_dict, model_names, model_classes, model_resource, torch_dtype, device)
             return loaded_model_names, loaded_models
 
@@ -197,6 +214,9 @@ class ModelDetectorFromSingleFile:
         keys_hash = hash_state_dict_keys(state_dict, with_shape=False)
         if keys_hash in self.keys_hash_dict:
             model_names, model_classes, model_resource = self.keys_hash_dict[keys_hash]
+            model_names, model_classes = _filter_allowed_models(
+                model_names, model_classes, kwargs.get("allowed_model_names", None)
+            )
             loaded_model_names, loaded_models = load_model_from_single_file(state_dict, model_names, model_classes, model_resource, torch_dtype, device)
             return loaded_model_names, loaded_models
 
@@ -472,4 +492,3 @@ class ModelManager:
     def to(self, device):
         for model in self.model:
             model.to(device)
-
