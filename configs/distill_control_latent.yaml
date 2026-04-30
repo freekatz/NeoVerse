@@ -22,17 +22,19 @@ timestamp_unit: seconds
 train_dataset: SpatialVID(split=None, ROOT="data/SpatialVID", use_camera_annotations=${use_camera_annotations}, continuous_target_frames=${continuous_target_frames}, force_first_context=${force_first_context}, timestamp_unit="${timestamp_unit}", min_interval=1, max_interval=1, height=${height}, width=${width}, num_views=${num_views}, min_num_context_views=${min_num_context_views}, max_num_context_views=${max_num_context_views}, seed=${seed})
 
 pipeline_kwargs:
-  novel_view_sampling_trans: [0.01, 0.1]
+  # Keep the distillation teacher deterministic by default. Random target
+  # condition drops/degradations create label noise the student cannot observe.
+  novel_view_sampling_trans: [0.0, 0.0]
   novel_view_sampling_max_rot: 0.0
-  culling_prob: 0.3
-  kernel_size_range: [11, 51]
+  culling_prob: 1.0
+  kernel_size_range: [0, 0]
   occlusion_thresh: 0.1
   alpha_thresh: 0.5
-  color_thresh: [50, 100]
+  color_thresh: [50, 50]
   mask_non_context_targets: false
-  prompt_drop_prob: 0.1
-  mask_drop_prob: 0.2
-  condition_drop_prob: 0.05
+  prompt_drop_prob: 0.0
+  mask_drop_prob: 0.0
+  condition_drop_prob: 0.0
 
 token:
   layer_indices: [4, 11, 17, 23]
@@ -90,18 +92,29 @@ tile_stride: [15, 26]
 
 learning_rate: 1.0e-4
 weight_decay: 0.01
-num_epochs: 2000
+num_epochs: 20000
 max_steps: 20000
 batch_size: 1
 num_workers: 1
 pin_memory: false
 gradient_accumulation_steps: 1
 clip_grad: 1.0
+cache_train_batch: false
+cache_frozen_outputs: false
+frozen_cache_dir: null
+frozen_cache_read: true
+frozen_cache_write: false
+frozen_cache_dtype: bfloat16
+preload_frozen_cache: false
+preload_frozen_cache_device: cpu
+preload_frozen_cache_batch_size: 1
+shuffle_preloaded_frozen_cache: true
 
 output_path: ./outputs/NeoVerseControlLatentDistill/manual
 auto_resume: true
 resume_from: null
 resume_optimizer: true
+save_optimizer_intermediate: false
 print_freq: 10
 save_freq: 500
 vis_freq: 500

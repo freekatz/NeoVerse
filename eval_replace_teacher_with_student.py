@@ -30,6 +30,18 @@ def zero_drop_probs(pipeline_kwargs):
     return kwargs
 
 
+def pipeline_condition_kwargs(render_conditions):
+    allowed = {
+        "source_views",
+        "target_rgb",
+        "target_depth",
+        "target_mask",
+        "target_poses",
+        "target_intrs",
+    }
+    return {key: value for key, value in render_conditions.items() if key in allowed}
+
+
 def load_adapter(pipe, cfg, checkpoint_path, device):
     adapter = build_adapter(pipe, cfg)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -103,6 +115,21 @@ def _tensor_to_pil_video(frames):
     return images
 
 
+def sort_target_trajectory(target_poses, target_intrs, target_timestamps, is_target=None):
+    sorted_poses = target_poses.clone()
+    sorted_intrs = target_intrs.clone()
+    sorted_timestamps = target_timestamps.clone()
+    sorted_is_target = None if is_target is None else is_target.clone()
+    for b_idx in range(target_timestamps.shape[0]):
+        order_indices = torch.argsort(target_timestamps[b_idx])
+        sorted_timestamps[b_idx] = target_timestamps[b_idx][order_indices]
+        sorted_poses[b_idx] = target_poses[b_idx][order_indices]
+        sorted_intrs[b_idx] = target_intrs[b_idx][order_indices]
+        if sorted_is_target is not None:
+            sorted_is_target[b_idx] = sorted_is_target[b_idx][order_indices]
+    return sorted_poses, sorted_intrs, sorted_timestamps, sorted_is_target
+
+
 def save_eval_condition_videos(output_dir, render_conditions, camera_embed=None, fps=15):
     os.makedirs(output_dir, exist_ok=True)
     views = render_conditions["source_views"]
@@ -170,6 +197,12 @@ def build_render_conditions(pipe, source_views, args, cfg):
         target_poses = predictions["rendered_extrinsics"]
         target_intrs = predictions["rendered_intrinsics"]
         target_timestamps = predictions["rendered_timestamps"]
+    target_poses, target_intrs, target_timestamps, sorted_is_target = sort_target_trajectory(
+        target_poses,
+        target_intrs,
+        target_timestamps,
+        views.get("is_target") if isinstance(views.get("is_target"), torch.Tensor) else None,
+    )
     target_rgb, target_depth, target_alpha = pipe.reconstructor.gs_renderer.rasterizer.forward(
         predictions["splats"],
         render_viewmats=homo_matrix_inverse(target_poses),
@@ -181,15 +214,8 @@ def build_render_conditions(pipe, source_views, args, cfg):
     )
     alpha_thresh = float(cfg.pipeline_kwargs.get("alpha_thresh", 0.5))
     target_mask = (target_alpha > alpha_thresh).float()
-    for b_idx in range(len(target_rgb)):
-        if isinstance(views.get("is_target"), torch.Tensor):
-            target_mask[b_idx][context_num:] = 0
-        order_indices = torch.argsort(target_timestamps[b_idx])
-        target_rgb[b_idx] = target_rgb[b_idx][order_indices]
-        target_depth[b_idx] = target_depth[b_idx][order_indices]
-        target_mask[b_idx] = target_mask[b_idx][order_indices]
-        target_poses[b_idx] = target_poses[b_idx][order_indices]
-        target_intrs[b_idx] = target_intrs[b_idx][order_indices]
+    if bool(cfg.pipeline_kwargs.get("mask_non_context_targets", False)) and sorted_is_target is not None:
+        target_mask = target_mask.masked_fill(sorted_is_target[:, :, None, None, None].bool(), 0)
     return {
         "source_views": views,
         "target_rgb": target_rgb,
@@ -442,7 +468,7 @@ def main():
             video = pipe(
                 prompt=prompt,
                 negative_prompt=args.negative_prompt,
-                **render_conditions,
+                **pipeline_condition_kwargs(render_conditions),
                 height=args.height,
                 width=args.width,
                 num_frames=args.num_frames,

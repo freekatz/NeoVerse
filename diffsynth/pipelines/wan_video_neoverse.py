@@ -540,7 +540,11 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
             context_extrinsics,
             recon_output["gs_depth"].squeeze(-1),
         )
-        if np.random.rand() < self.culling_prob:
+        if self.culling_prob >= 1.0:
+            kernel_size = 0
+        elif self.culling_prob <= 0.0 and self.kernel_size_range[0] == self.kernel_size_range[1]:
+            kernel_size = int(self.kernel_size_range[0])
+        elif np.random.rand() < self.culling_prob:
             kernel_size = 0
         else:
             kernel_size = np.random.randint(self.kernel_size_range[0], self.kernel_size_range[1]+1)
@@ -553,33 +557,46 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
             kernel_size=kernel_size,
             occlusion_thresh=self.occlusion_thresh,
         )
+
+        # Define the final target trajectory first, then render directly on it.
+        target_poses = render_extrinsics.clone()
+        target_intrs = render_intrinsics.clone()
+        target_timestamps = render_timestamps.clone()
+        sorted_is_target = None
+        if (
+            isinstance(source_views.get("is_target"), torch.Tensor)
+            and source_views["is_target"].shape[:2] == render_timestamps.shape[:2]
+        ):
+            sorted_is_target = source_views["is_target"].clone()
+
+        for b_idx in range(render_timestamps.shape[0]):
+            order_indices = torch.argsort(render_timestamps[b_idx])
+            target_poses[b_idx] = render_extrinsics[b_idx][order_indices]
+            target_intrs[b_idx] = render_intrinsics[b_idx][order_indices]
+            target_timestamps[b_idx] = render_timestamps[b_idx][order_indices]
+            if sorted_is_target is not None:
+                sorted_is_target[b_idx] = sorted_is_target[b_idx][order_indices]
+
         target_rgb, target_depth, target_alpha = pipe.reconstructor.gs_renderer.rasterizer.forward(
             splats,
-            render_viewmats=homo_matrix_inverse(render_extrinsics),   # c2w -> w2c
-            render_Ks=render_intrinsics,
-            render_timestamps=render_timestamps,
+            render_viewmats=homo_matrix_inverse(target_poses),   # c2w -> w2c
+            render_Ks=target_intrs,
+            render_timestamps=target_timestamps,
             sh_degree=0, width=W, height=H,
         )
         target_mask = target_alpha > self.alpha_thresh
-
-        # Sort renderings with timestamps: convert from "context + non-context" format to temporally ordered frames
-        target_poses = render_extrinsics.clone()
-        target_intrs = render_intrinsics.clone()
-        for b_idx in range(len(target_rgb)):
-            if self.mask_non_context_targets:
-                target_mask[b_idx][context_num_int:] = False
-            order_indices = torch.argsort(render_timestamps[b_idx])
-            target_rgb[b_idx] = target_rgb[b_idx][order_indices]
-            target_depth[b_idx] = target_depth[b_idx][order_indices]
-            target_mask[b_idx] = target_mask[b_idx][order_indices]
-            target_poses[b_idx] = target_poses[b_idx][order_indices]
-            target_intrs[b_idx] = target_intrs[b_idx][order_indices]
+        if self.mask_non_context_targets and sorted_is_target is not None:
+            target_mask = target_mask.masked_fill(sorted_is_target[:, :, None, None, None].bool(), False)
 
         if input_video is not None:
+            if self.color_thresh[0] == self.color_thresh[1]:
+                color_thresh = float(self.color_thresh[0])
+            else:
+                color_thresh = np.random.uniform(self.color_thresh[0], self.color_thresh[1])
             color_mask = fast_perceptual_color_distance(
                 rearrange(input_video, "B T C H W -> B T H W C"),
                 target_rgb,
-            ) < np.random.uniform(self.color_thresh[0], self.color_thresh[1])
+            ) < color_thresh
             target_mask = target_mask & color_mask.unsqueeze(-1)
         target_mask = target_mask.float()
 
@@ -640,6 +657,10 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
         global trajectory and adding small random rotations while maintaining focus on
         the scene center.
         """
+        trans_min, trans_max = float(self.novel_view_sampling_trans[0]), float(self.novel_view_sampling_trans[1])
+        if trans_min == 0.0 and trans_max == 0.0 and float(self.novel_view_sampling_max_rot) == 0.0:
+            return original_poses.clone()
+
         # Extract original camera components
         N_context = original_poses.shape[0]
         original_pos = original_poses[:, :3, 3]  # [3]
@@ -675,8 +696,7 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
 
         # Use the same perpendicular direction for all frames
         random_direction = perpendicular_dir.expand(N_context, -1)  # [N_context, 3]
-        translation_distance = torch.rand((1, 1), device=original_poses.device) *\
-            (self.novel_view_sampling_trans[1] - self.novel_view_sampling_trans[0]) + self.novel_view_sampling_trans[0]
+        translation_distance = torch.rand((1, 1), device=original_poses.device) * (trans_max - trans_min) + trans_min
         new_pos = original_pos + random_direction * translation_distance
 
         # Calculate new forward direction pointing toward view center

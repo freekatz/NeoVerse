@@ -20,9 +20,11 @@ bash scripts/train_distill_control_latent.sh \
   num_epochs="${NUM_EPOCHS_VALUE}" \
   num_workers="${NUM_WORKERS:-0}" \
   batch_size="${BATCH_SIZE:-1}" \
-  print_freq="${PRINT_FREQ:-1}" \
-  save_freq="${SAVE_FREQ:-200}" \
-  vis_freq="${VIS_FREQ:-200}" \
+  cache_train_batch="${CACHE_TRAIN_BATCH:-true}" \
+  cache_frozen_outputs="${CACHE_FROZEN_OUTPUTS:-true}" \
+  print_freq="${PRINT_FREQ:-10}" \
+  save_freq="${SAVE_FREQ:-1000}" \
+  vis_freq="${VIS_FREQ:-1000}" \
   min_num_context_views="${NUM_CONTEXT_VIEWS}" \
   max_num_context_views="${NUM_CONTEXT_VIEWS}" \
   pipeline_kwargs.novel_view_sampling_trans="${NOVEL_VIEW_SAMPLING_TRANS:-[0.0,0.0]}" \

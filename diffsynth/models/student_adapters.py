@@ -766,6 +766,7 @@ class CrossAttentionRoPEAdapter(torch.nn.Module):
         diffusion_timestep: torch.Tensor | None = None,
         text_context: torch.Tensor | None = None,
     ) -> OrderedDict[str, torch.Tensor]:
+        tokens = tokens.to(dtype=self.source_proj.weight.dtype)
         bsz = tokens.shape[0]
         device, dtype = tokens.device, tokens.dtype
         frames, height, width = output_grid

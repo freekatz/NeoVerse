@@ -1,5 +1,7 @@
 import argparse
 import datetime
+import hashlib
+import json
 import os
 import random
 import time
@@ -295,6 +297,147 @@ def add_time_metrics(metrics, target_times, source_times, device):
             metrics["time/source_target_start_delta_s"] = (source_times_f[:, 0] - target_times.detach().float()[:, 0]).abs().mean()
 
 
+def detach_optional_tensor(x):
+    return x.detach() if isinstance(x, torch.Tensor) else x
+
+
+def json_default(value):
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, torch.dtype):
+        return str(value)
+    return str(value)
+
+
+def cache_scalar(value):
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            value = value.detach().cpu().reshape(-1)[0]
+            if value.dtype == torch.bool:
+                return bool(value.item())
+            if torch.is_floating_point(value):
+                return float(value.item())
+            return int(value.item())
+        return tuple(value.detach().cpu().reshape(-1).tolist())
+    if isinstance(value, np.ndarray):
+        if value.size == 1:
+            return value.reshape(-1)[0].item()
+        return tuple(value.reshape(-1).tolist())
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        return cache_scalar(value[0])
+    return value
+
+
+def frozen_cache_signature(data, cfg):
+    views = []
+    for view in data:
+        views.append(
+            {
+                "video_name": cache_scalar(view.get("video_name")),
+                "image_name": cache_scalar(view.get("image_name")),
+                "timestamp": cache_scalar(view.get("timestamp")),
+                "is_target": cache_scalar(view.get("is_target")),
+            }
+        )
+    cfg_signature = {
+        "model_path": cfg.get("model_path", None),
+        "reconstructor_path": cfg.get("reconstructor_path", None),
+        "torch_dtype": cfg.get("torch_dtype", None),
+        "height": cfg.get("height", None),
+        "width": cfg.get("width", None),
+        "num_views": cfg.get("num_views", None),
+        "use_camera_annotations": cfg.get("use_camera_annotations", None),
+        "pipeline_kwargs": OmegaConf.to_container(cfg.pipeline_kwargs, resolve=True),
+        "token": OmegaConf.to_container(cfg.token, resolve=True),
+        "vae_tiled": cfg.get("vae_tiled", None),
+        "tile_size": list(cfg.get("tile_size", [])),
+        "tile_stride": list(cfg.get("tile_stride", [])),
+    }
+    payload = {"views": views, "config": cfg_signature}
+    encoded = json.dumps(payload, sort_keys=True, default=json_default).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def cache_float_dtype(cfg):
+    dtype_name = cfg.get("frozen_cache_dtype", None)
+    if dtype_name in {None, "none", "None"}:
+        return None
+    return getattr(torch, str(dtype_name))
+
+
+def cache_to_cpu(cache, dtype=None):
+    out = {}
+    for key, value in cache.items():
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu()
+            if dtype is not None and torch.is_floating_point(value):
+                value = value.to(dtype=dtype)
+        out[key] = value
+    return out
+
+
+def cache_to_device(cache, device):
+    out = {}
+    for key, value in cache.items():
+        out[key] = value.to(device=device, non_blocking=True) if isinstance(value, torch.Tensor) else value
+    return out
+
+
+def save_frozen_cache(path, cache, cfg):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = cache_to_cpu(cache, dtype=cache_float_dtype(cfg))
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def looks_like_frozen_cache(data):
+    return isinstance(data, dict) and "teacher" in data and "tokens" in data and "output_grid" in data
+
+
+def prepare_runtime_cache(cache, device):
+    return cache_to_device(cache, device)
+
+
+def frozen_cache_batch_key(cache):
+    key = []
+    for name in sorted(cache.keys()):
+        value = cache[name]
+        if isinstance(value, torch.Tensor):
+            key.append((name, tuple(value.shape[1:]), str(value.dtype)))
+        else:
+            key.append((name, json.dumps(value, sort_keys=True, default=json_default)))
+    return tuple(key)
+
+
+def merge_frozen_cache_entries(entries):
+    if len(entries) == 1:
+        return entries[0]
+    merged = {}
+    first = entries[0]
+    for name, value in first.items():
+        if isinstance(value, torch.Tensor):
+            merged[name] = torch.cat([entry[name] for entry in entries], dim=0)
+        else:
+            merged[name] = value
+    return merged
+
+
+def batch_preloaded_frozen_cache(caches, batch_size: int):
+    if batch_size <= 1:
+        return caches
+    buckets = OrderedDict()
+    for cache in caches:
+        buckets.setdefault(frozen_cache_batch_key(cache), []).append(cache)
+    batches = []
+    for entries in buckets.values():
+        for start in range(0, len(entries), batch_size):
+            batches.append(merge_frozen_cache_entries(entries[start : start + batch_size]))
+    return batches
+
+
 class ControlLatentDistillModule(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -376,7 +519,7 @@ class ControlLatentDistillModule(torch.nn.Module):
             self.pipe.eval()
         return {**inputs_shared, **inputs_posi}
 
-    def forward(self, data):
+    def build_frozen_forward_cache(self, data):
         inputs = self.forward_preprocess(data)
         with torch.no_grad():
             output_grid = condition_output_grid(self.pipe.control_branch, inputs["target_rgb"])
@@ -413,48 +556,99 @@ class ControlLatentDistillModule(torch.nn.Module):
             )
             self.pipe.load_models_to_device([])
 
-        student = self.adapter(
-            token_pack["tokens"].detach(),
-            output_grid,
-            target_times=target_times,
-            target_poses=inputs.get("target_poses"),
-            target_intrs=inputs.get("target_intrs"),
-            target_plucker=inputs.get("target_camera_embed"),
-            source_times=source_times,
-            source_poses=source_poses,
-            source_intrs=source_intrs,
-        )
-        loss, metrics = compute_distill_loss(student, teacher, self.cfg)
-        metrics["token_dim"] = torch.tensor(token_pack["token_dim"], device=loss.device, dtype=torch.float32)
-        metrics["token_groups"] = torch.tensor(token_pack["num_token_groups"], device=loss.device, dtype=torch.float32)
-        metrics["seq_len"] = torch.tensor(sequence_length, device=loss.device, dtype=torch.float32)
-        add_time_metrics(metrics, target_times, source_times, loss.device)
-        self.last_shapes = {
-            "teacher": {"condition": tuple(teacher.shape)},
-            "student": {"condition": tuple(student.shape)},
-            "tokens": tuple(token_pack["tokens"].shape),
+        target_plucker = inputs.get("target_camera_embed")
+        if isinstance(target_plucker, torch.Tensor):
+            target_plucker = F.interpolate(
+                target_plucker.permute(0, 2, 1, 3, 4),
+                size=output_grid,
+                mode="trilinear",
+            ).permute(0, 2, 1, 3, 4).contiguous()
+
+        return {
+            "teacher": teacher.detach(),
+            "tokens": token_pack["tokens"].detach(),
+            "token_dim": int(token_pack["token_dim"]),
+            "num_token_groups": int(token_pack["num_token_groups"]),
             "output_grid": output_grid,
-            "target_times": None if target_times is None else tuple(target_times.shape),
-            "source_times": None if source_times is None else tuple(source_times.shape),
+            "sequence_length": sequence_length,
+            "target_times": detach_optional_tensor(target_times),
+            "source_times": detach_optional_tensor(source_times),
+            "target_poses": detach_optional_tensor(inputs.get("target_poses")),
+            "target_intrs": detach_optional_tensor(inputs.get("target_intrs")),
+            "target_plucker": detach_optional_tensor(target_plucker),
+            "source_poses": detach_optional_tensor(source_poses),
+            "source_intrs": detach_optional_tensor(source_intrs),
+        }
+
+    def get_forward_cache(self, data):
+        frozen_cache_dir = self.cfg.get("frozen_cache_dir", None)
+        if frozen_cache_dir:
+            cache_path = os.path.join(str(frozen_cache_dir), f"{frozen_cache_signature(data, self.cfg)}.pt")
+            if bool(self.cfg.get("frozen_cache_read", True)) and os.path.exists(cache_path):
+                return cache_to_device(torch.load(cache_path, map_location="cpu"), self.pipe.device)
+            cache = self.build_frozen_forward_cache(data)
+            if bool(self.cfg.get("frozen_cache_write", False)):
+                save_frozen_cache(cache_path, cache, self.cfg)
+            return cache
+
+        if not bool(self.cfg.get("cache_frozen_outputs", False)):
+            return self.build_frozen_forward_cache(data)
+        if not hasattr(self, "_frozen_forward_cache"):
+            self._frozen_forward_cache = self.build_frozen_forward_cache(data)
+            cache = self._frozen_forward_cache
+            tokens = cache["tokens"]
+            teacher = cache["teacher"]
+            print(
+                "Cached frozen training inputs: "
+                f"tokens={tuple(tokens.shape)} teacher={tuple(teacher.shape)} "
+                f"output_grid={cache['output_grid']}"
+            )
+        return self._frozen_forward_cache
+
+    def forward(self, data):
+        cache = prepare_runtime_cache(data, self.pipe.device) if looks_like_frozen_cache(data) else self.get_forward_cache(data)
+        student = self.adapter(
+            cache["tokens"],
+            cache["output_grid"],
+            target_times=cache["target_times"],
+            target_poses=cache["target_poses"],
+            target_intrs=cache["target_intrs"],
+            target_plucker=cache["target_plucker"],
+            source_times=cache["source_times"],
+            source_poses=cache["source_poses"],
+            source_intrs=cache["source_intrs"],
+        )
+        loss, metrics = compute_distill_loss(student, cache["teacher"], self.cfg)
+        metrics["token_dim"] = torch.tensor(cache["token_dim"], device=loss.device, dtype=torch.float32)
+        metrics["token_groups"] = torch.tensor(cache["num_token_groups"], device=loss.device, dtype=torch.float32)
+        metrics["seq_len"] = torch.tensor(cache["sequence_length"], device=loss.device, dtype=torch.float32)
+        add_time_metrics(metrics, cache["target_times"], cache["source_times"], loss.device)
+        self.last_shapes = {
+            "teacher": {"condition": tuple(cache["teacher"].shape)},
+            "student": {"condition": tuple(student.shape)},
+            "tokens": tuple(cache["tokens"].shape),
+            "output_grid": cache["output_grid"],
+            "target_times": None if cache["target_times"] is None else tuple(cache["target_times"].shape),
+            "source_times": None if cache["source_times"] is None else tuple(cache["source_times"].shape),
             "target_time_range_s": None
-            if target_times is None
+            if cache["target_times"] is None
             else (
-                float(target_times[0, 0].detach().cpu()),
-                float(target_times[0, -1].detach().cpu()),
+                float(cache["target_times"][0, 0].detach().cpu()),
+                float(cache["target_times"][0, -1].detach().cpu()),
             ),
             "source_time_range_s": None
-            if source_times is None
+            if cache["source_times"] is None
             else (
-                float(source_times[0, 0].detach().cpu()),
-                float(source_times[0, -1].detach().cpu()),
+                float(cache["source_times"][0, 0].detach().cpu()),
+                float(cache["source_times"][0, -1].detach().cpu()),
             ),
-            "target_poses": None if inputs.get("target_poses") is None else tuple(inputs["target_poses"].shape),
-            "source_poses": None if source_poses is None else tuple(source_poses.shape),
+            "target_poses": None if cache["target_poses"] is None else tuple(cache["target_poses"].shape),
+            "source_poses": None if cache["source_poses"] is None else tuple(cache["source_poses"].shape),
         }
         self.last_visuals = (
-            {"condition": teacher.detach()},
+            {"condition": cache["teacher"]},
             {"condition": student.detach()},
-            output_grid,
+            cache["output_grid"],
         )
         return loss, metrics
 
@@ -465,24 +659,23 @@ def seed_everything(seed: int):
     random.seed(seed)
 
 
-def save_checkpoint(accelerator, model, optimizer, cfg, output_path, step, epoch=None, name=None):
+def save_checkpoint(accelerator, model, optimizer, cfg, output_path, step, epoch=None, name=None, include_optimizer=True):
     accelerator.wait_for_everyone()
     if not accelerator.is_main_process:
         return
     os.makedirs(output_path, exist_ok=True)
     unwrapped = accelerator.unwrap_model(model)
     ckpt_name = name or f"adapter_step_{step:08d}.pt"
-    torch.save(
-        {
-            "adapter": unwrapped.adapter.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "config": OmegaConf.to_container(cfg, resolve=True),
-            "step": step,
-            "epoch": epoch,
-            "shapes": getattr(unwrapped, "last_shapes", None),
-        },
-        os.path.join(output_path, ckpt_name),
-    )
+    payload = {
+        "adapter": unwrapped.adapter.state_dict(),
+        "config": OmegaConf.to_container(cfg, resolve=True),
+        "step": step,
+        "epoch": epoch,
+        "shapes": getattr(unwrapped, "last_shapes", None),
+    }
+    if include_optimizer:
+        payload["optimizer"] = optimizer.state_dict()
+    torch.save(payload, os.path.join(output_path, ckpt_name))
     OmegaConf.save(cfg, os.path.join(output_path, "config.yaml"))
 
 
@@ -494,6 +687,21 @@ def resolve_resume_path(cfg):
         candidate = os.path.join(str(cfg.output_path), "adapter_last.pt")
         if os.path.exists(candidate):
             return candidate
+        if os.path.isdir(str(cfg.output_path)):
+            latest_step = -1
+            latest_path = None
+            for name in os.listdir(str(cfg.output_path)):
+                if not (name.startswith("adapter_step_") and name.endswith(".pt")):
+                    continue
+                try:
+                    step = int(name.removeprefix("adapter_step_").removesuffix(".pt"))
+                except ValueError:
+                    continue
+                if step > latest_step:
+                    latest_step = step
+                    latest_path = os.path.join(str(cfg.output_path), name)
+            if latest_path is not None:
+                return latest_path
     return None
 
 
@@ -559,9 +767,46 @@ def main():
         return
     writer = SummaryWriter(log_dir=cfg.output_path) if accelerator.is_main_process else None
 
+    cached_train_batch = None
+    if bool(cfg.get("cache_train_batch", False)):
+        cached_train_batch = next(iter(dataloader))
+        if accelerator.is_main_process:
+            print("Cached one DataLoader batch for repeated overfit training.")
+
+    preloaded_frozen_batches = None
+    if bool(cfg.get("preload_frozen_cache", False)):
+        unwrapped = accelerator.unwrap_model(model)
+        preloaded_frozen_batches = []
+        preload_device = str(cfg.get("preload_frozen_cache_device", "cuda"))
+        if accelerator.is_main_process:
+            print(f"Preloading frozen cache from DataLoader to {preload_device}.")
+        for preload_batch in dataloader:
+            cache = unwrapped.get_forward_cache(preload_batch)
+            if preload_device == "cpu":
+                cache = cache_to_cpu(cache, dtype=cache_float_dtype(cfg))
+            else:
+                cache = cache_to_device(cache, accelerator.device)
+            preloaded_frozen_batches.append(cache)
+        preloaded_frozen_batches = batch_preloaded_frozen_cache(
+            preloaded_frozen_batches,
+            int(cfg.get("preload_frozen_cache_batch_size", 1)),
+        )
+        if accelerator.is_main_process:
+            print(f"Preloaded {len(preloaded_frozen_batches)} frozen cache batches on this process.")
+        if len(preloaded_frozen_batches) == 0:
+            raise RuntimeError("preload_frozen_cache=true but no frozen cache entries were loaded.")
+
     last_log = time.time()
     for epoch in range(int(cfg.num_epochs)):
-        for batch in dataloader:
+        if preloaded_frozen_batches is not None:
+            if bool(cfg.get("shuffle_preloaded_frozen_cache", True)):
+                random.shuffle(preloaded_frozen_batches)
+            batch_iter = preloaded_frozen_batches
+        elif cached_train_batch is not None:
+            batch_iter = (cached_train_batch,)
+        else:
+            batch_iter = dataloader
+        for batch in batch_iter:
             with accelerator.accumulate(model):
                 optimizer.zero_grad(set_to_none=True)
                 loss, metrics = model(batch)
@@ -593,7 +838,16 @@ def main():
                     save_heatmaps(os.path.join(cfg.output_path, "visuals"), step, teacher, student, output_grid)
 
                 if int(cfg.save_freq) > 0 and step % int(cfg.save_freq) == 0:
-                    save_checkpoint(accelerator, model, optimizer, cfg, cfg.output_path, step, epoch=epoch)
+                    save_checkpoint(
+                        accelerator,
+                        model,
+                        optimizer,
+                        cfg,
+                        cfg.output_path,
+                        step,
+                        epoch=epoch,
+                        include_optimizer=bool(cfg.get("save_optimizer_intermediate", False)),
+                    )
 
                 if cfg.get("max_steps", None) is not None and step >= int(cfg.max_steps):
                     save_checkpoint(accelerator, model, optimizer, cfg, cfg.output_path, step, epoch=epoch, name="adapter_last.pt")

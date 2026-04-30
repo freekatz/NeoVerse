@@ -35,6 +35,7 @@ CODE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 MODE="${MODE:-train}"
 LAUNCH_MODE="${LAUNCH_MODE:-foreground}"
 DRY_RUN="${DRY_RUN:-0}"
+FAST_FROZEN_CACHE="${FAST_FROZEN_CACHE:-1}"
 
 VENV_PATH="${VENV_PATH:-/root/vepfs/envs/neoverse}"
 ENV_PYTHON="${ENV_PYTHON:-${VENV_PATH}/bin/python}"
@@ -45,8 +46,14 @@ PROJECT_NAME="${PROJECT_NAME:-NeoVerseControlLatentDistill}"
 RUN_DATE="${RUN_DATE:-$(date +%F)}"
 RUN_TIME="${RUN_TIME:-$(date +%H-%M-%S)}"
 OUTPUT_PATH="${OUTPUT_PATH:-outputs/${PROJECT_NAME}/${RUN_DATE}/${RUN_TIME}}"
+if [[ "${OUTPUT_PATH}" != /* ]]; then
+  OUTPUT_PATH="${CODE_DIR}/${OUTPUT_PATH}"
+fi
 RUN_NAME="${RUN_NAME:-train}"
 LOG_DIR="${LOG_DIR:-${OUTPUT_PATH}/logs}"
+if [[ "${LOG_DIR}" != /* ]]; then
+  LOG_DIR="${CODE_DIR}/${LOG_DIR}"
+fi
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/train_${RUN_NAME}.log}"
 PID_FILE="${PID_FILE:-${LOG_DIR}/run.pid}"
 CONFIG_FILE="${CONFIG_FILE:-${LOG_DIR}/run_config.env}"
@@ -165,6 +172,8 @@ if [[ "${DIST_NPROC_PER_NODE}" -le 0 || "${DIST_NNODES}" -le 0 ]]; then
 fi
 
 GLOBAL_NUM_PROCESSES=$((DIST_NPROC_PER_NODE * DIST_NNODES))
+MAX_STEPS_VALUE="${MAX_STEPS:-20000}"
+NUM_EPOCHS_VALUE="${NUM_EPOCHS:-${MAX_STEPS_VALUE}}"
 
 TRAIN_OVERRIDES=(
   "output_path=${OUTPUT_PATH}"
@@ -175,7 +184,25 @@ TRAIN_OVERRIDES=(
   "force_first_context=${FORCE_FIRST_CONTEXT:-true}"
   "timestamp_unit=${TIMESTAMP_UNIT:-seconds}"
   "pipeline_kwargs.mask_non_context_targets=${MASK_NON_CONTEXT_TARGETS:-false}"
+  "max_steps=${MAX_STEPS_VALUE}"
+  "num_epochs=${NUM_EPOCHS_VALUE}"
 )
+
+if [[ "${FAST_FROZEN_CACHE}" == "1" ]]; then
+  FROZEN_CACHE_DIR="${FROZEN_CACHE_DIR:-${CODE_DIR}/outputs/${PROJECT_NAME}/frozen_cache}"
+  TRAIN_OVERRIDES+=(
+    "frozen_cache_dir=${FROZEN_CACHE_DIR}"
+    "frozen_cache_read=${FROZEN_CACHE_READ:-true}"
+    "frozen_cache_write=${FROZEN_CACHE_WRITE:-true}"
+    "preload_frozen_cache=${PRELOAD_FROZEN_CACHE:-true}"
+    "preload_frozen_cache_device=${PRELOAD_FROZEN_CACHE_DEVICE:-cpu}"
+    "preload_frozen_cache_batch_size=${PRELOAD_FROZEN_CACHE_BATCH_SIZE:-1}"
+    "save_optimizer_intermediate=${SAVE_OPTIMIZER_INTERMEDIATE:-false}"
+  )
+  if [[ -z "${SEED:-}" ]]; then
+    TRAIN_OVERRIDES+=("seed=1")
+  fi
+fi
 
 append_override_if_set() {
   local env_name="$1"
@@ -188,18 +215,33 @@ append_override_if_set() {
 
 append_override_if_set "MODEL_PATH" "model_path"
 append_override_if_set "RECONSTRUCTOR_PATH" "reconstructor_path"
+append_override_if_set "SEED" "seed"
 append_override_if_set "USE_CAMERA_ANNOTATIONS" "use_camera_annotations"
 append_override_if_set "BATCH_SIZE" "batch_size"
 append_override_if_set "NUM_WORKERS" "num_workers"
-append_override_if_set "MAX_STEPS" "max_steps"
-append_override_if_set "NUM_EPOCHS" "num_epochs"
 append_override_if_set "LEARNING_RATE" "learning_rate"
+append_override_if_set "WEIGHT_DECAY" "weight_decay"
+append_override_if_set "GRADIENT_ACCUMULATION_STEPS" "gradient_accumulation_steps"
+append_override_if_set "CLIP_GRAD" "clip_grad"
 append_override_if_set "SAVE_FREQ" "save_freq"
 append_override_if_set "PRINT_FREQ" "print_freq"
 append_override_if_set "VIS_FREQ" "vis_freq"
 append_override_if_set "AUTO_RESUME" "auto_resume"
 append_override_if_set "RESUME_FROM" "resume_from"
 append_override_if_set "RESUME_OPTIMIZER" "resume_optimizer"
+append_override_if_set "SAVE_OPTIMIZER_INTERMEDIATE" "save_optimizer_intermediate"
+append_override_if_set "CACHE_TRAIN_BATCH" "cache_train_batch"
+append_override_if_set "CACHE_FROZEN_OUTPUTS" "cache_frozen_outputs"
+if [[ "${FAST_FROZEN_CACHE}" != "1" ]]; then
+  append_override_if_set "FROZEN_CACHE_DIR" "frozen_cache_dir"
+fi
+append_override_if_set "FROZEN_CACHE_READ" "frozen_cache_read"
+append_override_if_set "FROZEN_CACHE_WRITE" "frozen_cache_write"
+append_override_if_set "FROZEN_CACHE_DTYPE" "frozen_cache_dtype"
+append_override_if_set "PRELOAD_FROZEN_CACHE" "preload_frozen_cache"
+append_override_if_set "PRELOAD_FROZEN_CACHE_DEVICE" "preload_frozen_cache_device"
+append_override_if_set "PRELOAD_FROZEN_CACHE_BATCH_SIZE" "preload_frozen_cache_batch_size"
+append_override_if_set "SHUFFLE_PRELOADED_FROZEN_CACHE" "shuffle_preloaded_frozen_cache"
 
 read -r -a accelerate_extra_args <<< "${ACCELERATE_EXTRA_ARGS}"
 
@@ -207,6 +249,7 @@ cat > "${CONFIG_FILE}" <<EOF
 MODE=${MODE}
 LAUNCH_MODE=${LAUNCH_MODE}
 DRY_RUN=${DRY_RUN}
+FAST_FROZEN_CACHE=${FAST_FROZEN_CACHE}
 CODE_DIR=${CODE_DIR}
 VENV_PATH=${VENV_PATH}
 ENV_PYTHON=${ENV_PYTHON}
@@ -217,6 +260,7 @@ RUN_DATE=${RUN_DATE}
 RUN_TIME=${RUN_TIME}
 RUN_NAME=${RUN_NAME}
 OUTPUT_PATH=${OUTPUT_PATH}
+FROZEN_CACHE_DIR=${FROZEN_CACHE_DIR:-}
 LOG_DIR=${LOG_DIR}
 LOG_FILE=${LOG_FILE}
 PID_FILE=${PID_FILE}
