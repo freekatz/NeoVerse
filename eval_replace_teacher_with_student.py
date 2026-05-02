@@ -3,9 +3,10 @@ import os
 import numpy as np
 from copy import deepcopy
 
+import imageio
 import torch
 from omegaconf import OmegaConf
-from PIL import Image
+from PIL import Image, ImageDraw
 from tqdm import tqdm
 
 from diffsynth.data import save_video
@@ -115,6 +116,238 @@ def _tensor_to_pil_video(frames):
     return images
 
 
+def _read_video(path):
+    reader = imageio.get_reader(path)
+    try:
+        return [Image.fromarray(frame).convert("RGB") for frame in reader]
+    finally:
+        reader.close()
+
+
+def _frame_size(frames_by_name):
+    for frames in frames_by_name.values():
+        if frames:
+            return _to_pil_rgb(frames[0]).size
+    raise ValueError("No frames available for comparison grid.")
+
+
+def _to_pil_rgb(frame):
+    if isinstance(frame, Image.Image):
+        return frame.convert("RGB")
+    return Image.fromarray(np.array(frame)).convert("RGB")
+
+
+def _resize_filter():
+    return getattr(Image, "Resampling", Image).LANCZOS
+
+
+def _pad_video(frames, length, size):
+    frames = [_to_pil_rgb(frame).resize(size, _resize_filter()) for frame in frames[:length]]
+    frames.extend(Image.new("RGB", size, (0, 0, 0)) for _ in range(length - len(frames)))
+    return frames
+
+
+def _draw_boxed_label(image, label, corner="top_left"):
+    draw = ImageDraw.Draw(image)
+    padding = 7
+    try:
+        text_box = draw.textbbox((0, 0), label)
+        text_width = text_box[2] - text_box[0]
+        text_height = text_box[3] - text_box[1]
+    except AttributeError:
+        text_width, text_height = draw.textsize(label)
+    box_width = text_width + padding * 2
+    box_height = text_height + padding * 2
+    if corner == "top_right":
+        x0 = max(image.width - box_width, 0)
+    else:
+        x0 = 0
+    y0 = 0
+    draw.rectangle((x0, y0, x0 + box_width, y0 + box_height), fill=(0, 0, 0))
+    draw.text((x0 + padding, y0 + padding), label, fill=(255, 255, 255))
+
+
+def _label_frame(frame, label, top_right_label=None):
+    image = _to_pil_rgb(frame).copy()
+    _draw_boxed_label(image, label, corner="top_left")
+    if top_right_label:
+        _draw_boxed_label(image, top_right_label, corner="top_right")
+    return image
+
+
+def _make_grid_video(frames_by_name, labels, length=None, top_right_labels=None):
+    size = _frame_size(frames_by_name)
+    if length is None:
+        length = max(len(frames) for frames in frames_by_name.values())
+    videos = {name: _pad_video(frames_by_name.get(name, []), length, size) for name in labels}
+    top_right_labels = top_right_labels or {}
+    grid_frames = []
+    for frame_idx in range(length):
+        tiles = [
+            _label_frame(videos[name][frame_idx], label, top_right_labels.get(name))
+            for name, label in labels.items()
+        ]
+        canvas = Image.new("RGB", (size[0] * 2, size[1] * 2), (0, 0, 0))
+        canvas.paste(tiles[0], (0, 0))
+        canvas.paste(tiles[1], (size[0], 0))
+        canvas.paste(tiles[2], (0, size[1]))
+        canvas.paste(tiles[3], (size[0], size[1]))
+        grid_frames.append(canvas)
+    return grid_frames
+
+
+def _context_timeline_video(views, source_video, target_timestamps):
+    is_target = views.get("is_target")
+    if not isinstance(is_target, torch.Tensor) or is_target.ndim != 2:
+        return []
+
+    context_mask = ~is_target[0].detach().cpu().bool()
+    target_timestamps = target_timestamps[0].detach().float().cpu()
+    black = torch.zeros_like(source_video[0])
+    source_timestamps = views.get("timestamp")
+    if isinstance(source_timestamps, torch.Tensor) and source_timestamps.ndim == 2:
+        source_timestamps = source_timestamps[0].detach().float().cpu()
+        aligned_frames = []
+        for target_ts in target_timestamps:
+            src_idx = int(torch.argmin((source_timestamps - target_ts).abs()).item())
+            if bool(context_mask[src_idx]):
+                aligned_frames.append(source_video[src_idx])
+            else:
+                aligned_frames.append(black)
+        return _tensor_to_pil_video(torch.stack(aligned_frames, dim=0))
+
+    total_frames = min(source_video.shape[0], target_timestamps.shape[0], context_mask.shape[0])
+    aligned = source_video[:total_frames].clone()
+    aligned[~context_mask[:total_frames]] = 0
+    if total_frames < target_timestamps.shape[0]:
+        aligned = torch.cat(
+            [aligned, black[None].repeat(target_timestamps.shape[0] - total_frames, 1, 1, 1)],
+            dim=0,
+        )
+    return _tensor_to_pil_video(aligned)
+
+
+def _source_timeline_video(views, source_video, target_timestamps=None):
+    source_timestamps = views.get("timestamp")
+    if isinstance(source_timestamps, torch.Tensor) and source_timestamps.ndim == 2:
+        source_timestamps = source_timestamps[0].detach().float().cpu()
+        if isinstance(target_timestamps, torch.Tensor) and target_timestamps.ndim == 2:
+            target_timestamps = target_timestamps[0].detach().float().cpu()
+            aligned = []
+            for target_ts in target_timestamps:
+                src_idx = int(torch.argmin((source_timestamps - target_ts).abs()).item())
+                aligned.append(source_video[src_idx])
+            return _tensor_to_pil_video(torch.stack(aligned, dim=0))
+        order = torch.argsort(source_timestamps)
+        return _tensor_to_pil_video(source_video[order])
+    return _tensor_to_pil_video(source_video)
+
+
+def _video_psnr(reference_frames, predicted_frames):
+    length = min(len(reference_frames), len(predicted_frames))
+    if length <= 0:
+        return None
+    mse_values = []
+    for frame_idx in range(length):
+        reference = _to_pil_rgb(reference_frames[frame_idx])
+        predicted = _to_pil_rgb(predicted_frames[frame_idx])
+        if predicted.size != reference.size:
+            predicted = predicted.resize(reference.size, _resize_filter())
+        reference = np.asarray(reference, dtype=np.float32) / 255.0
+        predicted = np.asarray(predicted, dtype=np.float32) / 255.0
+        mse_values.append(np.mean((reference - predicted) ** 2))
+    mse = float(np.mean(mse_values))
+    if mse <= 0:
+        return float("inf")
+    return float(10.0 * np.log10(1.0 / mse))
+
+
+def _format_psnr(value):
+    if value is None:
+        return None
+    if np.isinf(value):
+        return "PSNR inf"
+    return f"PSNR {value:.2f} dB"
+
+
+def save_eval_comparison_grid(output_dir, frames_by_name=None, fps=15, filename="comparison_grid.mp4"):
+    labels = {
+        "input_context_views": "Input context views",
+        "rendered_degraded_rgb": "Rendered degraded RGB",
+        "student": "Student",
+        "teacher": "Teacher",
+    }
+    frames_by_name = dict(frames_by_name or {})
+    disk_names = {
+        "rendered_degraded_rgb": ["rendered_degraded_rgb.mp4"],
+        "input_context_views": ["input_context_views_timeline.mp4"],
+        "student": ["student.mp4"],
+        "teacher": ["teacher.mp4"],
+    }
+    missing = {}
+    for name, video_names in disk_names.items():
+        if name in frames_by_name and frames_by_name[name]:
+            continue
+        for video_name in video_names:
+            path = os.path.join(output_dir, video_name)
+            if os.path.exists(path):
+                frames_by_name[name] = _read_video(path)
+                break
+        if name not in frames_by_name or not frames_by_name[name]:
+            missing[name] = video_names
+    if missing:
+        missing_text = ", ".join(f"{name} ({'/'.join(paths)})" for name, paths in missing.items())
+        print(f"Skip comparison grid; missing videos: {missing_text}")
+        return None
+
+    length = max(len(frames_by_name["rendered_degraded_rgb"]), len(frames_by_name["student"]), len(frames_by_name["teacher"]))
+    grid_frames = _make_grid_video(frames_by_name, labels, length=length)
+    output_path = os.path.join(output_dir, filename)
+    save_video(grid_frames, output_path, fps=fps)
+    return output_path
+
+
+def save_eval_gt_comparison_grid(output_dir, frames_by_name=None, fps=15, filename="comparison_grid_gt.mp4"):
+    labels = {
+        "gt_81_sorted": "GT 81 frames",
+        "rendered_degraded_rgb": "Rendered degraded RGB",
+        "student": "Student",
+        "teacher": "Teacher",
+    }
+    frames_by_name = dict(frames_by_name or {})
+    disk_names = {
+        "gt_81_sorted": ["gt_81_sorted.mp4"],
+        "rendered_degraded_rgb": ["rendered_degraded_rgb.mp4"],
+        "student": ["student.mp4"],
+        "teacher": ["teacher.mp4"],
+    }
+    missing = {}
+    for name, video_names in disk_names.items():
+        if name in frames_by_name and frames_by_name[name]:
+            continue
+        for video_name in video_names:
+            path = os.path.join(output_dir, video_name)
+            if os.path.exists(path):
+                frames_by_name[name] = _read_video(path)
+                break
+        if name not in frames_by_name or not frames_by_name[name]:
+            missing[name] = video_names
+    if missing:
+        missing_text = ", ".join(f"{name} ({'/'.join(paths)})" for name, paths in missing.items())
+        print(f"Skip GT comparison grid; missing videos: {missing_text}")
+        return None
+
+    length = max(len(frames_by_name["gt_81_sorted"]), len(frames_by_name["student"]), len(frames_by_name["teacher"]))
+    top_right_labels = {
+        "student": _format_psnr(_video_psnr(frames_by_name["gt_81_sorted"], frames_by_name["student"])),
+        "teacher": _format_psnr(_video_psnr(frames_by_name["gt_81_sorted"], frames_by_name["teacher"])),
+    }
+    grid_frames = _make_grid_video(frames_by_name, labels, length=length, top_right_labels=top_right_labels)
+    output_path = os.path.join(output_dir, filename)
+    save_video(grid_frames, output_path, fps=fps)
+    return output_path
+
+
 def sort_target_trajectory(target_poses, target_intrs, target_timestamps, is_target=None):
     sorted_poses = target_poses.clone()
     sorted_intrs = target_intrs.clone()
@@ -132,9 +365,15 @@ def sort_target_trajectory(target_poses, target_intrs, target_timestamps, is_tar
 
 def save_eval_condition_videos(output_dir, render_conditions, camera_embed=None, fps=15):
     os.makedirs(output_dir, exist_ok=True)
+    saved_frames = {}
     views = render_conditions["source_views"]
     source_video = views["img"][0].detach().float().permute(0, 2, 3, 1).cpu().clamp(0, 1)
-    save_video(_tensor_to_pil_video(source_video), os.path.join(output_dir, "input_source_views.mp4"), fps=fps)
+    source_frames = _tensor_to_pil_video(source_video)
+    saved_frames["input_source_views"] = source_frames
+    save_video(source_frames, os.path.join(output_dir, "input_source_views.mp4"), fps=fps)
+    gt_81_frames = _source_timeline_video(views, source_video, render_conditions["target_timestamps"])
+    saved_frames["gt_81_sorted"] = gt_81_frames
+    save_video(gt_81_frames, os.path.join(output_dir, "gt_81_sorted.mp4"), fps=fps)
 
     is_target = views.get("is_target")
     if isinstance(is_target, torch.Tensor) and is_target.ndim == 2:
@@ -142,13 +381,26 @@ def save_eval_condition_videos(output_dir, render_conditions, camera_embed=None,
         target_mask = is_target[0].detach().cpu().bool()
         context_video = source_video[context_mask]
         if len(context_video) > 0:
-            save_video(_tensor_to_pil_video(context_video), os.path.join(output_dir, "input_context_views.mp4"), fps=fps)
+            context_frames = _tensor_to_pil_video(context_video)
+            saved_frames["input_context_views_raw"] = context_frames
+            save_video(context_frames, os.path.join(output_dir, "input_context_views.mp4"), fps=fps)
+            context_timeline_frames = _context_timeline_video(
+                views,
+                source_video,
+                render_conditions["target_timestamps"],
+            )
+            saved_frames["input_context_views"] = context_timeline_frames
+            save_video(context_timeline_frames, os.path.join(output_dir, "input_context_views_timeline.mp4"), fps=fps)
         target_input_video = source_video[target_mask]
         if len(target_input_video) > 0:
-            save_video(_tensor_to_pil_video(target_input_video), os.path.join(output_dir, "input_target_views_gt.mp4"), fps=fps)
+            target_input_frames = _tensor_to_pil_video(target_input_video)
+            saved_frames["input_target_views_gt"] = target_input_frames
+            save_video(target_input_frames, os.path.join(output_dir, "input_target_views_gt.mp4"), fps=fps)
 
     target_rgb = render_conditions["target_rgb"][0].detach().float().cpu().clamp(0, 1)
-    save_video(_tensor_to_pil_video(target_rgb), os.path.join(output_dir, "rendered_degraded_rgb.mp4"), fps=fps)
+    target_rgb_frames = _tensor_to_pil_video(target_rgb)
+    saved_frames["rendered_degraded_rgb"] = target_rgb_frames
+    save_video(target_rgb_frames, os.path.join(output_dir, "rendered_degraded_rgb.mp4"), fps=fps)
 
     target_depth = render_conditions["target_depth"][0].detach().float().cpu()
     save_video(
@@ -168,6 +420,7 @@ def save_eval_condition_videos(output_dir, render_conditions, camera_embed=None,
         scale = camera_moment.abs().amax().clamp_min(1e-6)
         camera_moment = (camera_moment / scale).clamp(-1, 1) * 0.5 + 0.5
         save_video(_tensor_to_pil_video(camera_moment), os.path.join(output_dir, "target_plucker_moment.mp4"), fps=fps)
+    return saved_frames
 
 
 @torch.no_grad()
@@ -409,6 +662,7 @@ def main():
     parser.add_argument("--disable_lora", action="store_true")
     parser.add_argument("--lora_path", default=None)
     parser.add_argument("--no_save_conditions", action="store_true")
+    parser.add_argument("--no_save_comparison_grid", action="store_true")
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
@@ -452,6 +706,7 @@ def main():
     source_views = dataset[int(args.dataset_index)]
     prompt = source_views[0]["prompt"]
     render_conditions = build_render_conditions(pipe, source_views, args, cfg)
+    eval_frames = {}
     if not args.no_save_conditions:
         camera_embed_for_vis = None
         camera_unit = next((unit for unit in pipe.units if unit.__class__.__name__ == "WanVideoUnit_CameraProcesser"), None)
@@ -462,7 +717,7 @@ def main():
                 args.height,
                 args.width,
             )
-        save_eval_condition_videos(args.output_dir, render_conditions, camera_embed=camera_embed_for_vis)
+        eval_frames.update(save_eval_condition_videos(args.output_dir, render_conditions, camera_embed=camera_embed_for_vis))
     for mode in [item.strip() for item in args.modes.split(",") if item.strip()]:
         if mode == "teacher":
             video = pipe(
@@ -486,7 +741,15 @@ def main():
             video = generate_with_student(pipe, adapter, render_conditions, prompt, cfg, args, mode=mode)
         else:
             raise ValueError(f"Unsupported mode: {mode}")
+        eval_frames[mode] = video
         save_video(video, os.path.join(args.output_dir, f"{mode}.mp4"), fps=15)
+    if not args.no_save_comparison_grid:
+        grid_path = save_eval_comparison_grid(args.output_dir, eval_frames, fps=15)
+        if grid_path is not None:
+            print(f"Saved comparison grid: {grid_path}")
+        gt_grid_path = save_eval_gt_comparison_grid(args.output_dir, eval_frames, fps=15)
+        if gt_grid_path is not None:
+            print(f"Saved GT comparison grid: {gt_grid_path}")
 
 
 if __name__ == "__main__":
