@@ -99,7 +99,7 @@ class BaseDataset(EasyDataset):
 
     def __getitem__(self, idx):
         # set-up the rng
-        if self.seed:  # reseed for each __getitem__
+        if self.seed is not None:  # reseed for each __getitem__
             self._rng = np.random.default_rng(seed=self.seed + idx)
         elif not hasattr(self, "_rng"):
             seed = torch.randint(0, 2**32, (1,)).item()

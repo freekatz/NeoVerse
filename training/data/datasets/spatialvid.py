@@ -9,6 +9,7 @@ import pandas as pd
 from decord import VideoReader
 import gc
 from contextlib import contextmanager
+from collections.abc import Mapping, Sequence
 
 from tqdm import tqdm
 from ..base_dataset import BaseDataset
@@ -59,6 +60,17 @@ def VideoReader_contextmanager(*args, **kwargs):
 
 
 class SpatialVID(BaseDataset):
+    CONTEXT_SAMPLING_STRATEGIES = (
+        "uniform",
+        "uniform_first",
+        "random_first",
+        "window_with_first",
+        "prefix",
+        "first_plus_sparse",
+        "first_plus_recent_window",
+        "mixed",
+    )
+
     def __init__(
         self,
         ROOT,
@@ -68,6 +80,9 @@ class SpatialVID(BaseDataset):
         continuous_target_frames=False,
         force_first_context=True,
         timestamp_unit="seconds",
+        context_sampling_strategy="uniform",
+        context_sampling_weights=None,
+        variants_per_scene=1,
         *args,
         **kwargs,
     ):
@@ -77,6 +92,14 @@ class SpatialVID(BaseDataset):
         self.use_camera_annotations = use_camera_annotations
         self.continuous_target_frames = bool(continuous_target_frames)
         self.force_first_context = bool(force_first_context)
+        self.context_sampling_strategy = str(context_sampling_strategy)
+        self.context_sampling_weights = context_sampling_weights
+        self.variants_per_scene = max(1, int(variants_per_scene))
+        if self.context_sampling_strategy not in self.CONTEXT_SAMPLING_STRATEGIES:
+            raise ValueError(
+                f"Unsupported context_sampling_strategy={self.context_sampling_strategy!r}. "
+                f"Expected one of {self.CONTEXT_SAMPLING_STRATEGIES}."
+            )
         if timestamp_unit not in {"seconds", "frames"}:
             raise ValueError(f"Unsupported timestamp_unit={timestamp_unit!r}. Expected 'seconds' or 'frames'.")
         self.timestamp_unit = timestamp_unit
@@ -114,17 +137,94 @@ class SpatialVID(BaseDataset):
             raise ValueError(f"SpatialVID found no scenes after filtering ({filter_text}).")
 
     def __len__(self):
-        return len(self.scenes)
+        return len(self.scenes) * self.variants_per_scene
+
+    def _scene_variant_index(self, idx):
+        idx = int(idx)
+        if self.variants_per_scene <= 1:
+            return idx, 0
+        return idx // self.variants_per_scene, idx % self.variants_per_scene
+
+    def _strategy_for_sample(self, rng):
+        strategy = self.context_sampling_strategy
+        if strategy != "mixed":
+            self._last_context_strategy = strategy
+            return strategy
+        if self.context_sampling_weights is None:
+            choices = (
+                "uniform_first",
+                "random_first",
+                "window_with_first",
+                "prefix",
+                "first_plus_sparse",
+                "first_plus_recent_window",
+            )
+            weights = np.ones(len(choices), dtype=np.float64)
+        elif isinstance(self.context_sampling_weights, Mapping):
+            choices = tuple(str(key) for key in self.context_sampling_weights.keys())
+            weights = np.array([float(value) for value in self.context_sampling_weights.values()], dtype=np.float64)
+        elif isinstance(self.context_sampling_weights, Sequence) and not isinstance(self.context_sampling_weights, str):
+            choices = tuple(str(item[0]) for item in self.context_sampling_weights)
+            weights = np.array([float(item[1]) for item in self.context_sampling_weights], dtype=np.float64)
+        else:
+            raise ValueError("context_sampling_weights must be a mapping or a sequence of (strategy, weight) pairs.")
+        for choice in choices:
+            if choice == "mixed" or choice not in self.CONTEXT_SAMPLING_STRATEGIES:
+                raise ValueError(f"Invalid mixed context sampling choice: {choice!r}.")
+        if len(choices) == 0 or weights.sum() <= 0:
+            raise ValueError("context_sampling_weights must contain at least one positive weight.")
+        weights = weights / weights.sum()
+        strategy = str(rng.choice(choices, p=weights))
+        self._last_context_strategy = strategy
+        return strategy
 
     def _context_local_indices(self, num_context_views):
         num_context_views = int(np.clip(num_context_views, 1, self.num_views))
         if num_context_views >= self.num_views:
+            self._last_context_strategy = "all"
             return np.arange(self.num_views, dtype=np.int64)
         if self.force_first_context:
+            return self._context_local_indices_with_first(num_context_views)
+        self._last_context_strategy = "uniform_no_first"
+        indices = np.linspace(0, self.num_views - 1, num_context_views, dtype=int)
+        return np.unique(indices).astype(np.int64)
+
+    def _context_local_indices_with_first(self, num_context_views):
+        if num_context_views <= 1:
+            return np.array([0], dtype=np.int64)
+        strategy = self._strategy_for_sample(self._rng)
+        count = num_context_views - 1
+        candidates = np.arange(1, self.num_views, dtype=np.int64)
+        if strategy in {"uniform", "uniform_first"}:
             indices = np.linspace(0, self.num_views - 1, num_context_views, dtype=int)
-            indices[0] = 0
-            return np.unique(indices).astype(np.int64)
-        return np.unique(np.linspace(0, self.num_views - 1, num_context_views, dtype=int)).astype(np.int64)
+        elif strategy == "random_first":
+            rest = self._rng.choice(candidates, size=count, replace=False)
+            indices = np.concatenate(([0], np.sort(rest)))
+        elif strategy == "window_with_first":
+            window = min(count, self.num_views - 1)
+            start = int(self._rng.integers(1, self.num_views - window + 1))
+            indices = np.concatenate(([0], np.arange(start, start + window, dtype=np.int64)))
+        elif strategy == "prefix":
+            indices = np.arange(num_context_views, dtype=np.int64)
+        elif strategy == "first_plus_sparse":
+            rest = np.linspace(1, self.num_views - 1, count, dtype=int)
+            indices = np.concatenate(([0], rest))
+        elif strategy == "first_plus_recent_window":
+            window = min(count, self.num_views - 1)
+            max_start = self.num_views - window
+            min_start = max(1, self.num_views - max(window * 3, window))
+            start = int(self._rng.integers(min_start, max_start + 1))
+            indices = np.concatenate(([0], np.arange(start, start + window, dtype=np.int64)))
+        else:
+            raise ValueError(f"Unsupported sampled context strategy: {strategy!r}")
+        indices = np.unique(indices).astype(np.int64)
+        if len(indices) < num_context_views:
+            missing = num_context_views - len(indices)
+            pool = np.setdiff1d(candidates, indices, assume_unique=False)
+            if len(pool) > 0:
+                extra = self._rng.choice(pool, size=min(missing, len(pool)), replace=False)
+                indices = np.unique(np.concatenate((indices, extra))).astype(np.int64)
+        return np.sort(indices[:num_context_views]).astype(np.int64)
 
     def _timestamp(self, sample_index, time_index, v, first_sample_index, first_time_index, reverse, fps):
         if self.timestamp_unit == "seconds":
@@ -136,7 +236,8 @@ class SpatialVID(BaseDataset):
         return np.float32(delta)
 
     def _get_views(self, idx, rng, num_context_views):
-        scene_info = self.scenes.iloc[idx]
+        scene_idx, variant_id = self._scene_variant_index(idx)
+        scene_info = self.scenes.iloc[scene_idx]
         video_path = osp.join(self.ROOT, "SpatialVid/HQ", scene_info["video path"])
         annotation_dir = osp.join(self.ROOT, "SpatialVid/HQ", scene_info["annotation path"])
         poses_path = osp.join(annotation_dir, "poses.npy")
@@ -180,6 +281,7 @@ class SpatialVID(BaseDataset):
             text_prompt = captions["SceneDescription"]
 
         context_local_indices = set(self._context_local_indices(num_context_views).tolist())
+        context_strategy = getattr(self, "_last_context_strategy", self.context_sampling_strategy)
         first_sample_index = sample_index[0]
         first_time_index = sample_anno_index[0] if has_camera_annotations else sample_index[0]
         context_views = []
@@ -205,6 +307,9 @@ class SpatialVID(BaseDataset):
                 is_static=False,
                 timestamp=timestamp,
                 prompt=text_prompt,
+                scene_idx=scene_idx,
+                variant_id=variant_id,
+                context_strategy=context_strategy,
             )
             if has_camera_annotations:
                 view["camera_poses"] = camera_pose.astype(np.float32)

@@ -1,4 +1,5 @@
 seed: 0
+dataset_seed: ${seed}
 torch_dtype: bfloat16
 model_path: ./models
 reconstructor_path: ./models/NeoVerse/reconstructor.ckpt
@@ -19,7 +20,16 @@ use_camera_annotations: false
 continuous_target_frames: true
 force_first_context: true
 timestamp_unit: seconds
-train_dataset: SpatialVID(split=None, ROOT="data/SpatialVID", use_camera_annotations=${use_camera_annotations}, continuous_target_frames=${continuous_target_frames}, force_first_context=${force_first_context}, timestamp_unit="${timestamp_unit}", min_interval=1, max_interval=1, height=${height}, width=${width}, num_views=${num_views}, min_num_context_views=${min_num_context_views}, max_num_context_views=${max_num_context_views}, seed=${seed})
+context_sampling_strategy: uniform
+context_sampling_weights:
+  uniform_first: 0.25
+  random_first: 0.30
+  window_with_first: 0.15
+  prefix: 0.15
+  first_plus_sparse: 0.10
+  first_plus_recent_window: 0.05
+variants_per_scene: 1
+train_dataset: SpatialVID(split=None, ROOT="data/SpatialVID", use_camera_annotations=${use_camera_annotations}, continuous_target_frames=${continuous_target_frames}, force_first_context=${force_first_context}, timestamp_unit="${timestamp_unit}", context_sampling_strategy="${context_sampling_strategy}", context_sampling_weights=${context_sampling_weights}, variants_per_scene=${variants_per_scene}, min_interval=1, max_interval=1, height=${height}, width=${width}, num_views=${num_views}, min_num_context_views=${min_num_context_views}, max_num_context_views=${max_num_context_views}, seed=${dataset_seed})
 
 pipeline_kwargs:
   # Keep the distillation teacher deterministic by default. Random target

@@ -339,6 +339,9 @@ def frozen_cache_signature(data, cfg):
                 "image_name": cache_scalar(view.get("image_name")),
                 "timestamp": cache_scalar(view.get("timestamp")),
                 "is_target": cache_scalar(view.get("is_target")),
+                "scene_idx": cache_scalar(view.get("scene_idx")),
+                "variant_id": cache_scalar(view.get("variant_id")),
+                "context_strategy": cache_scalar(view.get("context_strategy")),
             }
         )
     cfg_signature = {
@@ -808,12 +811,12 @@ def main():
             batch_iter = dataloader
         for batch in batch_iter:
             with accelerator.accumulate(model):
-                optimizer.zero_grad(set_to_none=True)
                 loss, metrics = model(batch)
                 accelerator.backward(loss)
                 if cfg.clip_grad is not None and accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), float(cfg.clip_grad))
                 optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
             if accelerator.sync_gradients:
                 step += 1

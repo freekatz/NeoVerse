@@ -172,7 +172,7 @@ if [[ "${DIST_NPROC_PER_NODE}" -le 0 || "${DIST_NNODES}" -le 0 ]]; then
 fi
 
 GLOBAL_NUM_PROCESSES=$((DIST_NPROC_PER_NODE * DIST_NNODES))
-MAX_STEPS_VALUE="${MAX_STEPS:-20000}"
+MAX_STEPS_VALUE="${MAX_STEPS:-200000}"
 NUM_EPOCHS_VALUE="${NUM_EPOCHS:-${MAX_STEPS_VALUE}}"
 
 TRAIN_OVERRIDES=(
@@ -183,6 +183,8 @@ TRAIN_OVERRIDES=(
   "continuous_target_frames=${CONTINUOUS_TARGET_FRAMES:-true}"
   "force_first_context=${FORCE_FIRST_CONTEXT:-true}"
   "timestamp_unit=${TIMESTAMP_UNIT:-seconds}"
+  "context_sampling_strategy=${CONTEXT_SAMPLING_STRATEGY:-mixed}"
+  "variants_per_scene=${VARIANTS_PER_SCENE:-16}"
   "pipeline_kwargs.mask_non_context_targets=${MASK_NON_CONTEXT_TARGETS:-false}"
   "max_steps=${MAX_STEPS_VALUE}"
   "num_epochs=${NUM_EPOCHS_VALUE}"
@@ -216,6 +218,7 @@ append_override_if_set() {
 append_override_if_set "MODEL_PATH" "model_path"
 append_override_if_set "RECONSTRUCTOR_PATH" "reconstructor_path"
 append_override_if_set "SEED" "seed"
+append_override_if_set "DATASET_SEED" "dataset_seed"
 append_override_if_set "USE_CAMERA_ANNOTATIONS" "use_camera_annotations"
 append_override_if_set "BATCH_SIZE" "batch_size"
 append_override_if_set "NUM_WORKERS" "num_workers"
@@ -230,6 +233,22 @@ append_override_if_set "AUTO_RESUME" "auto_resume"
 append_override_if_set "RESUME_FROM" "resume_from"
 append_override_if_set "RESUME_OPTIMIZER" "resume_optimizer"
 append_override_if_set "SAVE_OPTIMIZER_INTERMEDIATE" "save_optimizer_intermediate"
+append_override_if_set "ADAPTER_TYPE" "adapter.type"
+append_override_if_set "ADAPTER_OUTPUT_MODE" "adapter.output_mode"
+append_override_if_set "ADAPTER_HIDDEN_DIM" "adapter.hidden_dim"
+append_override_if_set "ADAPTER_USE_TEXT_CONTEXT" "adapter.use_text_context"
+append_override_if_set "ADAPTER_USE_DIT_STATE" "adapter.use_dit_state"
+append_override_if_set "CONV_INPUT_CHANNELS" "adapter.input_channels"
+append_override_if_set "CONV_NUM_RES_BLOCKS" "adapter.num_res_blocks"
+append_override_if_set "CONV_DROPOUT" "adapter.dropout"
+append_override_if_set "CONV_CONDITION_TIME_DIM" "adapter.condition_time_dim"
+append_override_if_set "CROSS_TOKEN_DIM" "adapter.token_dim"
+append_override_if_set "CROSS_NUM_HEADS" "adapter.num_heads"
+append_override_if_set "CROSS_NUM_BLOCKS" "adapter.num_blocks"
+append_override_if_set "CROSS_SOURCE_POOL_HW" "adapter.source_pool_hw"
+append_override_if_set "CROSS_MAX_SOURCE_TOKENS" "adapter.max_source_tokens"
+append_override_if_set "CROSS_QUERY_CHUNK_SIZE" "adapter.query_chunk_size"
+append_override_if_set "CROSS_USE_ROPE" "adapter.use_rope"
 append_override_if_set "CACHE_TRAIN_BATCH" "cache_train_batch"
 append_override_if_set "CACHE_FROZEN_OUTPUTS" "cache_frozen_outputs"
 if [[ "${FAST_FROZEN_CACHE}" != "1" ]]; then
@@ -276,6 +295,13 @@ DIST_NODE_RANK=${DIST_NODE_RANK}
 DIST_MASTER_ADDR=${DIST_MASTER_ADDR}
 DIST_MASTER_PORT=${DIST_MASTER_PORT}
 GLOBAL_NUM_PROCESSES=${GLOBAL_NUM_PROCESSES}
+ADAPTER_TYPE=${ADAPTER_TYPE:-}
+ADAPTER_HIDDEN_DIM=${ADAPTER_HIDDEN_DIM:-}
+CROSS_NUM_HEADS=${CROSS_NUM_HEADS:-}
+CROSS_NUM_BLOCKS=${CROSS_NUM_BLOCKS:-}
+CROSS_SOURCE_POOL_HW=${CROSS_SOURCE_POOL_HW:-}
+CROSS_MAX_SOURCE_TOKENS=${CROSS_MAX_SOURCE_TOKENS:-}
+CROSS_QUERY_CHUNK_SIZE=${CROSS_QUERY_CHUNK_SIZE:-}
 TRAIN_OVERRIDES=${TRAIN_OVERRIDES[*]}
 EXTRA_OVERRIDES=$*
 EOF
