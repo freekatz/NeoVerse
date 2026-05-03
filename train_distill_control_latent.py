@@ -58,6 +58,8 @@ def build_adapter(pipe: WanVideoNeoVersePipeline, cfg):
             adapter_cfg.pop(conv_only_key, None)
         if adapter_cfg.get("token_dim") is None:
             adapter_cfg["token_dim"] = int(cfg.token.token_dim)
+        if adapter_cfg.get("max_token_groups") is None:
+            adapter_cfg["max_token_groups"] = max(int(cfg.token.token_groups), 8)
         return build_student_adapter(adapter_type, **common, **adapter_cfg)
     raise ValueError(f"Unsupported adapter type: {adapter_type}")
 
@@ -404,6 +406,16 @@ def prepare_runtime_cache(cache, device):
     return cache_to_device(cache, device)
 
 
+def cache_target_is_cpu(device) -> bool:
+    return torch.device(device).type == "cpu"
+
+
+def cache_to_target_device(cache, device, dtype=None):
+    if cache_target_is_cpu(device):
+        return cache_to_cpu(cache, dtype=dtype)
+    return cache_to_device(cache, device)
+
+
 def frozen_cache_batch_key(cache):
     key = []
     for name in sorted(cache.keys()):
@@ -583,19 +595,32 @@ class ControlLatentDistillModule(torch.nn.Module):
             "source_intrs": detach_optional_tensor(source_intrs),
         }
 
-    def get_forward_cache(self, data):
+    def get_forward_cache(self, data, device=None):
+        target_device = self.pipe.device if device is None else device
         frozen_cache_dir = self.cfg.get("frozen_cache_dir", None)
         if frozen_cache_dir:
             cache_path = os.path.join(str(frozen_cache_dir), f"{frozen_cache_signature(data, self.cfg)}.pt")
             if bool(self.cfg.get("frozen_cache_read", True)) and os.path.exists(cache_path):
-                return cache_to_device(torch.load(cache_path, map_location="cpu"), self.pipe.device)
+                return cache_to_target_device(
+                    torch.load(cache_path, map_location="cpu"),
+                    target_device,
+                    dtype=cache_float_dtype(self.cfg) if cache_target_is_cpu(target_device) else None,
+                )
             cache = self.build_frozen_forward_cache(data)
             if bool(self.cfg.get("frozen_cache_write", False)):
                 save_frozen_cache(cache_path, cache, self.cfg)
-            return cache
+            return cache_to_target_device(
+                cache,
+                target_device,
+                dtype=cache_float_dtype(self.cfg) if cache_target_is_cpu(target_device) else None,
+            )
 
         if not bool(self.cfg.get("cache_frozen_outputs", False)):
-            return self.build_frozen_forward_cache(data)
+            return cache_to_target_device(
+                self.build_frozen_forward_cache(data),
+                target_device,
+                dtype=cache_float_dtype(self.cfg) if cache_target_is_cpu(target_device) else None,
+            )
         if not hasattr(self, "_frozen_forward_cache"):
             self._frozen_forward_cache = self.build_frozen_forward_cache(data)
             cache = self._frozen_forward_cache
@@ -606,7 +631,11 @@ class ControlLatentDistillModule(torch.nn.Module):
                 f"tokens={tuple(tokens.shape)} teacher={tuple(teacher.shape)} "
                 f"output_grid={cache['output_grid']}"
             )
-        return self._frozen_forward_cache
+        return cache_to_target_device(
+            self._frozen_forward_cache,
+            target_device,
+            dtype=cache_float_dtype(self.cfg) if cache_target_is_cpu(target_device) else None,
+        )
 
     def forward(self, data):
         cache = prepare_runtime_cache(data, self.pipe.device) if looks_like_frozen_cache(data) else self.get_forward_cache(data)
@@ -781,21 +810,40 @@ def main():
         unwrapped = accelerator.unwrap_model(model)
         preloaded_frozen_batches = []
         preload_device = str(cfg.get("preload_frozen_cache_device", "cuda"))
+        preload_cache_device = "cpu" if preload_device == "cpu" else accelerator.device
+        preload_total = len(dataloader) if hasattr(dataloader, "__len__") else None
+        preload_log_freq = int(cfg.get("preload_frozen_cache_log_freq", 20))
+        preload_start = time.time()
         if accelerator.is_main_process:
-            print(f"Preloading frozen cache from DataLoader to {preload_device}.")
-        for preload_batch in dataloader:
-            cache = unwrapped.get_forward_cache(preload_batch)
+            total_text = "unknown" if preload_total is None else str(preload_total)
+            print(f"Preloading frozen cache from DataLoader to {preload_device} ({total_text} batches on this process).")
+        for preload_idx, preload_batch in enumerate(dataloader, start=1):
+            cache = unwrapped.get_forward_cache(preload_batch, device=preload_cache_device)
             if preload_device == "cpu":
                 cache = cache_to_cpu(cache, dtype=cache_float_dtype(cfg))
             else:
                 cache = cache_to_device(cache, accelerator.device)
             preloaded_frozen_batches.append(cache)
+            if accelerator.is_main_process and preload_log_freq > 0 and (
+                preload_idx == 1 or preload_idx % preload_log_freq == 0
+            ):
+                elapsed = time.time() - preload_start
+                if preload_total is None:
+                    print(f"Preloaded frozen cache batches: {preload_idx} elapsed={elapsed:.1f}s")
+                else:
+                    print(
+                        f"Preloaded frozen cache batches: {preload_idx}/{preload_total} "
+                        f"elapsed={elapsed:.1f}s"
+                    )
         preloaded_frozen_batches = batch_preloaded_frozen_cache(
             preloaded_frozen_batches,
             int(cfg.get("preload_frozen_cache_batch_size", 1)),
         )
         if accelerator.is_main_process:
-            print(f"Preloaded {len(preloaded_frozen_batches)} frozen cache batches on this process.")
+            print(
+                f"Preloaded {len(preloaded_frozen_batches)} frozen cache batches on this process "
+                f"in {time.time() - preload_start:.1f}s."
+            )
         if len(preloaded_frozen_batches) == 0:
             raise RuntimeError("preload_frozen_cache=true but no frozen cache entries were loaded.")
 

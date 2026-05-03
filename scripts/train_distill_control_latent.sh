@@ -174,6 +174,11 @@ fi
 GLOBAL_NUM_PROCESSES=$((DIST_NPROC_PER_NODE * DIST_NNODES))
 MAX_STEPS_VALUE="${MAX_STEPS:-200000}"
 NUM_EPOCHS_VALUE="${NUM_EPOCHS:-${MAX_STEPS_VALUE}}"
+CUDA_PRELOAD_MIN_PROCESSES="${CUDA_PRELOAD_MIN_PROCESSES:-8}"
+DEFAULT_PRELOAD_FROZEN_CACHE_DEVICE="${PRELOAD_FROZEN_CACHE_DEVICE:-cpu}"
+if [[ -z "${PRELOAD_FROZEN_CACHE_DEVICE:-}" && "${GLOBAL_NUM_PROCESSES}" -ge "${CUDA_PRELOAD_MIN_PROCESSES}" ]]; then
+  DEFAULT_PRELOAD_FROZEN_CACHE_DEVICE="cuda"
+fi
 
 TRAIN_OVERRIDES=(
   "output_path=${OUTPUT_PATH}"
@@ -197,7 +202,7 @@ if [[ "${FAST_FROZEN_CACHE}" == "1" ]]; then
     "frozen_cache_read=${FROZEN_CACHE_READ:-true}"
     "frozen_cache_write=${FROZEN_CACHE_WRITE:-true}"
     "preload_frozen_cache=${PRELOAD_FROZEN_CACHE:-true}"
-    "preload_frozen_cache_device=${PRELOAD_FROZEN_CACHE_DEVICE:-cpu}"
+    "preload_frozen_cache_device=${DEFAULT_PRELOAD_FROZEN_CACHE_DEVICE}"
     "preload_frozen_cache_batch_size=${PRELOAD_FROZEN_CACHE_BATCH_SIZE:-1}"
     "save_optimizer_intermediate=${SAVE_OPTIMIZER_INTERMEDIATE:-false}"
   )
@@ -249,6 +254,14 @@ append_override_if_set "CROSS_SOURCE_POOL_HW" "adapter.source_pool_hw"
 append_override_if_set "CROSS_MAX_SOURCE_TOKENS" "adapter.max_source_tokens"
 append_override_if_set "CROSS_QUERY_CHUNK_SIZE" "adapter.query_chunk_size"
 append_override_if_set "CROSS_USE_ROPE" "adapter.use_rope"
+append_override_if_set "CROSS_MAX_TOKEN_GROUPS" "adapter.max_token_groups"
+append_override_if_set "CROSS_USE_GROUP_EMBEDDING" "adapter.use_group_embedding"
+append_override_if_set "CROSS_USE_LOCAL_GRID" "adapter.use_local_grid"
+append_override_if_set "CROSS_USE_TIME_FILM" "adapter.use_time_film"
+append_override_if_set "CROSS_TIME_FILM_DIM" "adapter.time_film_dim"
+append_override_if_set "CROSS_TIME_POSITION_MODE" "adapter.time_position_mode"
+append_override_if_set "CROSS_REROPE_INTERVAL" "adapter.rerope_interval"
+append_override_if_set "CROSS_POST_NUM_RES_BLOCKS" "adapter.post_num_res_blocks"
 append_override_if_set "CACHE_TRAIN_BATCH" "cache_train_batch"
 append_override_if_set "CACHE_FROZEN_OUTPUTS" "cache_frozen_outputs"
 if [[ "${FAST_FROZEN_CACHE}" != "1" ]]; then
@@ -260,6 +273,7 @@ append_override_if_set "FROZEN_CACHE_DTYPE" "frozen_cache_dtype"
 append_override_if_set "PRELOAD_FROZEN_CACHE" "preload_frozen_cache"
 append_override_if_set "PRELOAD_FROZEN_CACHE_DEVICE" "preload_frozen_cache_device"
 append_override_if_set "PRELOAD_FROZEN_CACHE_BATCH_SIZE" "preload_frozen_cache_batch_size"
+append_override_if_set "PRELOAD_FROZEN_CACHE_LOG_FREQ" "preload_frozen_cache_log_freq"
 append_override_if_set "SHUFFLE_PRELOADED_FROZEN_CACHE" "shuffle_preloaded_frozen_cache"
 
 read -r -a accelerate_extra_args <<< "${ACCELERATE_EXTRA_ARGS}"
@@ -280,6 +294,8 @@ RUN_TIME=${RUN_TIME}
 RUN_NAME=${RUN_NAME}
 OUTPUT_PATH=${OUTPUT_PATH}
 FROZEN_CACHE_DIR=${FROZEN_CACHE_DIR:-}
+DEFAULT_PRELOAD_FROZEN_CACHE_DEVICE=${DEFAULT_PRELOAD_FROZEN_CACHE_DEVICE}
+CUDA_PRELOAD_MIN_PROCESSES=${CUDA_PRELOAD_MIN_PROCESSES}
 LOG_DIR=${LOG_DIR}
 LOG_FILE=${LOG_FILE}
 PID_FILE=${PID_FILE}
@@ -302,6 +318,11 @@ CROSS_NUM_BLOCKS=${CROSS_NUM_BLOCKS:-}
 CROSS_SOURCE_POOL_HW=${CROSS_SOURCE_POOL_HW:-}
 CROSS_MAX_SOURCE_TOKENS=${CROSS_MAX_SOURCE_TOKENS:-}
 CROSS_QUERY_CHUNK_SIZE=${CROSS_QUERY_CHUNK_SIZE:-}
+CROSS_USE_GROUP_EMBEDDING=${CROSS_USE_GROUP_EMBEDDING:-}
+CROSS_USE_LOCAL_GRID=${CROSS_USE_LOCAL_GRID:-}
+CROSS_USE_TIME_FILM=${CROSS_USE_TIME_FILM:-}
+CROSS_TIME_POSITION_MODE=${CROSS_TIME_POSITION_MODE:-}
+CROSS_REROPE_INTERVAL=${CROSS_REROPE_INTERVAL:-}
 TRAIN_OVERRIDES=${TRAIN_OVERRIDES[*]}
 EXTRA_OVERRIDES=$*
 EOF
@@ -319,6 +340,7 @@ log "dist_nnodes=${DIST_NNODES}"
 log "dist_node_rank=${DIST_NODE_RANK}"
 log "dist_master_addr=${DIST_MASTER_ADDR}"
 log "dist_master_port=${DIST_MASTER_PORT}"
+log "default_preload_frozen_cache_device=${DEFAULT_PRELOAD_FROZEN_CACHE_DEVICE}"
 log "default_overrides=${TRAIN_OVERRIDES[*]}"
 log "extra_overrides=$*"
 log "config_file=${CONFIG_FILE}"

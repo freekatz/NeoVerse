@@ -38,10 +38,16 @@ bash scripts/train_distill_control_latent.sh \
   adapter.type=cross_attention_rope \
   adapter.token_dim=null \
   adapter.num_heads="${CROSS_NUM_HEADS:-8}" \
-  adapter.num_blocks="${CROSS_NUM_BLOCKS:-2}" \
+  adapter.num_blocks="${CROSS_NUM_BLOCKS:-4}" \
   adapter.source_pool_hw="${CROSS_SOURCE_POOL_HW:-[16,16]}" \
   adapter.max_source_tokens="${CROSS_MAX_SOURCE_TOKENS:-32768}" \
   adapter.query_chunk_size="${CROSS_QUERY_CHUNK_SIZE:-4096}" \
   adapter.use_rope=true \
   adapter.use_dit_state=false \
+  adapter.use_group_embedding="${CROSS_USE_GROUP_EMBEDDING:-true}" \
+  adapter.use_local_grid="${CROSS_USE_LOCAL_GRID:-true}" \
+  adapter.use_time_film="${CROSS_USE_TIME_FILM:-true}" \
+  adapter.time_position_mode="${CROSS_TIME_POSITION_MODE:-reroped}" \
+  adapter.rerope_interval="${CROSS_REROPE_INTERVAL:-4.0}" \
+  adapter.post_num_res_blocks="${CROSS_POST_NUM_RES_BLOCKS:-2}" \
   "$@"

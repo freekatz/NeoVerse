@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Iterable
 
 import torch
@@ -511,15 +512,111 @@ def _time_positions(
     dtype,
     time_scale: torch.Tensor | None,
 ) -> torch.Tensor:
+    values = _time_values(times, batch_size, length, device, dtype)
+    if times is None:
+        return values
+    denom = time_scale.to(device=device, dtype=dtype) if time_scale is not None else values.detach().abs().amax(dim=1, keepdim=True).clamp_min(1.0)
+    return values / denom
+
+
+def _time_values(
+    times: torch.Tensor | None,
+    batch_size: int,
+    length: int,
+    device,
+    dtype,
+) -> torch.Tensor:
     if times is None:
         return torch.linspace(0, 1, length, device=device, dtype=dtype)[None].expand(batch_size, -1)
     values = times.to(device=device, dtype=dtype)
-    if values.ndim == 1:
-        values = values[None].expand(batch_size, -1)
+    if values.ndim == 0:
+        values = values.reshape(1, 1)
+    elif values.ndim == 1:
+        values = values[None]
+    if values.shape[0] == 1 and batch_size != 1:
+        values = values.expand(batch_size, -1)
     if values.shape[1] != length:
         values = _interp_sequence(values[..., None], length).squeeze(-1)
-    denom = time_scale.to(device=device, dtype=dtype) if time_scale is not None else values.detach().abs().amax(dim=1, keepdim=True).clamp_min(1.0)
-    return values / denom
+    return values
+
+
+def _reroped_time_positions(
+    query_times: torch.Tensor | None,
+    source_times: torch.Tensor | None,
+    batch_size: int,
+    query_length: int,
+    source_length: int,
+    device,
+    dtype,
+    interval: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    query = _time_values(query_times, batch_size, query_length, device, dtype)
+    source = _time_values(source_times, batch_size, source_length, device, dtype)
+    if source_length <= 1:
+        return torch.zeros_like(query), torch.zeros_like(source)
+
+    interval = float(interval)
+    query_positions = []
+    source_positions = []
+    for batch_idx in range(batch_size):
+        src = source[batch_idx].float()
+        qry = query[batch_idx].float()
+        order = torch.argsort(src)
+        sorted_src = src[order].contiguous()
+
+        ranks = torch.arange(source_length, device=device, dtype=torch.float32) * interval
+        src_pos = torch.empty_like(sorted_src)
+        src_pos.scatter_(0, order, ranks)
+
+        right = torch.searchsorted(sorted_src, qry.contiguous(), right=False).clamp(1, source_length - 1)
+        left = right - 1
+        left_t = sorted_src[left]
+        right_t = sorted_src[right]
+        frac = ((qry - left_t) / (right_t - left_t).clamp_min(1e-6)).clamp(0.0, 1.0)
+        qry_pos = (left.float() + frac) * interval
+
+        query_positions.append(qry_pos.to(dtype=dtype))
+        source_positions.append(src_pos.to(dtype=dtype))
+    return torch.stack(query_positions, dim=0), torch.stack(source_positions, dim=0)
+
+
+def _time_interpolate_5d(
+    x: torch.Tensor,
+    target_frames: int,
+    source_times: torch.Tensor | None,
+    target_times: torch.Tensor | None,
+) -> torch.Tensor:
+    if source_times is None or target_times is None:
+        return _resize_5d(x, (target_frames, x.shape[-2], x.shape[-1]), mode="trilinear")
+    batch_size, channels, views, height, width = x.shape
+    if views == target_frames:
+        source_values = _time_values(source_times, batch_size, views, x.device, x.dtype)
+        target_values = _time_values(target_times, batch_size, target_frames, x.device, x.dtype)
+        if torch.allclose(source_values, target_values, atol=1e-6, rtol=1e-5):
+            return x
+    if views <= 1:
+        return x.expand(-1, -1, target_frames, -1, -1)
+
+    source_values = _time_values(source_times, batch_size, views, x.device, x.dtype)
+    target_values = _time_values(target_times, batch_size, target_frames, x.device, x.dtype)
+    outputs = []
+    for batch_idx in range(batch_size):
+        src = source_values[batch_idx].float()
+        tgt = target_values[batch_idx].float()
+        order = torch.argsort(src)
+        sorted_src = src[order].contiguous()
+        sorted_x = x[batch_idx, :, order]
+
+        right = torch.searchsorted(sorted_src, tgt.contiguous(), right=False).clamp(1, views - 1)
+        left = right - 1
+        left_t = sorted_src[left]
+        right_t = sorted_src[right]
+        weight = ((tgt - left_t) / (right_t - left_t).clamp_min(1e-6)).clamp(0.0, 1.0)
+        left_grid = sorted_x[:, left]
+        right_grid = sorted_x[:, right]
+        weight = weight[None, :, None, None].to(dtype=x.dtype)
+        outputs.append(left_grid * (1 - weight) + right_grid * weight)
+    return torch.stack(outputs, dim=0).reshape(batch_size, channels, target_frames, height, width)
 
 
 def _camera_centers_for_positions(
@@ -551,8 +648,26 @@ def _query_positions_for_grid(
     target_times: torch.Tensor | None,
     target_poses: torch.Tensor | None,
     time_scale: torch.Tensor | None,
+    source_times: torch.Tensor | None = None,
+    source_length: int | None = None,
+    time_position_mode: str = "normalized",
+    rerope_interval: float = 4.0,
 ) -> torch.Tensor:
-    t = _time_positions(target_times, batch_size, frames, device, dtype, time_scale)
+    if time_position_mode == "reroped" and source_times is not None:
+        if source_length is None:
+            source_length = source_times.shape[-1] if source_times.ndim > 0 else 1
+        t, _ = _reroped_time_positions(
+            target_times,
+            source_times,
+            batch_size,
+            frames,
+            int(source_length),
+            device,
+            dtype,
+            rerope_interval,
+        )
+    else:
+        t = _time_positions(target_times, batch_size, frames, device, dtype, time_scale)
     cam = _camera_centers_for_positions(target_poses, batch_size, frames, device, dtype)
     y = torch.linspace(0, 1, height, device=device, dtype=dtype)
     x = torch.linspace(0, 1, width, device=device, dtype=dtype)
@@ -596,6 +711,378 @@ def _apply_rope_nd(x: torch.Tensor, positions: torch.Tensor, base: float = 10000
     if offset < dim:
         parts.append(x[..., offset:])
     return torch.cat(parts, dim=-1)
+
+
+class TemporalFiLM(torch.nn.Module):
+    def __init__(self, hidden_dim: int, time_dim: int = 128):
+        super().__init__()
+        self.time_dim = int(time_dim)
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(self.time_dim, hidden_dim),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden_dim, hidden_dim * 2),
+        )
+        torch.nn.init.zeros_(self.net[-1].weight)
+        torch.nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x: torch.Tensor, times: torch.Tensor | None) -> torch.Tensor:
+        if times is None:
+            return x
+        emb = sinusoidal_embedding(times.to(device=x.device, dtype=x.dtype), self.time_dim)
+        emb = emb.to(dtype=self.net[0].weight.dtype)
+        scale, shift = self.net(emb).to(dtype=x.dtype).chunk(2, dim=-1)
+        return x * (1 + scale) + shift
+
+
+@dataclass
+class SourceTokenPack:
+    tokens: torch.Tensor
+    positions: torch.Tensor
+    times: torch.Tensor
+
+
+class MinTTimePosition:
+    def __init__(self, mode: str = "reroped", rerope_interval: float = 4.0):
+        if mode not in {"normalized", "reroped"}:
+            raise ValueError(f"Unsupported time_position_mode: {mode}")
+        self.mode = mode
+        self.rerope_interval = float(rerope_interval)
+
+    def normalized(
+        self,
+        times: torch.Tensor | None,
+        batch_size: int,
+        length: int,
+        device,
+        dtype,
+        time_scale: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return _time_positions(times, batch_size, length, device, dtype, time_scale)
+
+    def frame_positions(
+        self,
+        times: torch.Tensor | None,
+        batch_size: int,
+        length: int,
+        device,
+        dtype,
+        time_scale: torch.Tensor | None,
+        *,
+        anchor_times: torch.Tensor | None = None,
+        anchor_length: int | None = None,
+    ) -> torch.Tensor:
+        if self.mode == "reroped" and anchor_times is not None:
+            if anchor_length is None:
+                anchor_length = anchor_times.shape[-1] if anchor_times.ndim > 0 else 1
+            positions, _ = _reroped_time_positions(
+                times,
+                anchor_times,
+                batch_size,
+                length,
+                int(anchor_length),
+                device,
+                dtype,
+                self.rerope_interval,
+            )
+            return positions
+        return self.normalized(times, batch_size, length, device, dtype, time_scale)
+
+    def query_grid_positions(
+        self,
+        batch_size: int,
+        output_grid: tuple[int, int, int],
+        device,
+        dtype,
+        target_times: torch.Tensor | None,
+        target_poses: torch.Tensor | None,
+        source_times: torch.Tensor | None,
+        source_length: int,
+        time_scale: torch.Tensor | None,
+    ) -> torch.Tensor:
+        frames, height, width = output_grid
+        return _query_positions_for_grid(
+            batch_size,
+            frames,
+            height,
+            width,
+            device,
+            dtype,
+            target_times,
+            target_poses,
+            time_scale,
+            source_times=source_times,
+            source_length=source_length,
+            time_position_mode=self.mode,
+            rerope_interval=self.rerope_interval,
+        )
+
+    def query_token_times(
+        self,
+        target_times: torch.Tensor | None,
+        batch_size: int,
+        output_grid: tuple[int, int, int],
+        device,
+        dtype,
+        time_scale: torch.Tensor | None,
+    ) -> torch.Tensor:
+        frames, height, width = output_grid
+        values = self.normalized(target_times, batch_size, frames, device, dtype, time_scale)
+        return values[:, :, None, None].expand(-1, -1, height, width).reshape(batch_size, -1)
+
+    def source_token_geometry(
+        self,
+        source_times: torch.Tensor | None,
+        source_poses: torch.Tensor | None,
+        batch_size: int,
+        views: int,
+        groups: int,
+        token_h: int,
+        token_w: int,
+        device,
+        dtype,
+        time_scale: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        token_times = self.normalized(source_times, batch_size, views, device, dtype, time_scale)
+        if self.mode == "reroped" and source_times is not None:
+            _, rope_times = _reroped_time_positions(
+                source_times,
+                source_times,
+                batch_size,
+                views,
+                views,
+                device,
+                dtype,
+                self.rerope_interval,
+            )
+        else:
+            rope_times = token_times
+
+        cam = _camera_centers_for_positions(source_poses, batch_size, views, device, dtype)
+        y = torch.linspace(0, 1, token_h, device=device, dtype=dtype)
+        x = torch.linspace(0, 1, token_w, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        rope_times = rope_times[:, :, None, None, None, None].expand(-1, -1, groups, token_h, token_w, -1)
+        token_times = token_times[:, :, None, None, None].expand(-1, -1, groups, token_h, token_w)
+        cam = cam[:, :, None, None, None, :].expand(-1, -1, groups, token_h, token_w, -1)
+        yy = yy[None, None, None, :, :, None].expand(batch_size, views, groups, -1, -1, -1)
+        xx = xx[None, None, None, :, :, None].expand(batch_size, views, groups, -1, -1, -1)
+        positions = torch.cat([rope_times, cam, yy, xx], dim=-1)
+        return (
+            positions.reshape(batch_size, views * groups * token_h * token_w, 6),
+            token_times.reshape(batch_size, views * groups * token_h * token_w),
+        )
+
+    def interpolate_source_grid(
+        self,
+        x: torch.Tensor,
+        target_frames: int,
+        source_times: torch.Tensor | None,
+        target_times: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return _time_interpolate_5d(x, target_frames, source_times, target_times)
+
+
+class SourceTokenEncoder(torch.nn.Module):
+    def __init__(
+        self,
+        token_dim: int,
+        hidden_dim: int,
+        *,
+        source_pool_hw: tuple[int, int] | None,
+        max_source_tokens: int | None,
+        max_token_groups: int,
+        use_group_embedding: bool,
+    ):
+        super().__init__()
+        self.token_dim = int(token_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.source_pool_hw = None if source_pool_hw is None else tuple(int(v) for v in source_pool_hw)
+        self.max_source_tokens = None if max_source_tokens is None else int(max_source_tokens)
+        self.max_token_groups = int(max_token_groups)
+        self.source_proj = torch.nn.Linear(self.token_dim, self.hidden_dim)
+        self.source_condition = SourceViewConditionEncoder(self.hidden_dim)
+        self.group_embed = (
+            torch.nn.Embedding(self.max_token_groups, self.hidden_dim) if bool(use_group_embedding) else None
+        )
+
+    @property
+    def dtype(self):
+        return self.source_proj.weight.dtype
+
+    def _check_shape(self, tokens: torch.Tensor) -> tuple[int, int, int, int, int, int]:
+        if tokens.ndim != 6:
+            raise ValueError(f"Expected tokens with shape B x N x L x h x w x C, got {tuple(tokens.shape)}")
+        bsz, views, groups, token_h, token_w, channels = tokens.shape
+        if channels != self.token_dim:
+            raise ValueError(f"Adapter token_dim={self.token_dim}, but input token dim is {channels}.")
+        if self.group_embed is not None and groups > self.max_token_groups:
+            raise ValueError(
+                f"Input has {groups} token groups, but adapter max_token_groups={self.max_token_groups}."
+            )
+        return bsz, views, groups, token_h, token_w, channels
+
+    def _group_embedding(self, groups: int, device, dtype) -> torch.Tensor | None:
+        if self.group_embed is None:
+            return None
+        group_ids = torch.arange(groups, device=device, dtype=torch.long)
+        return self.group_embed(group_ids).to(dtype=dtype)
+
+    @staticmethod
+    def _source_group_ids(views: int, groups: int, height: int, width: int, device) -> torch.Tensor:
+        return (
+            torch.arange(groups, device=device, dtype=torch.long)[None, :, None, None]
+            .expand(views, -1, height, width)
+            .reshape(-1)
+        )
+
+    def _maybe_pool(self, tokens: torch.Tensor) -> torch.Tensor:
+        bsz, views, groups, token_h, token_w, channels = tokens.shape
+        if self.source_pool_hw is None or (token_h, token_w) == self.source_pool_hw:
+            return tokens
+        pooled_h, pooled_w = self.source_pool_hw
+        x = tokens.permute(0, 1, 2, 5, 3, 4).reshape(bsz * views * groups, channels, token_h, token_w)
+        x = F.interpolate(x.float(), size=(pooled_h, pooled_w), mode="bilinear", align_corners=False)
+        x = x.to(tokens.dtype)
+        return x.reshape(bsz, views, groups, channels, pooled_h, pooled_w).permute(0, 1, 2, 4, 5, 3)
+
+    def _source_condition_grid(
+        self,
+        *,
+        batch_size: int,
+        views: int,
+        height: int,
+        width: int,
+        device,
+        dtype,
+        source_times: torch.Tensor | None,
+        source_poses: torch.Tensor | None,
+        source_intrs: torch.Tensor | None,
+        time_scale: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return self.source_condition(
+            batch_size=batch_size,
+            views=views,
+            height=height,
+            width=width,
+            device=device,
+            dtype=dtype,
+            source_times=source_times,
+            source_poses=source_poses,
+            source_intrs=source_intrs,
+            time_scale=time_scale,
+        )
+
+    def local_view_grid(
+        self,
+        tokens: torch.Tensor,
+        *,
+        source_times: torch.Tensor | None,
+        source_poses: torch.Tensor | None,
+        source_intrs: torch.Tensor | None,
+        time_scale: torch.Tensor | None,
+    ) -> torch.Tensor:
+        bsz, views, groups, token_h, token_w, channels = self._check_shape(tokens)
+        projected = self.source_proj(tokens.reshape(bsz * views * groups * token_h * token_w, channels))
+        projected = projected.reshape(bsz, views, groups, token_h, token_w, self.hidden_dim)
+        group_emb = self._group_embedding(groups, tokens.device, projected.dtype)
+        if group_emb is not None:
+            projected = projected + group_emb[None, None, :, None, None, :]
+        x = projected.mean(dim=2).permute(0, 4, 1, 2, 3).contiguous()
+        return x + self._source_condition_grid(
+            batch_size=bsz,
+            views=views,
+            height=token_h,
+            width=token_w,
+            device=tokens.device,
+            dtype=tokens.dtype,
+            source_times=source_times,
+            source_poses=source_poses,
+            source_intrs=source_intrs,
+            time_scale=time_scale,
+        )
+
+    def attention_pack(
+        self,
+        tokens: torch.Tensor,
+        *,
+        time_position: MinTTimePosition,
+        source_times: torch.Tensor | None,
+        source_poses: torch.Tensor | None,
+        source_intrs: torch.Tensor | None,
+        time_scale: torch.Tensor | None,
+    ) -> SourceTokenPack:
+        bsz, views, groups, _, _, channels = self._check_shape(tokens)
+        tokens = self._maybe_pool(tokens)
+        _, _, groups, token_h, token_w, _ = tokens.shape
+
+        source = self.source_proj(tokens.reshape(bsz * views * groups * token_h * token_w, channels))
+        source = source.reshape(bsz, views * groups * token_h * token_w, self.hidden_dim)
+        group_emb = self._group_embedding(groups, tokens.device, source.dtype)
+        group_ids = self._source_group_ids(views, groups, token_h, token_w, tokens.device)
+        if group_emb is not None:
+            source = source + group_emb[group_ids][None]
+
+        source_cond = self._source_condition_grid(
+            batch_size=bsz,
+            views=views,
+            height=1,
+            width=1,
+            device=tokens.device,
+            dtype=tokens.dtype,
+            source_times=source_times,
+            source_poses=source_poses,
+            source_intrs=source_intrs,
+            time_scale=time_scale,
+        ).squeeze(-1).squeeze(-1).transpose(1, 2)
+        source_cond = source_cond[:, :, None, None, None, :].expand(-1, -1, groups, token_h, token_w, -1)
+        source = source + source_cond.reshape(bsz, views * groups * token_h * token_w, -1)
+
+        positions, token_times = time_position.source_token_geometry(
+            source_times,
+            source_poses,
+            bsz,
+            views,
+            groups,
+            token_h,
+            token_w,
+            tokens.device,
+            tokens.dtype,
+            time_scale,
+        )
+        if self.max_source_tokens is not None and source.shape[1] > self.max_source_tokens:
+            idx = torch.linspace(0, source.shape[1] - 1, self.max_source_tokens, device=tokens.device).long()
+            source = source[:, idx]
+            positions = positions[:, idx]
+            token_times = token_times[:, idx]
+        return SourceTokenPack(tokens=source, positions=positions, times=token_times)
+
+
+class LocalGridShortcut(torch.nn.Module):
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.ones(()))
+        self.proj = torch.nn.Sequential(
+            torch.nn.Conv3d(hidden_dim, hidden_dim, kernel_size=1),
+            torch.nn.SiLU(),
+            CausalResBlock(hidden_dim),
+        )
+
+    def forward(
+        self,
+        source_grid: torch.Tensor,
+        output_grid: tuple[int, int, int],
+        *,
+        time_position: MinTTimePosition,
+        source_times: torch.Tensor | None,
+        target_times: torch.Tensor | None,
+    ) -> torch.Tensor:
+        frames, height, width = output_grid
+        views = source_grid.shape[2]
+        if source_grid.shape[-2:] != (height, width):
+            source_grid = _resize_5d(source_grid, (views, height, width), mode="trilinear")
+        source_grid = time_position.interpolate_source_grid(source_grid, frames, source_times, target_times)
+        x = self.proj(source_grid)
+        return self.scale.to(dtype=x.dtype) * x.flatten(2).transpose(1, 2)
 
 
 class CrossAttentionBlock(torch.nn.Module):
@@ -659,37 +1146,51 @@ class CrossAttentionRoPEAdapter(torch.nn.Module):
         control_layers: Iterable[int],
         hidden_dim: int = 512,
         num_heads: int = 8,
-        num_blocks: int = 2,
+        num_blocks: int = 4,
         source_pool_hw: tuple[int, int] | None = (16, 16),
         max_source_tokens: int | None = 32768,
         query_chunk_size: int | None = 4096,
         text_context_dim: int | None = None,
         use_rope: bool = True,
         use_dit_state: bool = True,
+        max_token_groups: int = 8,
+        use_group_embedding: bool = True,
+        use_local_grid: bool = True,
+        use_time_film: bool = True,
+        time_film_dim: int = 128,
+        time_position_mode: str = "reroped",
+        rerope_interval: float = 4.0,
+        post_num_res_blocks: int = 2,
         output_mode: str = "condition_embedding",
     ):
         super().__init__()
         if output_mode not in {"condition_embedding", "hints"}:
             raise ValueError(f"Unsupported output_mode: {output_mode}")
         self.output_mode = output_mode
-        self.token_dim = int(token_dim)
         self.output_dim = int(output_dim)
+        self.hidden_dim = int(hidden_dim)
         self.control_layers = tuple(int(layer) for layer in control_layers)
-        self.source_pool_hw = source_pool_hw
-        self.max_source_tokens = max_source_tokens
-        self.query_chunk_size = query_chunk_size
+        self.query_chunk_size = None if query_chunk_size is None else int(query_chunk_size)
+        self.time_position = MinTTimePosition(mode=time_position_mode, rerope_interval=rerope_interval)
         self.condition = ConditionGridEncoder(hidden_dim, text_context_dim=text_context_dim)
-        self.source_condition = SourceViewConditionEncoder(hidden_dim)
-        self.source_proj = torch.nn.Linear(self.token_dim, hidden_dim)
+        self.source_encoder = SourceTokenEncoder(
+            token_dim,
+            hidden_dim,
+            source_pool_hw=source_pool_hw,
+            max_source_tokens=max_source_tokens,
+            max_token_groups=max_token_groups,
+            use_group_embedding=use_group_embedding,
+        )
+        self.local_grid = LocalGridShortcut(hidden_dim) if bool(use_local_grid) else None
+        self.query_time_film = TemporalFiLM(hidden_dim, time_film_dim) if bool(use_time_film) else None
+        self.source_time_film = TemporalFiLM(hidden_dim, time_film_dim) if bool(use_time_film) else None
         self.dit_state_proj = torch.nn.Linear(self.output_dim, hidden_dim) if use_dit_state else None
         self.blocks = torch.nn.ModuleList(
             [CrossAttentionBlock(hidden_dim, num_heads=num_heads, use_rope=use_rope) for _ in range(num_blocks)]
         )
-        self.post = torch.nn.Sequential(
-            torch.nn.Conv3d(hidden_dim, hidden_dim, kernel_size=1),
-            torch.nn.SiLU(),
-            CausalResBlock(hidden_dim),
-        )
+        post_blocks = [torch.nn.Conv3d(hidden_dim, hidden_dim, kernel_size=1), torch.nn.SiLU()]
+        post_blocks.extend(CausalResBlock(hidden_dim) for _ in range(max(0, int(post_num_res_blocks))))
+        self.post = torch.nn.Sequential(*post_blocks)
         self.condition_head = torch.nn.Conv3d(hidden_dim, self.output_dim, kernel_size=1)
         self.heads = (
             torch.nn.ModuleDict(
@@ -698,57 +1199,6 @@ class CrossAttentionRoPEAdapter(torch.nn.Module):
             if self.output_mode == "hints"
             else torch.nn.ModuleDict()
         )
-
-    def _pool_source_tokens(
-        self,
-        tokens: torch.Tensor,
-        source_times: torch.Tensor | None = None,
-        source_poses: torch.Tensor | None = None,
-        source_intrs: torch.Tensor | None = None,
-        time_scale: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        bsz, views, groups, token_h, token_w, channels = tokens.shape
-        if channels != self.token_dim:
-            raise ValueError(f"Adapter token_dim={self.token_dim}, but input token dim is {channels}.")
-        if self.source_pool_hw is not None and (token_h, token_w) != tuple(self.source_pool_hw):
-            pooled_h, pooled_w = self.source_pool_hw
-            x = tokens.permute(0, 1, 2, 5, 3, 4).reshape(bsz * views * groups, channels, token_h, token_w)
-            x = F.interpolate(x.float(), size=(pooled_h, pooled_w), mode="bilinear", align_corners=False).to(tokens.dtype)
-            tokens = x.reshape(bsz, views, groups, channels, pooled_h, pooled_w).permute(0, 1, 2, 4, 5, 3)
-            token_h, token_w = pooled_h, pooled_w
-        source = tokens.reshape(bsz, views * groups * token_h * token_w, channels)
-        source_cond = self.source_condition(
-            batch_size=bsz,
-            views=views,
-            height=1,
-            width=1,
-            device=tokens.device,
-            dtype=tokens.dtype,
-            source_times=source_times,
-            source_poses=source_poses,
-            source_intrs=source_intrs,
-            time_scale=time_scale,
-        ).squeeze(-1).squeeze(-1).transpose(1, 2)
-        source_cond = source_cond[:, :, None, None, None, :].expand(-1, -1, groups, token_h, token_w, -1)
-        source_cond = source_cond.reshape(bsz, views * groups * token_h * token_w, -1)
-
-        t = _time_positions(source_times, bsz, views, tokens.device, tokens.dtype, time_scale)
-        cam = _camera_centers_for_positions(source_poses, bsz, views, tokens.device, tokens.dtype)
-        y = torch.linspace(0, 1, token_h, device=tokens.device, dtype=tokens.dtype)
-        x = torch.linspace(0, 1, token_w, device=tokens.device, dtype=tokens.dtype)
-        yy, xx = torch.meshgrid(y, x, indexing="ij")
-        t = t[:, :, None, None, None, None].expand(-1, -1, groups, token_h, token_w, -1)
-        cam = cam[:, :, None, None, None, :].expand(-1, -1, groups, token_h, token_w, -1)
-        yy = yy[None, None, None, :, :, None].expand(bsz, views, groups, -1, -1, -1)
-        xx = xx[None, None, None, :, :, None].expand(bsz, views, groups, -1, -1, -1)
-        pos = torch.cat([t, cam, yy, xx], dim=-1).reshape(bsz, views * groups * token_h * token_w, 6)
-
-        if self.max_source_tokens is not None and source.shape[1] > self.max_source_tokens:
-            idx = torch.linspace(0, source.shape[1] - 1, self.max_source_tokens, device=tokens.device).long()
-            source = source[:, idx]
-            pos = pos[:, idx]
-            source_cond = source_cond[:, idx]
-        return source, pos, source_cond
 
     def forward(
         self,
@@ -766,8 +1216,8 @@ class CrossAttentionRoPEAdapter(torch.nn.Module):
         diffusion_timestep: torch.Tensor | None = None,
         text_context: torch.Tensor | None = None,
     ) -> OrderedDict[str, torch.Tensor]:
-        tokens = tokens.to(dtype=self.source_proj.weight.dtype)
-        bsz = tokens.shape[0]
+        tokens = tokens.to(dtype=self.source_encoder.dtype)
+        bsz, views = tokens.shape[:2]
         device, dtype = tokens.device, tokens.dtype
         frames, height, width = output_grid
         time_scale = _shared_time_scale(bsz, device, dtype, target_times, source_times)
@@ -787,28 +1237,56 @@ class CrossAttentionRoPEAdapter(torch.nn.Module):
         query = cond.flatten(2).transpose(1, 2)
         if self.dit_state_proj is not None and dit_tokens is not None:
             query = query + self.dit_state_proj(dit_tokens.to(dtype=query.dtype))
+        if self.local_grid is not None:
+            source_grid = self.source_encoder.local_view_grid(
+                tokens.to(dtype=query.dtype),
+                source_times=source_times,
+                source_poses=source_poses,
+                source_intrs=source_intrs,
+                time_scale=time_scale,
+            )
+            query = query + self.local_grid(
+                source_grid,
+                output_grid,
+                time_position=self.time_position,
+                source_times=source_times,
+                target_times=target_times,
+            )
+        query_time = self.time_position.query_token_times(
+            target_times,
+            bsz,
+            output_grid,
+            device,
+            query.dtype,
+            time_scale,
+        )
+        if self.query_time_film is not None:
+            query = self.query_time_film(query, query_time)
 
-        source, source_pos, source_cond = self._pool_source_tokens(
+        source_pack = self.source_encoder.attention_pack(
             tokens.to(dtype=query.dtype),
+            time_position=self.time_position,
             source_times=source_times,
             source_poses=source_poses,
             source_intrs=source_intrs,
             time_scale=time_scale,
         )
-        source = self.source_proj(source) + source_cond
-        query_pos = _query_positions_for_grid(
+        source = source_pack.tokens
+        if self.source_time_film is not None:
+            source = self.source_time_film(source, source_pack.times)
+        query_pos = self.time_position.query_grid_positions(
             bsz,
-            frames,
-            height,
-            width,
+            output_grid,
             device,
             query.dtype,
             target_times,
             target_poses,
+            source_times,
+            views,
             time_scale,
         )
         for block in self.blocks:
-            query = block(query, source, query_pos, source_pos, query_chunk_size=self.query_chunk_size)
+            query = block(query, source, query_pos, source_pack.positions, query_chunk_size=self.query_chunk_size)
 
         x = query.transpose(1, 2).reshape(bsz, -1, frames, height, width)
         x = self.post(x)

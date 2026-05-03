@@ -74,12 +74,20 @@ adapter:
   # token_dim: null
   # hidden_dim: 512
   # num_heads: 8
-  # num_blocks: 2
+  # num_blocks: 4
   # source_pool_hw: [16, 16]
   # max_source_tokens: 32768
   # query_chunk_size: 4096
   # use_rope: true
   # use_dit_state: false
+  # max_token_groups: null
+  # use_group_embedding: true
+  # use_local_grid: true
+  # use_time_film: true
+  # time_film_dim: 128
+  # time_position_mode: reroped
+  # rerope_interval: 4.0
+  # post_num_res_blocks: 2
 
 target_latent_shapes: condition_embedding_auto
 
