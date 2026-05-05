@@ -541,7 +541,7 @@ def compute_student_condition(pipe, adapter, token_pack, inputs_shared, output_g
 
 
 @torch.no_grad()
-def compute_student_hints(pipe, student_condition, inputs_shared, context, latents, timestep, mode, cfg):
+def compute_student_hints(pipe, student_condition, context, latents, timestep, cfg):
     x, output_grid, context_emb, _, t_mod, freqs = prepare_control_state(
         pipe,
         latents,
@@ -549,19 +549,8 @@ def compute_student_hints(pipe, student_condition, inputs_shared, context, laten
         context,
         fuse_vae_embedding_in_latents=bool(cfg.get("fuse_vae_embedding_in_latents", False)),
     )
-    condition = student_condition
-    if mode == "combined":
-        teacher_condition = pipe.control_branch.encode_condition(
-            inputs_shared["target_rgb"],
-            inputs_shared["target_depth"],
-            inputs_shared["target_camera_embed"],
-            inputs_shared["target_mask"],
-            sequence_length=x.shape[1],
-        )
-        condition = 0.5 * (teacher_condition + student_condition)
-
     hints = pipe.control_branch.hints_from_condition(
-        condition,
+        student_condition,
         x,
         context_emb,
         t_mod,
@@ -573,7 +562,7 @@ def compute_student_hints(pipe, student_condition, inputs_shared, context, laten
 
 
 @torch.no_grad()
-def generate_with_student(pipe, adapter, render_conditions, prompt, cfg, args, mode="student"):
+def generate_with_student(pipe, adapter, render_conditions, prompt, cfg, args):
     inputs_shared, inputs_posi, inputs_nega = prepare_inputs(pipe, prompt, render_conditions, args)
     pipe.load_models_to_device(["reconstructor"])
     token_pack = extract_vggt_tokens(
@@ -597,10 +586,10 @@ def generate_with_student(pipe, adapter, render_conditions, prompt, cfg, args, m
 
     pipe.load_models_to_device(pipe.in_iteration_models)
     models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
-    for progress_id, timestep_value in enumerate(tqdm(pipe.scheduler.timesteps, desc=f"{mode}")):
+    for progress_id, timestep_value in enumerate(tqdm(pipe.scheduler.timesteps, desc="student")):
         timestep = timestep_value.unsqueeze(0).to(dtype=pipe.torch_dtype, device=pipe.device)
         hints_posi = compute_student_hints(
-            pipe, student_condition, inputs_shared, inputs_posi["context"], inputs_shared["latents"], timestep, mode, cfg
+            pipe, student_condition, inputs_posi["context"], inputs_shared["latents"], timestep, cfg
         )
         model_inputs_posi = {
             **inputs_shared,
@@ -611,7 +600,7 @@ def generate_with_student(pipe, adapter, render_conditions, prompt, cfg, args, m
         noise_pred_posi = model_fn_wan_video(**models, **model_inputs_posi, timestep=timestep)
         if args.cfg_scale != 1.0:
             hints_nega = compute_student_hints(
-                pipe, student_condition, inputs_shared, inputs_nega["context"], inputs_shared["latents"], timestep, mode, cfg
+                pipe, student_condition, inputs_nega["context"], inputs_shared["latents"], timestep, cfg
             )
             model_inputs_nega = {
                 **inputs_shared,
@@ -644,7 +633,7 @@ def main():
     parser.add_argument("checkpoint", type=str)
     parser.add_argument("--output_dir", default="./outputs/distill_eval")
     parser.add_argument("--dataset_index", type=int, default=0)
-    parser.add_argument("--modes", default="teacher,student,combined")
+    parser.add_argument("--modes", default="teacher,student")
     parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--num_frames", type=int, default=None)
@@ -664,6 +653,13 @@ def main():
     parser.add_argument("--no_save_conditions", action="store_true")
     parser.add_argument("--no_save_comparison_grid", action="store_true")
     args = parser.parse_args()
+    requested_modes = [item.strip() for item in args.modes.split(",") if item.strip()]
+    if not requested_modes:
+        raise ValueError("--modes must contain at least one mode")
+    supported_modes = {"teacher", "student"}
+    unsupported_modes = sorted(set(requested_modes) - supported_modes)
+    if unsupported_modes:
+        raise ValueError(f"Unsupported mode(s): {', '.join(unsupported_modes)}. Supported modes: teacher, student")
 
     cfg = OmegaConf.load(args.config)
     args.height = args.height or int(cfg.height)
@@ -700,7 +696,7 @@ def main():
         enable_vram_management=args.enable_vram_management,
     )
     pipe.eval()
-    adapter = load_adapter(pipe, cfg, args.checkpoint, pipe.device)
+    adapter = load_adapter(pipe, cfg, args.checkpoint, pipe.device) if "student" in requested_modes else None
 
     dataset = eval(cfg.train_dataset)
     source_views = dataset[int(args.dataset_index)]
@@ -718,7 +714,7 @@ def main():
                 args.width,
             )
         eval_frames.update(save_eval_condition_videos(args.output_dir, render_conditions, camera_embed=camera_embed_for_vis))
-    for mode in [item.strip() for item in args.modes.split(",") if item.strip()]:
+    for mode in requested_modes:
         if mode == "teacher":
             video = pipe(
                 prompt=prompt,
@@ -737,8 +733,8 @@ def main():
                 tile_size=tuple(args.tile_size),
                 tile_stride=tuple(args.tile_stride),
             )
-        elif mode in {"student", "combined"}:
-            video = generate_with_student(pipe, adapter, render_conditions, prompt, cfg, args, mode=mode)
+        elif mode == "student":
+            video = generate_with_student(pipe, adapter, render_conditions, prompt, cfg, args)
         else:
             raise ValueError(f"Unsupported mode: {mode}")
         eval_frames[mode] = video

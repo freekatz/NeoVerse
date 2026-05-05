@@ -697,7 +697,7 @@ def save_checkpoint(accelerator, model, optimizer, cfg, output_path, step, epoch
         return
     os.makedirs(output_path, exist_ok=True)
     unwrapped = accelerator.unwrap_model(model)
-    ckpt_name = name or f"adapter_step_{step:08d}.pt"
+    ckpt_name = name or "adapter_last.pt"
     payload = {
         "adapter": unwrapped.adapter.state_dict(),
         "config": OmegaConf.to_container(cfg, resolve=True),
@@ -707,7 +707,10 @@ def save_checkpoint(accelerator, model, optimizer, cfg, output_path, step, epoch
     }
     if include_optimizer:
         payload["optimizer"] = optimizer.state_dict()
-    torch.save(payload, os.path.join(output_path, ckpt_name))
+    ckpt_path = os.path.join(output_path, ckpt_name)
+    tmp_path = f"{ckpt_path}.tmp"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, ckpt_path)
     OmegaConf.save(cfg, os.path.join(output_path, "config.yaml"))
 
 
@@ -897,6 +900,7 @@ def main():
                         cfg.output_path,
                         step,
                         epoch=epoch,
+                        name="adapter_last.pt",
                         include_optimizer=bool(cfg.get("save_optimizer_intermediate", False)),
                     )
 

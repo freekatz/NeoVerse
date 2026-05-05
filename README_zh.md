@@ -35,7 +35,7 @@ diffsynth/models/student_adapters.py
 | `scripts/train_distill_control_latent.sh` | 推荐训练入口。封装环境变量、accelerate、多 GPU、日志、自动 resume、frozen cache。 |
 | `hooks/extract_vggt_tokens.py` | 从 reconstructor 中提取中间层 tokens，默认取 `[4, 11, 17, 23]` 层，并可追加 camera token。 |
 | `diffsynth/models/student_adapters.py` | Student Adapter 实现。包含默认 `conv` adapter 和 `cross_attention_rope` ablation。 |
-| `eval_replace_teacher_with_student.py` | 用训练好的 student 替换 teacher condition，跑 teacher / student / combined 视频生成对比。 |
+| `eval_replace_teacher_with_student.py` | 用训练好的 student 替换 teacher condition，跑 teacher / student 视频生成对比。 |
 | `experiments/compare_reconstruction_context.py` | 不跑 diffusion，只对比“81 帧全量输入重建”和“稀疏 context 输入重建”的 81 帧渲染视频。 |
 | `README_distill_adapter.md` | 更偏实现细节的旧说明。本文档是更完整的上手手册。 |
 
@@ -57,7 +57,7 @@ RUN_NAME=distill_conv_ctx10_20 bash scripts/train_distill_control_latent.sh
   outputs/NeoVerseControlLatentDistill/YYYY-MM-DD/HH-MM-SS/adapter_last.pt \
   --output_dir outputs/distill_eval/run0 \
   --dataset_index 0 \
-  --modes teacher,student,combined
+  --modes teacher,student
 ```
 
 诊断用：看 81 帧全量重建 vs 20 帧 context 重建。
@@ -350,7 +350,7 @@ auto_resume: true
 resume_optimizer: true
 ```
 
-如果 `OUTPUT_PATH` 指向已有 run，且里面有 `adapter_last.pt` 或 `adapter_step_*.pt`，脚本会自动恢复：
+如果 `OUTPUT_PATH` 指向已有 run，且里面有 `adapter_last.pt`，脚本会自动恢复。旧 run 里只有 `adapter_step_*.pt` 时也兼容恢复：
 
 ```bash
 OUTPUT_PATH=outputs/NeoVerseControlLatentDistill/2026-04-30/12-00-00 \
@@ -370,7 +370,6 @@ bash scripts/train_distill_control_latent.sh
 | 文件 | 说明 |
 | --- | --- |
 | `adapter_last.pt` | 最终或当前最新 adapter checkpoint，通常包含 optimizer。 |
-| `adapter_step_XXXXXXXX.pt` | 中间 checkpoint。是否包含 optimizer 由 `SAVE_OPTIMIZER_INTERMEDIATE` 控制。 |
 | `config.yaml` | 解析后的完整配置。 |
 | `visuals/*.png` | teacher / student / abs error heatmap。 |
 | `events.out.tfevents.*` | TensorBoard scalar。 |
@@ -424,7 +423,7 @@ cache_frozen_outputs=true
 num_workers=0
 ```
 
-## 10. 替换评估：teacher / student / combined
+## 10. 替换评估：teacher / student
 
 训练完后，用 `eval_replace_teacher_with_student.py` 看 student 是否能替代 teacher condition。
 
@@ -434,7 +433,7 @@ num_workers=0
   outputs/NeoVerseControlLatentDistill/YYYY-MM-DD/HH-MM-SS/adapter_last.pt \
   --output_dir outputs/distill_eval/run0 \
   --dataset_index 0 \
-  --modes teacher,student,combined
+  --modes teacher,student
 ```
 
 输出：
@@ -443,7 +442,6 @@ num_workers=0
 outputs/distill_eval/run0/
 ├── teacher.mp4
 ├── student.mp4
-├── combined.mp4
 ├── input_source_views.mp4
 ├── input_context_views.mp4
 ├── input_target_views_gt.mp4
@@ -460,7 +458,6 @@ outputs/distill_eval/run0/
 | --- | --- |
 | `teacher` | 原 NeoVerse degraded render condition path。 |
 | `student` | 用 student 预测的 early condition embedding 替换 teacher condition。 |
-| `combined` | `0.5 * teacher + 0.5 * student`，主要用于调试过渡。 |
 
 默认评估逻辑：
 
@@ -570,7 +567,7 @@ metadata.json
 | `BATCH_SIZE` | `1` | 每进程 batch size。当前训练主要按 batch 1 设计。 |
 | `NUM_WORKERS` | `1` | DataLoader workers。 |
 | `PRINT_FREQ` | `10` | 打印间隔。 |
-| `SAVE_FREQ` | `500` | 中间 checkpoint 间隔。 |
+| `SAVE_FREQ` | `500` | 覆盖保存 `adapter_last.pt` 的间隔。 |
 | `VIS_FREQ` | `500` | heatmap 可视化间隔。 |
 | `FAST_FROZEN_CACHE` | `1` | 默认打开 frozen cache 加速；设为 `0` 可关闭。 |
 | `FROZEN_CACHE_DIR` | `outputs/.../frozen_cache` | frozen cache 目录。 |
@@ -690,9 +687,9 @@ Overfit 单视频时，`condition/l1` 应该能明显下降。如果 overfit 都
 
 默认已经开启 `FAST_FROZEN_CACHE=1`。它会把 frozen teacher 的重计算变成 cache 读写和轻量 adapter 训练。正式长跑建议 cache preload 到 CPU，不建议直接全塞 GPU。
 
-### Q5：中间 checkpoint 没有 optimizer，能 resume 吗？
+### Q5：最新 checkpoint 没有 optimizer，能 resume 吗？
 
-可以。脚本会加载 adapter；如果 checkpoint 里有 optimizer 且 `resume_optimizer=true`，就恢复 optimizer。`adapter_last.pt` 通常包含 optimizer。中间 `adapter_step_*.pt` 是否包含 optimizer 由 `SAVE_OPTIMIZER_INTERMEDIATE` 控制。
+可以。脚本会加载 adapter；如果 checkpoint 里有 optimizer 且 `resume_optimizer=true`，就恢复 optimizer。周期保存的 `adapter_last.pt` 是否包含 optimizer 由 `SAVE_OPTIMIZER_INTERMEDIATE` 控制，最终保存会包含 optimizer。
 
 ### Q6：评估为什么比训练更吃显存？
 
@@ -747,7 +744,7 @@ experiments/compare_reconstruction_context.py 输出视频和 metadata.json
   outputs/NeoVerseControlLatentDistill/YYYY-MM-DD/HH-MM-SS/adapter_last.pt \
   --output_dir outputs/distill_eval/exp_name_dataset0 \
   --dataset_index 0 \
-  --modes teacher,student,combined \
+  --modes teacher,student \
   --enable_vram_management
 ```
 

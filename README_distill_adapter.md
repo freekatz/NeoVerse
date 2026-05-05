@@ -39,7 +39,7 @@ accelerate launch train_distill_control_latent.py configs/distill_control_latent
 
 训练输出写入 `output_path`：
 
-- `adapter_step_*.pt` / `adapter_last.pt`：adapter-only checkpoint，包含 optimizer state、config 和最近一次 shape 记录。
+- `adapter_last.pt`：当前最新 checkpoint，包含 adapter、config、最近一次 shape 记录；最终保存包含 optimizer state。
 - `config.yaml`：解析后的运行配置。
 - `visuals/*.png`：teacher/student condition embedding 和 absolute error heatmap。
 - TensorBoard scalars：每层 L1 / L2 / cosine / latent statistics。
@@ -54,14 +54,13 @@ python eval_replace_teacher_with_student.py \
   outputs/NeoVerseControlLatentDistill/YYYY-MM-DD/HH-MM-SS/adapter_last.pt \
   --output_dir outputs/distill_eval \
   --dataset_index 0 \
-  --modes teacher,student,combined
+  --modes teacher,student
 ```
 
 评估模式：
 
 - `teacher`：原始 NeoVerse degraded-render condition path。
 - `student`：绕过 degraded RGB / depth / mask 的 early condition embedding，改用 student 预测的 `c`，然后复用 frozen control blocks 得到最终 hints。
-- `combined`：teacher `c` 和 student `c` 取平均，再经过 frozen control blocks，用于调试和过渡实验。
 
 评估脚本默认跟官方 `inference.py` 对齐：如果存在 LightX2V 4-step LoRA，则使用 `num_inference_steps=4, cfg_scale=1.0`；如果传 `--disable_lora`，则使用 full inference 的 `num_inference_steps=50, cfg_scale=5.0`。也可以手动传 `--num_inference_steps` 和 `--cfg_scale` 覆盖。
 
