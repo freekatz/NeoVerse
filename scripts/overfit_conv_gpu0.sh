@@ -24,7 +24,7 @@ bash scripts/train_distill_control_latent.sh \
   cache_frozen_outputs="${CACHE_FROZEN_OUTPUTS:-true}" \
   print_freq="${PRINT_FREQ:-10}" \
   save_freq="${SAVE_FREQ:-1000}" \
-  vis_freq="${VIS_FREQ:-1000}" \
+  vis_freq="${VIS_FREQ:-0}" \
   min_num_context_views="${NUM_CONTEXT_VIEWS}" \
   max_num_context_views="${NUM_CONTEXT_VIEWS}" \
   pipeline_kwargs.novel_view_sampling_trans="${NOVEL_VIEW_SAMPLING_TRANS:-[0.0,0.0]}" \

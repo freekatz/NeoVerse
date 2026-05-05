@@ -1,0 +1,11 @@
+
+eval:
+for i in 0 17 33 81 159 240 319; do
+    /root/vepfs/envs/neoverse/bin/python eval_replace_teacher_with_student.py \
+    outputs/NeoVerseControlLatentDistill/2026-05-04/17-05-14/config.yaml \
+    outputs/NeoVerseControlLatentDistill/2026-05-04/17-05-14/adapter_last.pt \
+    --output_dir outputs/NeoVerseControlLatentDistill/2026-05-04/17-05-14/eval_idx${i} \
+    --dataset_index ${i} \
+    --modes teacher,student \
+    --enable_vram_management
+done

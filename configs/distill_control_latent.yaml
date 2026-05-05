@@ -135,4 +135,4 @@ resume_optimizer: true
 save_optimizer_intermediate: false
 print_freq: 10
 save_freq: 500
-vis_freq: 500
+vis_freq: 0
