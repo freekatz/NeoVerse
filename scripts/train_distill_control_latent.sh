@@ -6,6 +6,7 @@ set -euo pipefail
 #   RUN_NAME=neoverse_distill_v1 bash scripts/train_distill_control_latent.sh
 #   GPU_LIST=0,1 RUN_NAME=neoverse_distill_v1 bash scripts/train_distill_control_latent.sh
 #   LAUNCH_MODE=background RUN_NAME=neoverse_distill_v1 bash scripts/train_distill_control_latent.sh
+#   ADAPTER_TYPE=conv RUN_NAME=neoverse_distill_conv bash scripts/train_distill_control_latent.sh
 #   On Volcengine/MLP with MLP_* env vars already set:
 #     RUN_NAME=neoverse_distill_v1 bash scripts/train_distill_control_latent.sh
 
@@ -65,6 +66,10 @@ PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+
+# Default distillation student is the cross-attention RoPE adapter. Override with
+# ADAPTER_TYPE=conv to use the older convolutional adapter.
+ADAPTER_TYPE="${ADAPTER_TYPE:-cross_attention_rope}"
 
 LAUNCHER="${LAUNCHER:-accelerate}"
 USE_DISTRIBUTED="${USE_DISTRIBUTED:-auto}"
@@ -224,6 +229,7 @@ append_override_if_set "MODEL_PATH" "model_path"
 append_override_if_set "RECONSTRUCTOR_PATH" "reconstructor_path"
 append_override_if_set "SEED" "seed"
 append_override_if_set "DATASET_SEED" "dataset_seed"
+append_override_if_set "DATA_ROOT" "data_root"
 append_override_if_set "USE_CAMERA_ANNOTATIONS" "use_camera_annotations"
 append_override_if_set "BATCH_SIZE" "batch_size"
 append_override_if_set "NUM_WORKERS" "num_workers"

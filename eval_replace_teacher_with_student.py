@@ -348,6 +348,55 @@ def save_eval_gt_comparison_grid(output_dir, frames_by_name=None, fps=15, filena
     return output_path
 
 
+def save_eval_neoverse_prediction_grid(
+    output_dir,
+    frames_by_name=None,
+    fps=15,
+    filename="comparison_grid_gt_context_render_neoversepred.mp4",
+):
+    labels = {
+        "gt_81_sorted": "GT",
+        "input_context_views": "Context",
+        "rendered_degraded_rgb": "Render",
+        "teacher": "NeoVerse pred",
+    }
+    frames_by_name = dict(frames_by_name or {})
+    disk_names = {
+        "gt_81_sorted": ["gt_81_sorted.mp4"],
+        "input_context_views": ["input_context_views_timeline.mp4", "input_context_views.mp4"],
+        "rendered_degraded_rgb": ["rendered_degraded_rgb.mp4"],
+        "teacher": ["teacher.mp4", "neoversepred.mp4", "neoverse_pred.mp4"],
+    }
+    missing = {}
+    for name, video_names in disk_names.items():
+        if name in frames_by_name and frames_by_name[name]:
+            continue
+        for video_name in video_names:
+            path = os.path.join(output_dir, video_name)
+            if os.path.exists(path):
+                frames_by_name[name] = _read_video(path)
+                break
+        if name not in frames_by_name or not frames_by_name[name]:
+            missing[name] = video_names
+    if missing:
+        missing_text = ", ".join(f"{name} ({'/'.join(paths)})" for name, paths in missing.items())
+        print(f"Skip GT/context/render/NeoVerse grid; missing videos: {missing_text}")
+        return None
+
+    length = max(
+        len(frames_by_name["gt_81_sorted"]),
+        len(frames_by_name["rendered_degraded_rgb"]),
+        len(frames_by_name["teacher"]),
+    )
+    top_right_labels = {
+        "teacher": _format_psnr(_video_psnr(frames_by_name["gt_81_sorted"], frames_by_name["teacher"])),
+    }
+    grid_frames = _make_grid_video(frames_by_name, labels, length=length, top_right_labels=top_right_labels)
+    output_path = os.path.join(output_dir, filename)
+    save_video(grid_frames, output_path, fps=fps)
+    return output_path
+
+
 def sort_target_trajectory(target_poses, target_intrs, target_timestamps, is_target=None):
     sorted_poses = target_poses.clone()
     sorted_intrs = target_intrs.clone()
@@ -746,6 +795,9 @@ def main():
         gt_grid_path = save_eval_gt_comparison_grid(args.output_dir, eval_frames, fps=15)
         if gt_grid_path is not None:
             print(f"Saved GT comparison grid: {gt_grid_path}")
+        neoverse_grid_path = save_eval_neoverse_prediction_grid(args.output_dir, eval_frames, fps=15)
+        if neoverse_grid_path is not None:
+            print(f"Saved GT/context/render/NeoVerse grid: {neoverse_grid_path}")
 
 
 if __name__ == "__main__":
