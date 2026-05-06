@@ -188,7 +188,16 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                     activation="rotation+none", # use 'none' to disable confidence prediction
                 )
 
-    def forward(self, views: Dict[str, torch.Tensor], cond_flags: List[int]=[0, 0, 0], is_inference=True, use_motion=True):
+    def forward(
+        self,
+        views: Dict[str, torch.Tensor],
+        cond_flags: List[int]=[0, 0, 0],
+        is_inference=True,
+        use_motion=True,
+        return_token_list: bool = False,
+        skip_unused_heads: bool = False,
+        force_motion_tokens: bool = False,
+    ):
         """
         Execute forward pass through the WorldMirror model.
 
@@ -210,21 +219,26 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
         if use_cond:
             priors = self.extract_priors(views)
             token_list, patch_start_idx, fwd_token_list, bwd_token_list = self.visual_geometry_transformer(
-                imgs, priors, cond_flags=cond_flags, use_motion=(use_motion and is_inference)
+                imgs, priors, cond_flags=cond_flags, use_motion=(use_motion and (is_inference or force_motion_tokens))
             )
         else:
-            token_list, patch_start_idx, fwd_token_list, bwd_token_list = self.visual_geometry_transformer(imgs, use_motion=(use_motion and is_inference))
+            token_list, patch_start_idx, fwd_token_list, bwd_token_list = self.visual_geometry_transformer(
+                imgs,
+                use_motion=(use_motion and (is_inference or force_motion_tokens)),
+            )
 
         # Generate all predictions
         preds = self._gen_all_preds(
             token_list, imgs, patch_start_idx, views, cond_flags, is_inference, use_motion,
-            fwd_token_list, bwd_token_list
+            fwd_token_list, bwd_token_list,
+            return_token_list=return_token_list,
+            skip_unused_heads=skip_unused_heads,
         )
 
         for key, value in preds.items():
             if isinstance(value, torch.Tensor) and value.dtype == torch.bfloat16:
                 preds[key] = value.to(torch.float32)
-            elif isinstance(value, list):
+            elif isinstance(value, list) and key not in {"token_list", "context_token_list"}:
                 for batch_value in value:
                     for frame_value in batch_value:
                         frame_value.to(torch.float32)
@@ -232,7 +246,8 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
 
     def _gen_all_preds(self, token_list, imgs, patch_start_idx,
                         views, cond_flags, is_inference, use_motion,
-                       fwd_token_list=[], bwd_token_list=[]):
+                       fwd_token_list=[], bwd_token_list=[], return_token_list: bool = False,
+                       skip_unused_heads: bool = False):
         """Generate all enabled predictions"""
         preds = {}
 
@@ -246,7 +261,7 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
             preds["camera_intrs"] = int_mat  # Camera intrinsic matrix: [B, S, 3, 3]
 
         # Depth prediction
-        if self.enable_depth:
+        if self.enable_depth and not skip_unused_heads:
             depth, depth_conf = self.depth_head(
                 token_list, images=imgs, patch_start_idx=patch_start_idx,
             )
@@ -254,7 +269,7 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
             preds["depth_conf"] = depth_conf
 
         # 3D point prediction
-        if self.enable_pts:
+        if self.enable_pts and not skip_unused_heads:
             pts, pts_conf = self.pts_head(
                 token_list, images=imgs, patch_start_idx=patch_start_idx,
             )
@@ -262,7 +277,7 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
             preds["pts3d_conf"] = pts_conf
 
         # Normal prediction
-        if self.enable_norm:
+        if self.enable_norm and not skip_unused_heads:
             normals, norm_conf = self.norm_head(
                 token_list, images=imgs, patch_start_idx=patch_start_idx,
             )
@@ -271,7 +286,15 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
 
         # Prepare context predictions for motion and GS heads
         if self.enable_motion or self.enable_gs:
-            context_preds = self.prepare_contexts(views, cond_flags, is_inference, use_motion)
+            context_preds = self.prepare_contexts(
+                views,
+                cond_flags,
+                is_inference,
+                use_motion,
+                token_list=token_list,
+                fwd_token_list=fwd_token_list,
+                bwd_token_list=bwd_token_list,
+            )
         else:
             context_preds = {}
 
@@ -330,6 +353,13 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                 context_predictions=context_preds,
                 is_inference=is_inference
             )
+        if return_token_list:
+            if "token_list" in context_preds:
+                preds["context_token_list"] = context_preds["token_list"]
+                preds["context_patch_start_idx"] = patch_start_idx
+            else:
+                preds["token_list"] = token_list
+                preds["patch_start_idx"] = patch_start_idx
         return preds
 
     def extract_priors(self, views):
@@ -385,7 +415,16 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
         c2w_mat = torch.linalg.inv(w2c_mat)
         return c2w_mat, int_mat
 
-    def prepare_contexts(self, views, cond_flags, is_inference, use_motion):
+    def prepare_contexts(
+        self,
+        views,
+        cond_flags,
+        is_inference,
+        use_motion,
+        token_list=None,
+        fwd_token_list=None,
+        bwd_token_list=None,
+    ):
         # Generate context views predictions
         context_preds = {}
         # only for training or evaluation
@@ -400,9 +439,16 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
         context_imgs = views['img'][:, :context_nums]
 
         use_cond = sum(cond_flags) > 0
+        all_views_are_context = context_nums == views["img"].shape[1]
+        has_motion_tokens = fwd_token_list is not None and bwd_token_list is not None and len(fwd_token_list) > 0 and len(bwd_token_list) > 0
+        can_reuse_tokens = token_list is not None and all_views_are_context and (not (self.enable_motion and use_motion) or has_motion_tokens)
 
         # Extract context priors and process features based on context views
-        if use_cond:
+        if can_reuse_tokens:
+            context_token_list = token_list
+            context_fwd_token_list = fwd_token_list
+            context_bwd_token_list = bwd_token_list
+        elif use_cond:
             priors = self.extract_priors(views)
             context_priors = (prior[:, :context_nums] if prior is not None else None for prior in priors)
             context_token_list, _, context_fwd_token_list, context_bwd_token_list = self.visual_geometry_transformer(

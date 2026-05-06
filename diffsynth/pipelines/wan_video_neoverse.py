@@ -523,7 +523,29 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
 
         pipe.load_models_to_device(self.onload_model_names)
         with torch.amp.autocast("cuda", dtype=pipe.torch_dtype):
-            recon_output = pipe.reconstructor(recon_source_views, is_inference=False)
+            skip_unused_heads = bool(getattr(pipe, "skip_unused_reconstructor_heads", False))
+            force_motion_tokens = has_gt_cameras and bool(getattr(pipe, "reuse_context_forward_tokens", True))
+            if bool(getattr(pipe, "reuse_reconstructor_tokens", False)):
+                try:
+                    recon_output = pipe.reconstructor(
+                        recon_source_views,
+                        is_inference=False,
+                        return_token_list=True,
+                        skip_unused_heads=skip_unused_heads,
+                        force_motion_tokens=force_motion_tokens,
+                    )
+                except TypeError:
+                    recon_output = pipe.reconstructor(recon_source_views, is_inference=False)
+            else:
+                try:
+                    recon_output = pipe.reconstructor(
+                        recon_source_views,
+                        is_inference=False,
+                        skip_unused_heads=skip_unused_heads,
+                        force_motion_tokens=force_motion_tokens,
+                    )
+                except TypeError:
+                    recon_output = pipe.reconstructor(recon_source_views, is_inference=False)
         if has_gt_cameras:
             render_extrinsics = source_views["camera_poses"]
             render_intrinsics = source_views["camera_intrs"]
@@ -612,7 +634,7 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
             output_path += "gt.mp4"
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             save_video(video, output_path, fps=15)
-        return {
+        output = {
             "source_views": source_views,
             "input_video": input_video,
             "target_rgb": target_rgb,
@@ -621,6 +643,16 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
             "target_poses": target_poses,
             "target_intrs": target_intrs,
         }
+        if "token_list" in recon_output:
+            output["reconstructor_token_list"] = recon_output["token_list"]
+            output["reconstructor_patch_start_idx"] = recon_output.get("patch_start_idx")
+        if "context_token_list" in recon_output:
+            output["reconstructor_context_token_list"] = recon_output["context_token_list"]
+            output["reconstructor_context_patch_start_idx"] = recon_output.get("context_patch_start_idx")
+        if hasattr(pipe.reconstructor, "visual_geometry_transformer"):
+            output["reconstructor_token_layers"] = tuple(pipe.reconstructor.visual_geometry_transformer.intermediate_idxs)
+            output["reconstructor_patch_size"] = int(getattr(pipe.reconstructor.visual_geometry_transformer, "patch_size", 14))
+        return output
 
     def compose_batches_from_list(self, batch):
         batched_inputs = {}
@@ -936,17 +968,21 @@ class WanVideoUnit_4DEmbedder(PipelineUnit):
             if pipe.save_root is not None:
                 save_tensor_video_for_vis(pipe.save_root, source_views, "target_rgb.mp4", target_rgb)
 
-            target_rgb = pipe.preprocess_video(target_rgb)
-            target_rgb_latents = pipe.vae.encode(target_rgb, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
-
             target_depth = repeat(target_depth, "B T H W 1 -> B T C H W", C=3)
 
             if pipe.save_root is not None:
                 target_depth_vis = (target_depth / d_max).clamp(0, 1)
                 save_tensor_video_for_vis(pipe.save_root, source_views, "target_depth.mp4", target_depth_vis)
 
+            target_rgb = pipe.preprocess_video(target_rgb)
             target_depth = pipe.preprocess_video(target_depth, normalize=d_max).clamp(min=-1, max=1)
-            target_depth_latents = pipe.vae.encode(target_depth, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
+            if bool(getattr(pipe, "batch_vae_teacher_embeds", False)):
+                target_batch = torch.cat([target_rgb, target_depth], dim=0)
+                target_latents = pipe.vae.encode(target_batch, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
+                target_rgb_latents, target_depth_latents = target_latents[:batch_size], target_latents[batch_size:]
+            else:
+                target_rgb_latents = pipe.vae.encode(target_rgb, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
+                target_depth_latents = pipe.vae.encode(target_depth, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
 
             if pipe.save_root is not None:
                 save_tensor_video_for_vis(pipe.save_root, source_views, "target_mask.mp4", target_mask, pattern="B T H W C")

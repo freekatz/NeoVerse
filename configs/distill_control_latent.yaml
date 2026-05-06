@@ -7,6 +7,10 @@ reconstructor_path: ./models/NeoVerse/reconstructor.ckpt
 lora_path: null
 lora_alpha: 1.0
 enable_vram_management: true
+reuse_reconstructor_tokens: true
+skip_unused_reconstructor_heads: true
+batch_vae_teacher_embeds: false
+reuse_context_forward_tokens: true
 load_dit: false
 load_text_encoder: false
 load_vae: true
@@ -31,6 +35,13 @@ context_sampling_weights:
   first_plus_recent_window: 0.05
 variants_per_scene: 1
 train_dataset: SpatialVID(split=None, ROOT="${data_root}", use_camera_annotations=${use_camera_annotations}, continuous_target_frames=${continuous_target_frames}, force_first_context=${force_first_context}, timestamp_unit="${timestamp_unit}", context_sampling_strategy="${context_sampling_strategy}", context_sampling_weights=${context_sampling_weights}, variants_per_scene=${variants_per_scene}, min_interval=1, max_interval=1, height=${height}, width=${width}, num_views=${num_views}, min_num_context_views=${min_num_context_views}, max_num_context_views=${max_num_context_views}, seed=${dataset_seed})
+
+camera_condition_normalization:
+  enabled: false
+  normalize_poses: true
+  normalize_intrinsics: true
+  normalize_plucker: true
+  min_translation_scale: 1.0
 
 pipeline_kwargs:
   # Keep the distillation teacher deterministic by default. Random target
@@ -116,6 +127,8 @@ max_steps: 20000
 batch_size: 1
 num_workers: 1
 pin_memory: false
+persistent_workers: true
+prefetch_factor: 2
 gradient_accumulation_steps: 1
 clip_grad: 1.0
 cache_train_batch: false

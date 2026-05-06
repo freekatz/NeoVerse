@@ -124,23 +124,15 @@ def _extract_from_depth_anything3(
 
 
 @torch.no_grad()
-def _extract_from_worldmirror(
-    reconstructor: torch.nn.Module,
-    views: dict[str, Any],
+def pack_worldmirror_token_list(
+    token_list: list[torch.Tensor],
+    patch_start_idx: int,
+    height: int,
+    width: int,
+    patch_size: int,
     layer_indices: Iterable[int],
     include_camera_token: IncludeCamera,
 ) -> dict[str, Any]:
-    imgs = views["img"]
-    _, _, _, height, width = imgs.shape
-    vgt = reconstructor.visual_geometry_transformer
-    old_indices = list(vgt.intermediate_idxs)
-    try:
-        vgt.intermediate_idxs = list(layer_indices)
-        token_list, patch_start_idx, _, _ = vgt(imgs, use_motion=False)
-    finally:
-        vgt.intermediate_idxs = old_indices
-
-    patch_size = getattr(vgt, "patch_size", 14)
     patch_groups = []
     camera_tokens = []
     for token_tensor in token_list:
@@ -168,6 +160,34 @@ def _extract_from_worldmirror(
         "num_token_groups": int(tokens.shape[2]),
         "backend": "worldmirror",
     }
+
+
+def _extract_from_worldmirror(
+    reconstructor: torch.nn.Module,
+    views: dict[str, Any],
+    layer_indices: Iterable[int],
+    include_camera_token: IncludeCamera,
+) -> dict[str, Any]:
+    imgs = views["img"]
+    _, _, _, height, width = imgs.shape
+    vgt = reconstructor.visual_geometry_transformer
+    old_indices = list(vgt.intermediate_idxs)
+    try:
+        vgt.intermediate_idxs = list(layer_indices)
+        token_list, patch_start_idx, _, _ = vgt(imgs, use_motion=False)
+    finally:
+        vgt.intermediate_idxs = old_indices
+
+    patch_size = getattr(vgt, "patch_size", 14)
+    return pack_worldmirror_token_list(
+        token_list,
+        patch_start_idx=patch_start_idx,
+        height=height,
+        width=width,
+        patch_size=patch_size,
+        layer_indices=layer_indices,
+        include_camera_token=include_camera_token,
+    )
 
 
 def extract_vggt_tokens(

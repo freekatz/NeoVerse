@@ -19,7 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 from diffsynth.models.student_adapters import build_student_adapter
 from diffsynth.models.wan_video_dit import sinusoidal_embedding_1d
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
-from hooks.extract_vggt_tokens import compose_views_from_list, extract_vggt_tokens
+from hooks.extract_vggt_tokens import compose_views_from_list, extract_vggt_tokens, pack_worldmirror_token_list
 from training.data.datasets.spatialvid import SpatialVID
 
 
@@ -303,6 +303,156 @@ def detach_optional_tensor(x):
     return x.detach() if isinstance(x, torch.Tensor) else x
 
 
+def token_pack_from_preprocess(inputs, cfg):
+    if not bool(cfg.token.context_only):
+        return None
+    token_list = inputs.get("reconstructor_context_token_list")
+    patch_start_idx = inputs.get("reconstructor_context_patch_start_idx")
+    if token_list is None or patch_start_idx is None:
+        return None
+
+    expected_layers = tuple(int(layer) for layer in cfg.token.layer_indices)
+    actual_layers = tuple(int(layer) for layer in inputs.get("reconstructor_token_layers", ()))
+    if actual_layers != expected_layers or len(token_list) != len(expected_layers):
+        return None
+
+    source_views = inputs.get("source_views")
+    if isinstance(source_views, list):
+        source_views = compose_views_from_list(source_views)
+    if not isinstance(source_views, dict) or "img" not in source_views:
+        return None
+    imgs = source_views["img"]
+    if not isinstance(imgs, torch.Tensor) or imgs.ndim < 5:
+        return None
+    if "is_target" in source_views and isinstance(source_views["is_target"], torch.Tensor):
+        context_count = int((~source_views["is_target"].bool())[0].sum().item())
+        if int(token_list[0].shape[1]) != context_count:
+            return None
+
+    return pack_worldmirror_token_list(
+        token_list,
+        patch_start_idx=int(patch_start_idx),
+        height=int(imgs.shape[-2]),
+        width=int(imgs.shape[-1]),
+        patch_size=int(inputs.get("reconstructor_patch_size", 14)),
+        layer_indices=expected_layers,
+        include_camera_token=cfg.token.include_camera_token,
+    )
+
+
+def get_camera_condition_normalization_cfg(cfg):
+    default = {
+        "enabled": False,
+        "normalize_poses": True,
+        "normalize_intrinsics": True,
+        "normalize_plucker": True,
+        "min_translation_scale": 1.0,
+    }
+    value = cfg.get("camera_condition_normalization", None)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        out = dict(default)
+        out["enabled"] = value
+        return out
+    value = OmegaConf.to_container(value, resolve=True) if not isinstance(value, dict) else value
+    out = dict(default)
+    out.update(value)
+    return out
+
+
+def _homogeneous_poses(poses: torch.Tensor) -> tuple[torch.Tensor, bool]:
+    if poses.shape[-2:] == (4, 4):
+        return poses, False
+    if poses.shape[-2:] != (3, 4):
+        raise ValueError(f"Expected camera poses with shape (..., 4, 4) or (..., 3, 4), got {tuple(poses.shape)}")
+    row = poses.new_tensor([0, 0, 0, 1]).reshape(*([1] * (poses.ndim - 2)), 1, 4)
+    row = row.expand(*poses.shape[:-2], 1, 4)
+    return torch.cat([poses, row], dim=-2), True
+
+
+def _camera_normalization_params(reference_poses: torch.Tensor | None, min_translation_scale: float):
+    if reference_poses is None:
+        return None, None
+    ref_h, _ = _homogeneous_poses(reference_poses.float())
+    anchor = ref_h[:, :1]
+    anchor_inv = torch.linalg.inv(anchor)
+    rel = anchor_inv @ ref_h
+    centers = rel[..., :3, 3]
+    scale = centers.detach().norm(dim=-1).amax(dim=1, keepdim=True)
+    scale = scale.clamp_min(float(min_translation_scale))
+    return anchor_inv, scale
+
+
+def _normalize_poses_to_first(poses: torch.Tensor | None, anchor_inv: torch.Tensor | None, scale: torch.Tensor | None):
+    if poses is None or anchor_inv is None or scale is None:
+        return poses
+    dtype = poses.dtype
+    poses_h, squeezed = _homogeneous_poses(poses.float())
+    rel = anchor_inv.to(device=poses_h.device, dtype=poses_h.dtype) @ poses_h
+    rel = rel.clone()
+    rel[..., :3, 3] = rel[..., :3, 3] / scale.to(device=poses_h.device, dtype=poses_h.dtype)[..., None]
+    rel = rel.to(dtype=dtype)
+    return rel[..., :3, :] if squeezed else rel
+
+
+def _normalize_intrinsics(intrs: torch.Tensor | None, height: int, width: int):
+    if intrs is None:
+        return intrs
+    out = intrs.clone()
+    out[..., 0, :] = out[..., 0, :] / float(width)
+    out[..., 1, :] = out[..., 1, :] / float(height)
+    return out
+
+
+def _normalize_plucker_to_first(
+    plucker: torch.Tensor | None,
+    reference_poses: torch.Tensor | None,
+    anchor_inv: torch.Tensor | None,
+    scale: torch.Tensor | None,
+):
+    if plucker is None or reference_poses is None or anchor_inv is None or scale is None:
+        return plucker
+    if plucker.shape[2] != 6:
+        raise ValueError(f"Expected target_plucker with shape B x F x 6 x H x W, got {tuple(plucker.shape)}")
+    dtype = plucker.dtype
+    ref_h, _ = _homogeneous_poses(reference_poses.float())
+    first = ref_h[:, 0].to(device=plucker.device, dtype=torch.float32)
+    world_to_first = anchor_inv[:, 0, :3, :3].to(device=plucker.device, dtype=torch.float32)
+    first_origin = first[:, :3, 3]
+    rays_d = plucker[:, :, :3].float()
+    moment = plucker[:, :, 3:].float()
+    origin_shift = first_origin[:, None, :, None, None].expand_as(rays_d)
+    moment = moment - torch.cross(origin_shift, rays_d, dim=2)
+    rays_d = torch.einsum("bij,bfjhw->bfihw", world_to_first, rays_d)
+    moment = torch.einsum("bij,bfjhw->bfihw", world_to_first, moment)
+    moment = moment / scale.to(device=plucker.device, dtype=torch.float32)[:, :, None, None, None]
+    return torch.cat([rays_d, moment], dim=2).to(dtype=dtype)
+
+
+def normalize_camera_condition_cache(cache: dict, cfg):
+    norm_cfg = get_camera_condition_normalization_cfg(cfg)
+    if not bool(norm_cfg["enabled"]):
+        return cache
+    reference_poses = cache.get("target_poses") if cache.get("target_poses") is not None else cache.get("source_poses")
+    anchor_inv, scale = _camera_normalization_params(
+        reference_poses,
+        min_translation_scale=float(norm_cfg["min_translation_scale"]),
+    )
+    if anchor_inv is None:
+        return cache
+    cache = dict(cache)
+    if bool(norm_cfg["normalize_poses"]):
+        cache["target_poses"] = _normalize_poses_to_first(cache.get("target_poses"), anchor_inv, scale)
+        cache["source_poses"] = _normalize_poses_to_first(cache.get("source_poses"), anchor_inv, scale)
+    if bool(norm_cfg["normalize_intrinsics"]):
+        cache["target_intrs"] = _normalize_intrinsics(cache.get("target_intrs"), int(cfg.height), int(cfg.width))
+        cache["source_intrs"] = _normalize_intrinsics(cache.get("source_intrs"), int(cfg.height), int(cfg.width))
+    if bool(norm_cfg["normalize_plucker"]):
+        cache["target_plucker"] = _normalize_plucker_to_first(cache.get("target_plucker"), reference_poses, anchor_inv, scale)
+    return cache
+
+
 def json_default(value):
     if isinstance(value, (np.integer,)):
         return int(value)
@@ -354,6 +504,7 @@ def frozen_cache_signature(data, cfg):
         "width": cfg.get("width", None),
         "num_views": cfg.get("num_views", None),
         "use_camera_annotations": cfg.get("use_camera_annotations", None),
+        "camera_condition_normalization": get_camera_condition_normalization_cfg(cfg),
         "pipeline_kwargs": OmegaConf.to_container(cfg.pipeline_kwargs, resolve=True),
         "token": OmegaConf.to_container(cfg.token, resolve=True),
         "vae_tiled": cfg.get("vae_tiled", None),
@@ -458,7 +609,7 @@ class ControlLatentDistillModule(torch.nn.Module):
         super().__init__()
         self.cfg = cfg
         initial_device = "cpu"
-        if bool(cfg.get("enable_vram_management", True)) and torch.cuda.is_available():
+        if torch.cuda.is_available():
             initial_device = f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}"
         pipe = WanVideoNeoVersePipeline.from_pretrained(
             local_model_path=cfg.model_path,
@@ -474,6 +625,10 @@ class ControlLatentDistillModule(torch.nn.Module):
             load_vae=bool(cfg.get("load_vae", True)),
         )
         pipe.scheduler.set_timesteps(int(cfg.scheduler_train_steps), training=True)
+        pipe.reuse_reconstructor_tokens = bool(cfg.get("reuse_reconstructor_tokens", True))
+        pipe.skip_unused_reconstructor_heads = bool(cfg.get("skip_unused_reconstructor_heads", True))
+        pipe.batch_vae_teacher_embeds = bool(cfg.get("batch_vae_teacher_embeds", False))
+        pipe.reuse_context_forward_tokens = bool(cfg.get("reuse_context_forward_tokens", True))
         freeze_module(pipe)
         object.__setattr__(self, "pipe", pipe)
         self.adapter = build_adapter(pipe, cfg)
@@ -547,16 +702,21 @@ class ControlLatentDistillModule(torch.nn.Module):
                 inputs["target_mask"],
                 sequence_length=sequence_length,
             )
-            self.pipe.load_models_to_device(["reconstructor"])
-            token_pack = extract_vggt_tokens(
-                self.pipe.reconstructor,
-                inputs["source_views"],
-                layer_indices=self.cfg.token.layer_indices,
-                include_camera_token=self.cfg.token.include_camera_token,
-                context_only=bool(self.cfg.token.context_only),
-                ref_view_strategy=str(self.cfg.token.ref_view_strategy),
-                autocast_dtype=getattr(torch, self.cfg.token.autocast_dtype),
-            )
+            token_pack = None
+            if bool(self.cfg.get("reuse_reconstructor_tokens", True)):
+                token_pack = token_pack_from_preprocess(inputs, self.cfg)
+            reused_reconstructor_tokens = token_pack is not None
+            if token_pack is None:
+                self.pipe.load_models_to_device(["reconstructor"])
+                token_pack = extract_vggt_tokens(
+                    self.pipe.reconstructor,
+                    inputs["source_views"],
+                    layer_indices=self.cfg.token.layer_indices,
+                    include_camera_token=self.cfg.token.include_camera_token,
+                    context_only=bool(self.cfg.token.context_only),
+                    ref_view_strategy=str(self.cfg.token.ref_view_strategy),
+                    autocast_dtype=getattr(torch, self.cfg.token.autocast_dtype),
+                )
             target_times = extract_target_times(inputs["source_views"], device=self.pipe.device)
             source_times = extract_source_times(
                 inputs["source_views"],
@@ -579,7 +739,7 @@ class ControlLatentDistillModule(torch.nn.Module):
                 mode="trilinear",
             ).permute(0, 2, 1, 3, 4).contiguous()
 
-        return {
+        cache = {
             "teacher": teacher.detach(),
             "tokens": token_pack["tokens"].detach(),
             "token_dim": int(token_pack["token_dim"]),
@@ -593,7 +753,9 @@ class ControlLatentDistillModule(torch.nn.Module):
             "target_plucker": detach_optional_tensor(target_plucker),
             "source_poses": detach_optional_tensor(source_poses),
             "source_intrs": detach_optional_tensor(source_intrs),
+            "reused_reconstructor_tokens": bool(reused_reconstructor_tokens),
         }
+        return normalize_camera_condition_cache(cache, self.cfg)
 
     def get_forward_cache(self, data, device=None):
         target_device = self.pipe.device if device is None else device
@@ -655,6 +817,11 @@ class ControlLatentDistillModule(torch.nn.Module):
         metrics["token_groups"] = torch.tensor(cache["num_token_groups"], device=loss.device, dtype=torch.float32)
         metrics["seq_len"] = torch.tensor(cache["sequence_length"], device=loss.device, dtype=torch.float32)
         add_time_metrics(metrics, cache["target_times"], cache["source_times"], loss.device)
+        metrics["reused_reconstructor_tokens"] = torch.tensor(
+            float(bool(cache.get("reused_reconstructor_tokens", False))),
+            device=loss.device,
+            dtype=torch.float32,
+        )
         self.last_shapes = {
             "teacher": {"condition": tuple(cache["teacher"].shape)},
             "student": {"condition": tuple(student.shape)},
@@ -676,6 +843,7 @@ class ControlLatentDistillModule(torch.nn.Module):
             ),
             "target_poses": None if cache["target_poses"] is None else tuple(cache["target_poses"].shape),
             "source_poses": None if cache["source_poses"] is None else tuple(cache["source_poses"].shape),
+            "reused_reconstructor_tokens": bool(cache.get("reused_reconstructor_tokens", False)),
         }
         self.last_visuals = (
             {"condition": cache["teacher"]},
@@ -771,13 +939,17 @@ def main():
         OmegaConf.save(cfg, os.path.join(cfg.output_path, "config.yaml"))
 
     dataset = eval(cfg.train_dataset)
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=int(cfg.batch_size),
-        shuffle=True,
-        num_workers=int(cfg.num_workers),
-        pin_memory=bool(cfg.pin_memory),
-    )
+    dataloader_kwargs = {
+        "batch_size": int(cfg.batch_size),
+        "shuffle": True,
+        "num_workers": int(cfg.num_workers),
+        "pin_memory": bool(cfg.pin_memory),
+    }
+    if int(cfg.num_workers) > 0:
+        dataloader_kwargs["persistent_workers"] = bool(cfg.get("persistent_workers", True))
+        if cfg.get("prefetch_factor", None) is not None:
+            dataloader_kwargs["prefetch_factor"] = int(cfg.prefetch_factor)
+    dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
     model = ControlLatentDistillModule(cfg)
     optimizer = torch.optim.AdamW(
         model.adapter.parameters(),

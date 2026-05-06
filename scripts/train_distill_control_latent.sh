@@ -227,12 +227,25 @@ append_override_if_set() {
 
 append_override_if_set "MODEL_PATH" "model_path"
 append_override_if_set "RECONSTRUCTOR_PATH" "reconstructor_path"
+append_override_if_set "ENABLE_VRAM_MANAGEMENT" "enable_vram_management"
+append_override_if_set "REUSE_RECONSTRUCTOR_TOKENS" "reuse_reconstructor_tokens"
+append_override_if_set "SKIP_UNUSED_RECONSTRUCTOR_HEADS" "skip_unused_reconstructor_heads"
+append_override_if_set "BATCH_VAE_TEACHER_EMBEDS" "batch_vae_teacher_embeds"
+append_override_if_set "REUSE_CONTEXT_FORWARD_TOKENS" "reuse_context_forward_tokens"
 append_override_if_set "SEED" "seed"
 append_override_if_set "DATASET_SEED" "dataset_seed"
 append_override_if_set "DATA_ROOT" "data_root"
 append_override_if_set "USE_CAMERA_ANNOTATIONS" "use_camera_annotations"
+append_override_if_set "CAMERA_CONDITION_NORMALIZE" "camera_condition_normalization.enabled"
+append_override_if_set "CAMERA_CONDITION_NORMALIZE_POSES" "camera_condition_normalization.normalize_poses"
+append_override_if_set "CAMERA_CONDITION_NORMALIZE_INTRINSICS" "camera_condition_normalization.normalize_intrinsics"
+append_override_if_set "CAMERA_CONDITION_NORMALIZE_PLUCKER" "camera_condition_normalization.normalize_plucker"
+append_override_if_set "CAMERA_CONDITION_MIN_TRANSLATION_SCALE" "camera_condition_normalization.min_translation_scale"
 append_override_if_set "BATCH_SIZE" "batch_size"
 append_override_if_set "NUM_WORKERS" "num_workers"
+append_override_if_set "PIN_MEMORY" "pin_memory"
+append_override_if_set "PERSISTENT_WORKERS" "persistent_workers"
+append_override_if_set "PREFETCH_FACTOR" "prefetch_factor"
 append_override_if_set "LEARNING_RATE" "learning_rate"
 append_override_if_set "WEIGHT_DECAY" "weight_decay"
 append_override_if_set "GRADIENT_ACCUMULATION_STEPS" "gradient_accumulation_steps"
@@ -329,6 +342,11 @@ CROSS_USE_LOCAL_GRID=${CROSS_USE_LOCAL_GRID:-}
 CROSS_USE_TIME_FILM=${CROSS_USE_TIME_FILM:-}
 CROSS_TIME_POSITION_MODE=${CROSS_TIME_POSITION_MODE:-}
 CROSS_REROPE_INTERVAL=${CROSS_REROPE_INTERVAL:-}
+CAMERA_CONDITION_NORMALIZE=${CAMERA_CONDITION_NORMALIZE:-}
+CAMERA_CONDITION_NORMALIZE_POSES=${CAMERA_CONDITION_NORMALIZE_POSES:-}
+CAMERA_CONDITION_NORMALIZE_INTRINSICS=${CAMERA_CONDITION_NORMALIZE_INTRINSICS:-}
+CAMERA_CONDITION_NORMALIZE_PLUCKER=${CAMERA_CONDITION_NORMALIZE_PLUCKER:-}
+CAMERA_CONDITION_MIN_TRANSLATION_SCALE=${CAMERA_CONDITION_MIN_TRANSLATION_SCALE:-}
 TRAIN_OVERRIDES=${TRAIN_OVERRIDES[*]}
 EXTRA_OVERRIDES=$*
 EOF
