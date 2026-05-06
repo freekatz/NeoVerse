@@ -9,3 +9,20 @@ for i in 0 17 33 81 159 240 319; do
     --modes teacher,student \
     --enable_vram_management
 done
+
+cd /root/vepfs/diffsynth-dev/papers/neoverse/code
+
+GPU_LIST=0,1 \
+CAMERA_CONDITION_NORMALIZE=true \
+CAMERA_CONDITION_MIN_TRANSLATION_SCALE=1.0 \
+RUN_NAME=online_fast_gtcam \
+USE_CAMERA_ANNOTATIONS=false \
+ENABLE_VRAM_MANAGEMENT=false \
+NUM_WORKERS=4 \
+PIN_MEMORY=true \
+PERSISTENT_WORKERS=true \
+PREFETCH_FACTOR=2 \
+REUSE_RECONSTRUCTOR_TOKENS=true \
+SKIP_UNUSED_RECONSTRUCTOR_HEADS=true \
+REUSE_CONTEXT_FORWARD_TOKENS=true \
+bash scripts/train_distill_control_latent_online.sh
