@@ -1,28 +1,160 @@
+#!/usr/bin/env bash
+set -euo pipefail
 
-eval:
-for i in 0 17 33 81 159 240 319; do
-    /root/vepfs/envs/neoverse/bin/python eval_replace_teacher_with_student.py \
-    outputs/NeoVerseControlLatentDistill/2026-05-04/17-05-14/config.yaml \
-    outputs/NeoVerseControlLatentDistill/2026-05-04/17-05-14/adapter_last.pt \
-    --output_dir outputs/NeoVerseControlLatentDistill/2026-05-04/17-05-14/eval_idx${i} \
-    --dataset_index ${i} \
-    --modes teacher,student \
-    --enable_vram_management
-done
+CODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${CODE_DIR}"
 
-cd /root/vepfs/diffsynth-dev/papers/neoverse/code
+PYTHON="${PYTHON:-/root/vepfs/envs/neoverse/bin/python}"
 
-GPU_LIST=0,1 \
-CAMERA_CONDITION_NORMALIZE=true \
-CAMERA_CONDITION_MIN_TRANSLATION_SCALE=1.0 \
-RUN_NAME=online_fast_gtcam \
-USE_CAMERA_ANNOTATIONS=false \
-ENABLE_VRAM_MANAGEMENT=false \
-NUM_WORKERS=4 \
-PIN_MEMORY=true \
-PERSISTENT_WORKERS=true \
-PREFETCH_FACTOR=2 \
-REUSE_RECONSTRUCTOR_TOKENS=true \
-SKIP_UNUSED_RECONSTRUCTOR_HEADS=true \
-REUSE_CONTEXT_FORWARD_TOKENS=true \
-bash scripts/train_distill_control_latent_online.sh
+usage() {
+  cat <<'EOF'
+NeoVerse local commands
+
+Usage:
+  ./cli train-online-time [extra OmegaConf overrides...]
+  ./cli train-online-fast [extra OmegaConf overrides...]
+  ./cli build-camera-cache [args for experiments/build_spatialvid_camera_cache.py]
+  ./cli build-frozen-cache [args for experiments/build_spatialvid_frozen_cache.py]
+  ./cli compare-temporal [args for experiments/compare_temporal_trajectories.py]
+  ./cli eval-last CONFIG CHECKPOINT [dataset indices...]
+  ./cli dry-run-time
+
+Training presets:
+  train-online-time  Online distillation with temporal augmentation enabled.
+                     Default profile is forward_pause.
+                     Override with TEMPORAL_TRAJECTORY_PROFILE=mixed_fzr for stronger F/Z/R/backward control.
+
+  train-online-fast  Previous online_fast_gtcam-style run without temporal augmentation.
+
+  compare-temporal  Defaults to --reconstruct_from all so forward=F:81 checks all-input replay.
+                    Use --reconstruct_from context for training-teacher-like sparse-context rendering.
+
+  build-camera-cache  Builds fixed 81-frame clip camera caches. Supports GPU_LIST
+                      sharding like training. Train with CAMERA_CACHE_DIR=<same output_dir>
+                      CAMERA_CACHE_REQUIRED=true.
+
+  build-frozen-cache  Builds fixed clip + fixed trajectory frozen caches. Use the
+                      same FIXED_CLIPS_PER_SCENE, TRAJECTORIES_PER_CLIP,
+                      CAMERA_CACHE_DIR, and DATASET_SEED when training.
+
+Useful env overrides:
+  GPU_LIST=0,1
+  RUN_NAME=online_time_forward_pause
+  MAX_STEPS=200000
+  DATA_ROOT=data/SpatialVID_full
+  FIXED_CLIPS_PER_SCENE=16
+  CAMERA_CACHE_DIR=outputs/NeoVerseControlLatentDistill/camera_cache
+  TRAJECTORIES_PER_CLIP=8|16
+  TEMPORAL_VARIANT_PROFILE_WEIGHTS=forward_pause:0.5,mixed_fzr:0.4,backward:0.1
+  TEMPORAL_TRAJECTORY_PROFILE=forward_pause|mixed_fzr
+  DRY_RUN=1
+EOF
+}
+
+common_online_env() {
+  export GPU_LIST="${GPU_LIST:-0,1}"
+  export CAMERA_CONDITION_NORMALIZE="${CAMERA_CONDITION_NORMALIZE:-true}"
+  export CAMERA_CONDITION_MIN_TRANSLATION_SCALE="${CAMERA_CONDITION_MIN_TRANSLATION_SCALE:-1.0}"
+  export USE_CAMERA_ANNOTATIONS="${USE_CAMERA_ANNOTATIONS:-false}"
+  export ENABLE_VRAM_MANAGEMENT="${ENABLE_VRAM_MANAGEMENT:-false}"
+  export NUM_WORKERS="${NUM_WORKERS:-4}"
+  export PIN_MEMORY="${PIN_MEMORY:-true}"
+  export PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-true}"
+  export PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
+  export REUSE_RECONSTRUCTOR_TOKENS="${REUSE_RECONSTRUCTOR_TOKENS:-true}"
+  export SKIP_UNUSED_RECONSTRUCTOR_HEADS="${SKIP_UNUSED_RECONSTRUCTOR_HEADS:-true}"
+  export REUSE_CONTEXT_FORWARD_TOKENS="${REUSE_CONTEXT_FORWARD_TOKENS:-true}"
+}
+
+train_online_time() {
+  common_online_env
+  export RUN_NAME="${RUN_NAME:-online_time_forward_pause}"
+  export TEMPORAL_AUGMENTATION="${TEMPORAL_AUGMENTATION:-true}"
+  export TEMPORAL_TRAJECTORY_PROFILE="${TEMPORAL_TRAJECTORY_PROFILE:-forward_pause}"
+  export TEMPORAL_VARIANT_PROFILE_WEIGHTS="${TEMPORAL_VARIANT_PROFILE_WEIGHTS:-forward_pause:0.5,mixed_fzr:0.4,backward:0.1}"
+  export TEMPORAL_ORDER="${TEMPORAL_ORDER:-trajectory}"
+  export TRAJECTORIES_PER_CLIP="${TRAJECTORIES_PER_CLIP:-8}"
+  export DATASET_SEED="${DATASET_SEED:-0}"
+  bash scripts/train_distill_control_latent_online.sh "$@"
+}
+
+train_online_fast() {
+  common_online_env
+  export RUN_NAME="${RUN_NAME:-online_fast_gtcam}"
+  export TEMPORAL_AUGMENTATION="${TEMPORAL_AUGMENTATION:-false}"
+  bash scripts/train_distill_control_latent_online.sh "$@"
+}
+
+compare_temporal() {
+  "${PYTHON}" experiments/compare_temporal_trajectories.py "$@"
+}
+
+build_camera_cache() {
+  export GPU_LIST="${GPU_LIST:-0,1}"
+  bash scripts/build_spatialvid_camera_cache.sh "$@"
+}
+
+build_frozen_cache() {
+  export GPU_LIST="${GPU_LIST:-0,1}"
+  bash scripts/build_spatialvid_frozen_cache.sh "$@"
+}
+
+eval_last() {
+  if [[ "$#" -lt 2 ]]; then
+    echo "Usage: ./cli eval-last CONFIG CHECKPOINT [dataset indices...]" >&2
+    exit 2
+  fi
+  local config="$1"
+  local checkpoint="$2"
+  shift 2
+  local indices=("$@")
+  if [[ "${#indices[@]}" -eq 0 ]]; then
+    indices=(0 17 33 81 159 240 319)
+  fi
+  for index in "${indices[@]}"; do
+    "${PYTHON}" eval_replace_teacher_with_student.py \
+      "${config}" \
+      "${checkpoint}" \
+      --output_dir "$(dirname "${checkpoint}")/eval_idx${index}" \
+      --dataset_index "${index}" \
+      --modes teacher,student \
+      --enable_vram_management
+  done
+}
+
+cmd="${1:-help}"
+if [[ "$#" -gt 0 ]]; then
+  shift
+fi
+
+case "${cmd}" in
+  help|-h|--help)
+    usage
+    ;;
+  train-online-time)
+    train_online_time "$@"
+    ;;
+  train-online-fast)
+    train_online_fast "$@"
+    ;;
+  dry-run-time)
+    DRY_RUN=1 train_online_time "$@"
+    ;;
+  compare-temporal)
+    compare_temporal "$@"
+    ;;
+  build-camera-cache)
+    build_camera_cache "$@"
+    ;;
+  build-frozen-cache)
+    build_frozen_cache "$@"
+    ;;
+  eval-last)
+    eval_last "$@"
+    ;;
+  *)
+    echo "Unknown command: ${cmd}" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

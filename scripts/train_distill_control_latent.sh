@@ -179,6 +179,7 @@ fi
 GLOBAL_NUM_PROCESSES=$((DIST_NPROC_PER_NODE * DIST_NNODES))
 MAX_STEPS_VALUE="${MAX_STEPS:-200000}"
 NUM_EPOCHS_VALUE="${NUM_EPOCHS:-${MAX_STEPS_VALUE}}"
+TRAJECTORIES_PER_CLIP_VALUE="${TRAJECTORIES_PER_CLIP:-${VARIANTS_PER_SCENE:-1}}"
 CUDA_PRELOAD_MIN_PROCESSES="${CUDA_PRELOAD_MIN_PROCESSES:-8}"
 DEFAULT_PRELOAD_FROZEN_CACHE_DEVICE="${PRELOAD_FROZEN_CACHE_DEVICE:-cpu}"
 if [[ -z "${PRELOAD_FROZEN_CACHE_DEVICE:-}" && "${GLOBAL_NUM_PROCESSES}" -ge "${CUDA_PRELOAD_MIN_PROCESSES}" ]]; then
@@ -193,8 +194,15 @@ TRAIN_OVERRIDES=(
   "continuous_target_frames=${CONTINUOUS_TARGET_FRAMES:-true}"
   "force_first_context=${FORCE_FIRST_CONTEXT:-true}"
   "timestamp_unit=${TIMESTAMP_UNIT:-seconds}"
+  "temporal_augmentation=${TEMPORAL_AUGMENTATION:-false}"
+  "temporal_trajectory_profile=${TEMPORAL_TRAJECTORY_PROFILE:-forward_pause}"
+  "temporal_order=${TEMPORAL_ORDER:-trajectory}"
+  "temporal_max_condition_frames=${TEMPORAL_MAX_CONDITION_FRAMES:-8}"
   "context_sampling_strategy=${CONTEXT_SAMPLING_STRATEGY:-mixed}"
-  "variants_per_scene=${VARIANTS_PER_SCENE:-16}"
+  "variants_per_scene=${TRAJECTORIES_PER_CLIP_VALUE}"
+  "trajectories_per_clip=${TRAJECTORIES_PER_CLIP_VALUE}"
+  "temporal_variant_profile_weights=${TEMPORAL_VARIANT_PROFILE_WEIGHTS:-}"
+  "fixed_clips_per_scene=${FIXED_CLIPS_PER_SCENE:-16}"
   "pipeline_kwargs.mask_non_context_targets=${MASK_NON_CONTEXT_TARGETS:-false}"
   "max_steps=${MAX_STEPS_VALUE}"
   "num_epochs=${NUM_EPOCHS_VALUE}"
@@ -235,7 +243,12 @@ append_override_if_set "REUSE_CONTEXT_FORWARD_TOKENS" "reuse_context_forward_tok
 append_override_if_set "SEED" "seed"
 append_override_if_set "DATASET_SEED" "dataset_seed"
 append_override_if_set "DATA_ROOT" "data_root"
+append_override_if_set "VIDEO_IDS" "video_ids"
+append_override_if_set "VIDEO_PATHS" "video_paths"
 append_override_if_set "USE_CAMERA_ANNOTATIONS" "use_camera_annotations"
+append_override_if_set "FIXED_CLIPS_PER_SCENE" "fixed_clips_per_scene"
+append_override_if_set "CAMERA_CACHE_DIR" "camera_cache_dir"
+append_override_if_set "CAMERA_CACHE_REQUIRED" "camera_cache_required"
 append_override_if_set "CAMERA_CONDITION_NORMALIZE" "camera_condition_normalization.enabled"
 append_override_if_set "CAMERA_CONDITION_NORMALIZE_POSES" "camera_condition_normalization.normalize_poses"
 append_override_if_set "CAMERA_CONDITION_NORMALIZE_INTRINSICS" "camera_condition_normalization.normalize_intrinsics"
@@ -288,6 +301,7 @@ if [[ "${FAST_FROZEN_CACHE}" != "1" ]]; then
 fi
 append_override_if_set "FROZEN_CACHE_READ" "frozen_cache_read"
 append_override_if_set "FROZEN_CACHE_WRITE" "frozen_cache_write"
+append_override_if_set "FROZEN_CACHE_REQUIRED" "frozen_cache_required"
 append_override_if_set "FROZEN_CACHE_DTYPE" "frozen_cache_dtype"
 append_override_if_set "PRELOAD_FROZEN_CACHE" "preload_frozen_cache"
 append_override_if_set "PRELOAD_FROZEN_CACHE_DEVICE" "preload_frozen_cache_device"
@@ -313,6 +327,7 @@ RUN_TIME=${RUN_TIME}
 RUN_NAME=${RUN_NAME}
 OUTPUT_PATH=${OUTPUT_PATH}
 FROZEN_CACHE_DIR=${FROZEN_CACHE_DIR:-}
+FROZEN_CACHE_REQUIRED=${FROZEN_CACHE_REQUIRED:-}
 DEFAULT_PRELOAD_FROZEN_CACHE_DEVICE=${DEFAULT_PRELOAD_FROZEN_CACHE_DEVICE}
 CUDA_PRELOAD_MIN_PROCESSES=${CUDA_PRELOAD_MIN_PROCESSES}
 LOG_DIR=${LOG_DIR}
@@ -347,6 +362,12 @@ CAMERA_CONDITION_NORMALIZE_POSES=${CAMERA_CONDITION_NORMALIZE_POSES:-}
 CAMERA_CONDITION_NORMALIZE_INTRINSICS=${CAMERA_CONDITION_NORMALIZE_INTRINSICS:-}
 CAMERA_CONDITION_NORMALIZE_PLUCKER=${CAMERA_CONDITION_NORMALIZE_PLUCKER:-}
 CAMERA_CONDITION_MIN_TRANSLATION_SCALE=${CAMERA_CONDITION_MIN_TRANSLATION_SCALE:-}
+FIXED_CLIPS_PER_SCENE=${FIXED_CLIPS_PER_SCENE:-}
+TRAJECTORIES_PER_CLIP=${TRAJECTORIES_PER_CLIP:-}
+TRAJECTORIES_PER_CLIP_VALUE=${TRAJECTORIES_PER_CLIP_VALUE}
+TEMPORAL_VARIANT_PROFILE_WEIGHTS=${TEMPORAL_VARIANT_PROFILE_WEIGHTS:-}
+CAMERA_CACHE_DIR=${CAMERA_CACHE_DIR:-}
+CAMERA_CACHE_REQUIRED=${CAMERA_CACHE_REQUIRED:-}
 TRAIN_OVERRIDES=${TRAIN_OVERRIDES[*]}
 EXTRA_OVERRIDES=$*
 EOF
@@ -375,7 +396,12 @@ run_cmd "${ENV_PYTHON}" -m py_compile \
   diffsynth/models/student_adapters.py \
   diffsynth/pipelines/wan_video_neoverse.py \
   diffsynth/models/wan_video_neoverse_controller.py \
-  hooks/extract_vggt_tokens.py
+  hooks/extract_vggt_tokens.py \
+  training/data/base_dataset.py \
+  training/data/datasets/spatialvid.py \
+  training/data/temporal_trajectory.py \
+  experiments/build_spatialvid_camera_cache.py \
+  experiments/build_spatialvid_frozen_cache.py
 
 launch_cmd=(
   "${ACCELERATE}" launch

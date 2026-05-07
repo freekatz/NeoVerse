@@ -18,6 +18,7 @@ set -euo pipefail
 #   VARIANTS_PER_SCENE=1
 #   DATASET_SEED=null          # keep online random sampling
 #   FROZEN_CACHE_DIR=/path     # optional opportunistic on-disk cache
+#   TEMPORAL_AUGMENTATION=true TEMPORAL_TRAJECTORY_PROFILE=forward_pause
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -27,8 +28,15 @@ export CONTEXT_SAMPLING_STRATEGY="${CONTEXT_SAMPLING_STRATEGY:-mixed}"
 export VARIANTS_PER_SCENE="${VARIANTS_PER_SCENE:-1}"
 export PRELOAD_FROZEN_CACHE="${PRELOAD_FROZEN_CACHE:-false}"
 export CACHE_FROZEN_OUTPUTS="${CACHE_FROZEN_OUTPUTS:-false}"
-export FROZEN_CACHE_WRITE="${FROZEN_CACHE_WRITE:-false}"
-export FROZEN_CACHE_READ="${FROZEN_CACHE_READ:-false}"
+if [[ -n "${FROZEN_CACHE_DIR:-}" || "${USE_FROZEN_CACHE:-0}" == "1" ]]; then
+  export FROZEN_CACHE_WRITE="${FROZEN_CACHE_WRITE:-false}"
+  export FROZEN_CACHE_READ="${FROZEN_CACHE_READ:-true}"
+  export FROZEN_CACHE_REQUIRED="${FROZEN_CACHE_REQUIRED:-true}"
+else
+  export FROZEN_CACHE_WRITE="${FROZEN_CACHE_WRITE:-false}"
+  export FROZEN_CACHE_READ="${FROZEN_CACHE_READ:-false}"
+  export FROZEN_CACHE_REQUIRED="${FROZEN_CACHE_REQUIRED:-false}"
+fi
 export DATASET_SEED="${DATASET_SEED:-null}"
 
 exec bash "${SCRIPT_DIR}/train_distill_control_latent.sh" "$@"
