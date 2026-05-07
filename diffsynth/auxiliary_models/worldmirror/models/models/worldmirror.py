@@ -434,9 +434,22 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
         assert self.enable_cam and (self.enable_motion or self.enable_gs)
         if 'is_target' not in views:
             context_nums = views['img'].shape[1]
+            context_indices = torch.arange(
+                context_nums,
+                device=views["img"].device,
+                dtype=torch.long,
+            ).unsqueeze(0).expand(views["img"].shape[0], -1)
         else:
-            context_nums = (views['is_target'][0] == False).sum().item()
-        context_imgs = views['img'][:, :context_nums]
+            context_mask = ~views['is_target'].bool()
+            context_counts = context_mask.sum(dim=1)
+            if not bool(torch.all(context_counts == context_counts[0]).item()):
+                raise ValueError("WorldMirror expects the same number of context views in every batch item.")
+            context_nums = int(context_counts[0].item())
+            context_indices = torch.stack(
+                [torch.nonzero(mask, as_tuple=False).flatten() for mask in context_mask],
+                dim=0,
+            ).to(device=views["img"].device, dtype=torch.long)
+        context_imgs = self._gather_sequence(views['img'], context_indices)
 
         use_cond = sum(cond_flags) > 0
         all_views_are_context = context_nums == views["img"].shape[1]
@@ -450,7 +463,7 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
             context_bwd_token_list = bwd_token_list
         elif use_cond:
             priors = self.extract_priors(views)
-            context_priors = (prior[:, :context_nums] if prior is not None else None for prior in priors)
+            context_priors = (self._gather_sequence(prior, context_indices) if prior is not None else None for prior in priors)
             context_token_list, _, context_fwd_token_list, context_bwd_token_list = self.visual_geometry_transformer(
                 context_imgs, context_priors, cond_flags=cond_flags, use_motion=use_motion
             )
@@ -468,8 +481,20 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
         context_preds['imgs'] = context_imgs
         context_preds['fwd_token_list'] = context_fwd_token_list
         context_preds['bwd_token_list'] = context_bwd_token_list
+        context_preds['view_indices'] = context_indices
+        for key in ("timestamp", "is_static"):
+            value = views.get(key)
+            if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[1] == views["img"].shape[1]:
+                context_preds[key] = self._gather_sequence(value, context_indices)
 
         return context_preds
+
+    @staticmethod
+    def _gather_sequence(tensor, indices):
+        index = indices.to(device=tensor.device, dtype=torch.long)
+        index = index.reshape(index.shape[0], index.shape[1], *([1] * (tensor.ndim - 2)))
+        index = index.expand(-1, -1, *tensor.shape[2:])
+        return torch.gather(tensor, dim=1, index=index)
 
     @staticmethod
     def state_dict_converter():

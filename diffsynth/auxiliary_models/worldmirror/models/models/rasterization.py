@@ -507,7 +507,8 @@ class GaussianSplatRenderer(nn.Module):
         - splats / rendered_extrinsics / rendered_intrinsics
         """
         B, _, _, H, W = images.shape
-        S = context_predictions.get("imgs", images).shape[1] # context view nums
+        context_images = context_predictions.get("imgs", images)
+        S = context_images.shape[1] # context view nums
         V = images.shape[1] - S                              # target view nums
         has_gt_cameras = "camera_poses" in views and "camera_intrs" in views
 
@@ -516,7 +517,7 @@ class GaussianSplatRenderer(nn.Module):
         gs_params_static = self.gs_head(gs_feats_reshape)
         if self.is_4dgs:
             gs_params_dynamic = self.gs_head_dynamic(gs_feats_reshape)
-            is_static = views["is_static"][:, :S].reshape(-1)
+            is_static = context_predictions.get("is_static", views["is_static"][:, :S]).reshape(-1)
             gs_params = torch.where(
                 is_static[:, None, None, None],
                 gs_params_static,
@@ -550,8 +551,13 @@ class GaussianSplatRenderer(nn.Module):
             )
             if "camera_poses" in context_predictions:
                 pred_context_extrinsic, _ = self.prepare_cameras(context_predictions, S)
+                context_indices = context_predictions.get("view_indices")
+                if isinstance(context_indices, torch.Tensor):
+                    pred_all_context_extrinsic = self._gather_sequence(pred_all_extrinsic, context_indices)
+                else:
+                    pred_all_context_extrinsic = pred_all_extrinsic[:, :S]
                 scale_factor = pred_context_extrinsic[:, :, :3, 3].norm(dim=-1).mean(dim=1, keepdim=True) / (
-                    pred_all_extrinsic[:, :S, :3, 3].norm(dim=-1).mean(dim=1, keepdim=True) + 1e-6
+                    pred_all_context_extrinsic[:, :, :3, 3].norm(dim=-1).mean(dim=1, keepdim=True) + 1e-6
                 )
                 scale_factor = scale_factor.unsqueeze(-1)
 
@@ -678,6 +684,7 @@ class GaussianSplatRenderer(nn.Module):
         B, _, _, H, W = images.shape
         S = context_nums
         splats = {}
+        context_images = context_predictions.get("imgs", images[:, :S])
 
         # Only take parameters from source view branch
         gs_params = rearrange(gs_params, "(b s) c h w -> b s h w c", b=B)
@@ -697,7 +704,7 @@ class GaussianSplatRenderer(nn.Module):
         residual_sh = act_gs.reg_dense_sh(residual_sh.reshape(B, S, H * W, self.nums_sh * 3))
         new_sh = torch.zeros_like(residual_sh)
         new_sh[..., 0, :] = sh_utils.RGB2SH(
-            images[:, :S].permute(0, 1, 3, 4, 2).reshape(B, S, H * W, 3)
+            context_images.permute(0, 1, 3, 4, 2).reshape(B, S, H * W, 3)
         )
         splats["sh"] = new_sh + residual_sh
 
@@ -715,8 +722,13 @@ class GaussianSplatRenderer(nn.Module):
             raise ValueError(f"Invalid depth_from={depth_from}")
 
         if camera_from == "gtcamera":
-            pose4x4 = views["camera_poses"][:, :S].reshape(B * S, 4, 4)
-            intrinsic = views["camera_intrs"][:, :S].reshape(B * S, 3, 3)
+            context_indices = context_predictions.get("view_indices")
+            if isinstance(context_indices, torch.Tensor):
+                pose4x4 = self._gather_sequence(views["camera_poses"], context_indices).reshape(B * S, 4, 4)
+                intrinsic = self._gather_sequence(views["camera_intrs"], context_indices).reshape(B * S, 3, 3)
+            else:
+                pose4x4 = views["camera_poses"][:, :S].reshape(B * S, 4, 4)
+                intrinsic = views["camera_intrs"][:, :S].reshape(B * S, 3, 3)
         elif camera_from == "predcamera":
             pose4x4 = context_predictions.get("camera_poses", predictions["camera_poses"])[:, :S].reshape(B * S, 4, 4).detach()
             intrinsic = context_predictions.get("camera_intrs", predictions["camera_intrs"])[:, :S].reshape(B * S, 3, 3).detach()
@@ -728,7 +740,7 @@ class GaussianSplatRenderer(nn.Module):
         splats["means"] = pts3d
         splats["conf"] = conf.reshape(B, S, H * W)
 
-        splats["timestamp"] = views["timestamp"][:, :S]
+        splats["timestamp"] = context_predictions.get("timestamp", views["timestamp"][:, :S])
         if "velocity_fwd" in predictions:
             camera2world = pose4x4.reshape(B, S, 4, 4)
             world_velocity_fwd = torch.einsum(
@@ -760,6 +772,13 @@ class GaussianSplatRenderer(nn.Module):
             static_flag=views["is_static"][:, 0],
         )
         return gaussians
+
+    @staticmethod
+    def _gather_sequence(tensor, indices):
+        index = indices.to(device=tensor.device, dtype=torch.long)
+        index = index.reshape(index.shape[0], index.shape[1], *([1] * (tensor.ndim - 2)))
+        index = index.expand(-1, -1, *tensor.shape[2:])
+        return torch.gather(tensor, dim=1, index=index)
 
     def prepare_cameras(self, views, nums):
         viewmats = views["camera_poses"][:, :nums]

@@ -214,6 +214,12 @@ def extract_target_times(source_views, device):
     if timestamps is None or not isinstance(timestamps, torch.Tensor):
         return None
     timestamps = timestamps.to(device=device, dtype=torch.float32)
+    target_indices = target_trajectory_indices(source_views, device=device)
+    if target_indices is not None and target_indices.shape == timestamps.shape:
+        order = continuous_view_order_indices(source_views, device=device)
+        if order is not None and order.shape == timestamps.shape:
+            timestamps = torch.gather(timestamps, dim=1, index=order)
+        return torch.gather(timestamps, dim=1, index=target_indices)
     return torch.sort(timestamps, dim=1).values
 
 
@@ -232,6 +238,58 @@ def extract_source_times(source_views, device, context_only: bool = True):
     # SpatialVID and ExampleVideo return context views first, followed by target views.
     count = int(keep[0].sum().item())
     return timestamps[:, :count]
+
+
+def _as_tensor_2d(value, device, dtype=None):
+    if isinstance(value, torch.Tensor):
+        tensor = value.to(device=device, dtype=dtype) if dtype is not None else value.to(device=device)
+    elif isinstance(value, np.ndarray):
+        tensor = torch.as_tensor(value, device=device, dtype=dtype)
+    elif isinstance(value, (list, tuple)):
+        try:
+            tensor = torch.as_tensor(value, device=device, dtype=dtype)
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+    if tensor.ndim == 0:
+        tensor = tensor.reshape(1, 1)
+    elif tensor.ndim == 1:
+        tensor = tensor.unsqueeze(0)
+    return tensor
+
+
+def continuous_view_order_indices(source_views, device):
+    if isinstance(source_views, list):
+        source_views = compose_views_from_list(source_views)
+    trajectory_index = _as_tensor_2d(source_views.get("trajectory_index"), device=device, dtype=torch.long)
+    if trajectory_index is None:
+        return None
+    return torch.argsort(trajectory_index, dim=1)
+
+
+def target_trajectory_indices(source_views, device):
+    if isinstance(source_views, list):
+        source_views = compose_views_from_list(source_views)
+    target_index = _as_tensor_2d(source_views.get("target_trajectory_index"), device=device, dtype=torch.long)
+    if target_index is None:
+        return None
+    order = continuous_view_order_indices(source_views, device=device)
+    if order is not None and order.shape == target_index.shape:
+        target_index = torch.gather(target_index, dim=1, index=order)
+    return target_index
+
+
+target_view_order_indices = continuous_view_order_indices
+
+
+def _context_count(source_views, fallback_count):
+    if "is_target" not in source_views or not isinstance(source_views["is_target"], torch.Tensor):
+        return fallback_count
+    keep = ~source_views["is_target"].bool()
+    if keep.ndim != 2:
+        return fallback_count
+    return int(keep[0].sum().item())
 
 
 def gather_source_cameras_from_target(source_views, target_poses, target_intrs, context_only: bool = True):
@@ -262,10 +320,10 @@ def gather_source_cameras_from_target(source_views, target_poses, target_intrs, 
 
     timestamps = timestamps.to(device=device, dtype=torch.float32)
     if context_only and "is_target" in source_views and isinstance(source_views["is_target"], torch.Tensor):
-        keep = ~source_views["is_target"].bool()
-        count = int(keep[0].sum().item()) if keep.ndim == 2 else timestamps.shape[1]
+        count = _context_count(source_views, timestamps.shape[1])
         source_times = timestamps[:, :count]
     else:
+        count = timestamps.shape[1]
         source_times = timestamps
 
     sorted_times, _ = torch.sort(timestamps, dim=1)
@@ -494,6 +552,13 @@ def frozen_cache_signature(data, cfg):
                 "scene_idx": cache_scalar(view.get("scene_idx")),
                 "variant_id": cache_scalar(view.get("variant_id")),
                 "context_strategy": cache_scalar(view.get("context_strategy")),
+                "trajectory_index": cache_scalar(view.get("trajectory_index")),
+                "target_trajectory_index": cache_scalar(view.get("target_trajectory_index")),
+                "camera_cache_path": cache_scalar(view.get("camera_cache_path")),
+                "temporal_augmentation": cache_scalar(view.get("temporal_augmentation")),
+                "temporal_order": cache_scalar(view.get("temporal_order")),
+                "temporal_trajectory_profile": cache_scalar(view.get("temporal_trajectory_profile")),
+                "temporal_trajectory_type": cache_scalar(view.get("temporal_trajectory_type")),
             }
         )
     cfg_signature = {
@@ -504,6 +569,12 @@ def frozen_cache_signature(data, cfg):
         "width": cfg.get("width", None),
         "num_views": cfg.get("num_views", None),
         "use_camera_annotations": cfg.get("use_camera_annotations", None),
+        "temporal_augmentation": cfg.get("temporal_augmentation", None),
+        "temporal_trajectory_profile": cfg.get("temporal_trajectory_profile", None),
+        "temporal_variant_profile_weights": cfg.get("temporal_variant_profile_weights", None),
+        "temporal_order": cfg.get("temporal_order", None),
+        "temporal_max_condition_frames": cfg.get("temporal_max_condition_frames", None),
+        "trajectories_per_clip": cfg.get("trajectories_per_clip", None),
         "camera_condition_normalization": get_camera_condition_normalization_cfg(cfg),
         "pipeline_kwargs": OmegaConf.to_container(cfg.pipeline_kwargs, resolve=True),
         "token": OmegaConf.to_container(cfg.token, resolve=True),
@@ -717,18 +788,25 @@ class ControlLatentDistillModule(torch.nn.Module):
                     ref_view_strategy=str(self.cfg.token.ref_view_strategy),
                     autocast_dtype=getattr(torch, self.cfg.token.autocast_dtype),
                 )
-            target_times = extract_target_times(inputs["source_views"], device=self.pipe.device)
+            target_times = inputs.get("target_timestamps")
+            if isinstance(target_times, torch.Tensor):
+                target_times = target_times.to(device=self.pipe.device, dtype=torch.float32)
+            else:
+                target_times = extract_target_times(inputs["source_views"], device=self.pipe.device)
             source_times = extract_source_times(
                 inputs["source_views"],
                 device=self.pipe.device,
                 context_only=bool(self.cfg.token.context_only),
             )
-            source_poses, source_intrs = gather_source_cameras_from_target(
-                inputs["source_views"],
-                inputs.get("target_poses"),
-                inputs.get("target_intrs"),
-                context_only=bool(self.cfg.token.context_only),
-            )
+            source_poses = inputs.get("source_poses")
+            source_intrs = inputs.get("source_intrs")
+            if not isinstance(source_poses, torch.Tensor) or not isinstance(source_intrs, torch.Tensor):
+                source_poses, source_intrs = gather_source_cameras_from_target(
+                    inputs["source_views"],
+                    inputs.get("target_poses"),
+                    inputs.get("target_intrs"),
+                    context_only=bool(self.cfg.token.context_only),
+                )
             self.pipe.load_models_to_device([])
 
         target_plucker = inputs.get("target_camera_embed")
@@ -768,6 +846,8 @@ class ControlLatentDistillModule(torch.nn.Module):
                     target_device,
                     dtype=cache_float_dtype(self.cfg) if cache_target_is_cpu(target_device) else None,
                 )
+            if bool(self.cfg.get("frozen_cache_required", False)):
+                raise FileNotFoundError(f"Missing frozen forward cache: {cache_path}")
             cache = self.build_frozen_forward_cache(data)
             if bool(self.cfg.get("frozen_cache_write", False)):
                 save_frozen_cache(cache_path, cache, self.cfg)

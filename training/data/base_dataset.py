@@ -130,7 +130,13 @@ class BaseDataset(EasyDataset):
             view["true_shape"] = np.int32((height, width))
             view["img"] = images[v]
 
-            if v > 0 and view["is_target"] == views[v-1]["is_target"]:
+            allow_nonmonotonic = False
+            if v > 0:
+                allow_nonmonotonic = bool(
+                    view.get("allow_nonmonotonic_timestamps", False)
+                    or views[v - 1].get("allow_nonmonotonic_timestamps", False)
+                )
+            if v > 0 and view["is_target"] == views[v-1]["is_target"] and not allow_nonmonotonic:
                 assert view["timestamp"] >= views[v-1]["timestamp"], f"Timestamp for view {view_name(view)} is not greater than or equal to previous view."
             else:
                 assert "prompt" in view

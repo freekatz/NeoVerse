@@ -1,6 +1,8 @@
 seed: 0
 dataset_seed: ${seed}
 data_root: data/SpatialVID
+video_ids: null
+video_paths: null
 torch_dtype: bfloat16
 model_path: ./models
 reconstructor_path: ./models/NeoVerse/reconstructor.ckpt
@@ -25,6 +27,10 @@ use_camera_annotations: false
 continuous_target_frames: true
 force_first_context: true
 timestamp_unit: seconds
+temporal_augmentation: false
+temporal_trajectory_profile: forward_pause
+temporal_order: trajectory
+temporal_max_condition_frames: 8
 context_sampling_strategy: uniform
 context_sampling_weights:
   uniform_first: 0.25
@@ -34,7 +40,12 @@ context_sampling_weights:
   first_plus_sparse: 0.10
   first_plus_recent_window: 0.05
 variants_per_scene: 1
-train_dataset: SpatialVID(split=None, ROOT="${data_root}", use_camera_annotations=${use_camera_annotations}, continuous_target_frames=${continuous_target_frames}, force_first_context=${force_first_context}, timestamp_unit="${timestamp_unit}", context_sampling_strategy="${context_sampling_strategy}", context_sampling_weights=${context_sampling_weights}, variants_per_scene=${variants_per_scene}, min_interval=1, max_interval=1, height=${height}, width=${width}, num_views=${num_views}, min_num_context_views=${min_num_context_views}, max_num_context_views=${max_num_context_views}, seed=${dataset_seed})
+trajectories_per_clip: null
+temporal_variant_profile_weights: ""
+fixed_clips_per_scene: 0
+camera_cache_dir: ""
+camera_cache_required: false
+train_dataset: SpatialVID(split=None, ROOT="${data_root}", video_ids=${video_ids}, video_paths=${video_paths}, use_camera_annotations=${use_camera_annotations}, continuous_target_frames=${continuous_target_frames}, force_first_context=${force_first_context}, timestamp_unit="${timestamp_unit}", temporal_augmentation=${temporal_augmentation}, temporal_trajectory_profile="${temporal_trajectory_profile}", temporal_order="${temporal_order}", temporal_max_condition_frames=${temporal_max_condition_frames}, context_sampling_strategy="${context_sampling_strategy}", context_sampling_weights=${context_sampling_weights}, variants_per_scene=${variants_per_scene}, trajectories_per_clip=${trajectories_per_clip}, temporal_variant_profile_weights="${temporal_variant_profile_weights}", fixed_clips_per_scene=${fixed_clips_per_scene}, camera_cache_dir="${camera_cache_dir}", camera_cache_required=${camera_cache_required}, min_interval=1, max_interval=1, height=${height}, width=${width}, num_views=${num_views}, min_num_context_views=${min_num_context_views}, max_num_context_views=${max_num_context_views}, seed=${dataset_seed})
 
 camera_condition_normalization:
   enabled: false
@@ -136,6 +147,7 @@ cache_frozen_outputs: false
 frozen_cache_dir: null
 frozen_cache_read: true
 frozen_cache_write: false
+frozen_cache_required: false
 frozen_cache_dtype: bfloat16
 preload_frozen_cache: false
 preload_frozen_cache_device: cpu

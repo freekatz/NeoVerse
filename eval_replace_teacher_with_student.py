@@ -19,6 +19,8 @@ from train_distill_control_latent import (
     extract_target_times,
     gather_source_cameras_from_target,
     prepare_control_state,
+    continuous_view_order_indices,
+    target_trajectory_indices,
 )
 from training.data.datasets.spatialvid import SpatialVID
 
@@ -91,6 +93,26 @@ def slice_context_views(views):
             context_views[key] = value
     context_views["is_target"] = torch.zeros_like(is_target[:, :context_num])
     return context_views, context_num
+
+
+def gather_view_tensor(tensor, indices):
+    if indices.ndim == 1:
+        indices = indices.unsqueeze(0).expand(tensor.shape[0], -1)
+    index = indices.to(device=tensor.device, dtype=torch.long)
+    index = index.reshape(index.shape[0], index.shape[1], *([1] * (tensor.ndim - 2)))
+    index = index.expand(-1, -1, *tensor.shape[2:])
+    return torch.gather(tensor, dim=1, index=index)
+
+
+def gather_views(views, indices):
+    total_views = views["img"].shape[1]
+    gathered = {}
+    for key, value in views.items():
+        if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[1] == total_views:
+            gathered[key] = gather_view_tensor(value, indices)
+        else:
+            gathered[key] = value
+    return gathered
 
 
 def _normalize_video_tensor(frames, min_value=None, max_value=None):
@@ -397,19 +419,53 @@ def save_eval_neoverse_prediction_grid(
     return output_path
 
 
-def sort_target_trajectory(target_poses, target_intrs, target_timestamps, is_target=None):
-    sorted_poses = target_poses.clone()
-    sorted_intrs = target_intrs.clone()
-    sorted_timestamps = target_timestamps.clone()
-    sorted_is_target = None if is_target is None else is_target.clone()
-    for b_idx in range(target_timestamps.shape[0]):
-        order_indices = torch.argsort(target_timestamps[b_idx])
-        sorted_timestamps[b_idx] = target_timestamps[b_idx][order_indices]
-        sorted_poses[b_idx] = target_poses[b_idx][order_indices]
-        sorted_intrs[b_idx] = target_intrs[b_idx][order_indices]
-        if sorted_is_target is not None:
-            sorted_is_target[b_idx] = sorted_is_target[b_idx][order_indices]
-    return sorted_poses, sorted_intrs, sorted_timestamps, sorted_is_target
+def build_temporal_target_conditions(views, render_poses, render_intrs, render_timestamps):
+    order = continuous_view_order_indices(views, device=render_timestamps.device)
+    if order is None or order.shape != render_timestamps.shape:
+        order = torch.argsort(render_timestamps, dim=1)
+    target_indices = target_trajectory_indices(views, device=render_timestamps.device)
+    if target_indices is None or target_indices.shape != render_timestamps.shape:
+        target_indices = torch.arange(
+            render_timestamps.shape[1],
+            device=render_timestamps.device,
+            dtype=torch.long,
+        ).unsqueeze(0).expand(render_timestamps.shape[0], -1)
+    continuous_views = gather_views(views, order)
+    continuous_poses = render_poses
+    continuous_intrs = render_intrs
+    continuous_timestamps = render_timestamps
+    target_poses = gather_view_tensor(continuous_poses, target_indices)
+    target_intrs = gather_view_tensor(continuous_intrs, target_indices)
+    target_timestamps = gather_view_tensor(continuous_timestamps.unsqueeze(-1), target_indices).squeeze(-1)
+    target_rgb = gather_view_tensor(continuous_views["img"], target_indices).permute(0, 1, 3, 4, 2).contiguous()
+    target_is_target = None
+    if isinstance(views.get("is_target"), torch.Tensor) and views["is_target"].shape[:2] == render_timestamps.shape:
+        continuous_is_target = gather_view_tensor(views["is_target"], order)
+        target_is_target = gather_view_tensor(continuous_is_target, target_indices)
+    context_num = int((~views["is_target"][0].bool()).sum().item()) if isinstance(views.get("is_target"), torch.Tensor) else views["img"].shape[1]
+    source_index_values = views.get("trajectory_index")
+    if source_index_values is None:
+        source_indices = torch.arange(
+            context_num,
+            device=render_timestamps.device,
+            dtype=torch.long,
+        ).unsqueeze(0).expand(render_timestamps.shape[0], -1)
+    else:
+        if not isinstance(source_index_values, torch.Tensor):
+            source_index_values = torch.as_tensor(source_index_values, device=render_timestamps.device, dtype=torch.long)
+        source_indices = source_index_values[:, :context_num].to(device=render_timestamps.device, dtype=torch.long)
+    source_poses = gather_view_tensor(continuous_poses, source_indices)
+    source_intrs = gather_view_tensor(continuous_intrs, source_indices)
+    return {
+        "continuous_views": continuous_views,
+        "target_rgb": target_rgb,
+        "target_poses": target_poses,
+        "target_intrs": target_intrs,
+        "target_timestamps": target_timestamps,
+        "target_is_target": target_is_target,
+        "source_poses": source_poses,
+        "source_intrs": source_intrs,
+    }
 
 
 def save_eval_condition_videos(output_dir, render_conditions, camera_embed=None, fps=15):
@@ -487,45 +543,56 @@ def build_render_conditions(pipe, source_views, args, cfg):
     if has_gt_cameras:
         recon_views, context_num = slice_context_views(views)
     else:
-        recon_views = views
+        order = continuous_view_order_indices(views, device=views["img"].device)
+        if order is None or order.shape != views["timestamp"].shape:
+            order = torch.argsort(views["timestamp"], dim=1)
+        recon_views = gather_views(views, order)
+        if isinstance(recon_views.get("is_target"), torch.Tensor):
+            recon_views["is_target"] = torch.zeros_like(recon_views["is_target"])
         context_num = int((~views["is_target"][0].bool()).sum().item()) if isinstance(views.get("is_target"), torch.Tensor) else views["img"].shape[1]
     with torch.amp.autocast("cuda", dtype=pipe.torch_dtype, enabled=str(pipe.device).startswith("cuda")):
         predictions = pipe.reconstructor(recon_views, is_inference=False)
     if has_gt_cameras:
-        target_poses = views["camera_poses"]
-        target_intrs = views["camera_intrs"]
-        target_timestamps = views["timestamp"]
+        order = continuous_view_order_indices(views, device=views["img"].device)
+        if order is None or order.shape != views["timestamp"].shape:
+            order = torch.argsort(views["timestamp"], dim=1)
+        continuous_views = gather_views(views, order)
+        render_poses = continuous_views["camera_poses"]
+        render_intrs = continuous_views["camera_intrs"]
+        render_timestamps = continuous_views["timestamp"]
     else:
-        target_poses = predictions["rendered_extrinsics"]
-        target_intrs = predictions["rendered_intrinsics"]
-        target_timestamps = predictions["rendered_timestamps"]
-    target_poses, target_intrs, target_timestamps, sorted_is_target = sort_target_trajectory(
-        target_poses,
-        target_intrs,
-        target_timestamps,
-        views.get("is_target") if isinstance(views.get("is_target"), torch.Tensor) else None,
+        render_poses = predictions["rendered_extrinsics"]
+        render_intrs = predictions["rendered_intrinsics"]
+        render_timestamps = predictions["rendered_timestamps"]
+    temporal_conditions = build_temporal_target_conditions(
+        views,
+        render_poses,
+        render_intrs,
+        render_timestamps,
     )
-    target_rgb, target_depth, target_alpha = pipe.reconstructor.gs_renderer.rasterizer.forward(
+    _, target_depth, target_alpha = pipe.reconstructor.gs_renderer.rasterizer.forward(
         predictions["splats"],
-        render_viewmats=homo_matrix_inverse(target_poses),
-        render_Ks=target_intrs,
-        render_timestamps=target_timestamps,
+        render_viewmats=homo_matrix_inverse(temporal_conditions["target_poses"]),
+        render_Ks=temporal_conditions["target_intrs"],
+        render_timestamps=temporal_conditions["target_timestamps"],
         sh_degree=0,
         width=args.width,
         height=args.height,
     )
     alpha_thresh = float(cfg.pipeline_kwargs.get("alpha_thresh", 0.5))
     target_mask = (target_alpha > alpha_thresh).float()
-    if bool(cfg.pipeline_kwargs.get("mask_non_context_targets", False)) and sorted_is_target is not None:
-        target_mask = target_mask.masked_fill(sorted_is_target[:, :, None, None, None].bool(), 0)
+    if bool(cfg.pipeline_kwargs.get("mask_non_context_targets", False)) and temporal_conditions["target_is_target"] is not None:
+        target_mask = target_mask.masked_fill(temporal_conditions["target_is_target"][:, :, None, None, None].bool(), 0)
     return {
         "source_views": views,
-        "target_rgb": target_rgb,
+        "target_rgb": temporal_conditions["target_rgb"],
         "target_depth": target_depth,
         "target_mask": target_mask,
-        "target_poses": target_poses,
-        "target_intrs": target_intrs,
-        "target_timestamps": target_timestamps,
+        "target_poses": temporal_conditions["target_poses"],
+        "target_intrs": temporal_conditions["target_intrs"],
+        "target_timestamps": temporal_conditions["target_timestamps"],
+        "source_poses": temporal_conditions["source_poses"],
+        "source_intrs": temporal_conditions["source_intrs"],
     }
 
 
@@ -544,6 +611,9 @@ def prepare_inputs(pipe, prompt, render_conditions, args):
         "target_mask": render_conditions["target_mask"],
         "target_poses": render_conditions["target_poses"],
         "target_intrs": render_conditions["target_intrs"],
+        "target_timestamps": render_conditions.get("target_timestamps"),
+        "source_poses": render_conditions.get("source_poses"),
+        "source_intrs": render_conditions.get("source_intrs"),
         "seed": args.seed,
         "rand_device": args.rand_device,
         "height": args.height,
@@ -564,18 +634,25 @@ def prepare_inputs(pipe, prompt, render_conditions, args):
 
 @torch.no_grad()
 def compute_student_condition(pipe, adapter, token_pack, inputs_shared, output_grid, cfg):
-    target_times = extract_target_times(inputs_shared["source_views"], device=pipe.device)
+    target_times = inputs_shared.get("target_timestamps")
+    if isinstance(target_times, torch.Tensor):
+        target_times = target_times.to(device=pipe.device, dtype=torch.float32)
+    else:
+        target_times = extract_target_times(inputs_shared["source_views"], device=pipe.device)
     source_times = extract_source_times(
         inputs_shared["source_views"],
         device=pipe.device,
         context_only=bool(cfg.token.context_only),
     )
-    source_poses, source_intrs = gather_source_cameras_from_target(
-        inputs_shared["source_views"],
-        inputs_shared.get("target_poses"),
-        inputs_shared.get("target_intrs"),
-        context_only=bool(cfg.token.context_only),
-    )
+    source_poses = inputs_shared.get("source_poses")
+    source_intrs = inputs_shared.get("source_intrs")
+    if not isinstance(source_poses, torch.Tensor) or not isinstance(source_intrs, torch.Tensor):
+        source_poses, source_intrs = gather_source_cameras_from_target(
+            inputs_shared["source_views"],
+            inputs_shared.get("target_poses"),
+            inputs_shared.get("target_intrs"),
+            context_only=bool(cfg.token.context_only),
+        )
     return adapter(
         token_pack["tokens"],
         output_grid,

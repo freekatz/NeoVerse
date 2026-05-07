@@ -478,18 +478,74 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
         self.color_thresh = color_thresh
         self.mask_non_context_targets = bool(mask_non_context_targets)
 
+    def _order_indices(self, source_views, b_idx, fallback_timestamps):
+        trajectory_index = source_views.get("trajectory_index")
+        if not isinstance(trajectory_index, torch.Tensor) and isinstance(trajectory_index, (np.ndarray, list, tuple)):
+            try:
+                trajectory_index = torch.as_tensor(trajectory_index, device=fallback_timestamps.device, dtype=torch.long)
+            except (TypeError, ValueError):
+                trajectory_index = None
+        if isinstance(trajectory_index, torch.Tensor):
+            if trajectory_index.ndim >= 2:
+                trajectory_index = trajectory_index[b_idx]
+            return torch.argsort(trajectory_index.to(device=fallback_timestamps.device))
+        return torch.argsort(fallback_timestamps[b_idx])
+
+    @staticmethod
+    def _gather_view_tensor(tensor, indices):
+        if indices.ndim == 1:
+            indices = indices.unsqueeze(0).expand(tensor.shape[0], -1)
+        index = indices.to(device=tensor.device, dtype=torch.long)
+        index = index.reshape(index.shape[0], index.shape[1], *([1] * (tensor.ndim - 2)))
+        index = index.expand(-1, -1, *tensor.shape[2:])
+        return torch.gather(tensor, dim=1, index=index)
+
+    def _gather_views(self, views, indices):
+        total_views = views["img"].shape[1]
+        gathered = {}
+        for key, value in views.items():
+            if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[1] == total_views:
+                gathered[key] = self._gather_view_tensor(value, indices)
+            else:
+                gathered[key] = value
+        return gathered
+
+    def _continuous_order(self, source_views):
+        timestamps = source_views["timestamp"]
+        orders = []
+        for b_idx in range(timestamps.shape[0]):
+            orders.append(self._order_indices(source_views, b_idx, timestamps))
+        return torch.stack(orders, dim=0).to(device=timestamps.device, dtype=torch.long)
+
+    def _target_trajectory_indices(self, source_views, continuous_order):
+        timestamps = source_views["timestamp"]
+        target_map = source_views.get("target_trajectory_index")
+        if not isinstance(target_map, torch.Tensor) and isinstance(target_map, (np.ndarray, list, tuple)):
+            try:
+                target_map = torch.as_tensor(target_map, device=timestamps.device, dtype=torch.long)
+            except (TypeError, ValueError):
+                target_map = None
+        if isinstance(target_map, torch.Tensor):
+            target_map = target_map.to(device=timestamps.device, dtype=torch.long)
+            if target_map.ndim == 1:
+                target_map = target_map.unsqueeze(0)
+            return self._gather_view_tensor(target_map.unsqueeze(-1), continuous_order).squeeze(-1)
+        batch_size, num_views = timestamps.shape
+        return torch.arange(num_views, device=timestamps.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+
     def process(self, pipe: WanVideoNeoVersePipeline, source_views, target_rgb, target_depth, target_mask, target_poses, target_intrs):
         if source_views is None:
             return {}
 
         if isinstance(source_views, list):
             source_views = self.compose_batches_from_list(source_views)
+        continuous_order = self._continuous_order(source_views)
+        continuous_views = self._gather_views(source_views, continuous_order)
+        target_indices = self._target_trajectory_indices(source_views, continuous_order)
+        target_input_video = self._gather_view_tensor(continuous_views["img"], target_indices)
         if pipe.is_training:
-            input_video = source_views["img"].clone()
+            input_video = target_input_video.clone()
             assert len(input_video) == 1, "During training, only batch size 1 is supported."
-            for b_idx in range(len(source_views["img"])):
-                order_indices = torch.argsort(source_views["timestamp"][b_idx])
-                input_video[b_idx] = input_video[b_idx][order_indices]
         else:
             input_video = None
 
@@ -507,9 +563,12 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
             isinstance(source_views.get("camera_poses"), torch.Tensor)
             and isinstance(source_views.get("camera_intrs"), torch.Tensor)
         )
+        has_camera_cache = has_gt_cameras and "camera_cache_path" in source_views
+        has_annotation_cameras = has_gt_cameras and not has_camera_cache
         context_num = (~source_views["is_target"]).sum()
         context_num_int = int(context_num.item() if isinstance(context_num, torch.Tensor) else context_num)
-        if has_gt_cameras:
+        context_indices = None
+        if has_annotation_cameras:
             total_views = source_views["img"].shape[1]
             recon_source_views = {}
             for key, value in source_views.items():
@@ -518,13 +577,26 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
                 else:
                     recon_source_views[key] = value
             recon_source_views["is_target"] = torch.zeros_like(source_views["is_target"][:, :context_num_int])
+        elif has_camera_cache:
+            continuous_is_context = ~continuous_views["is_target"].bool()
+            context_counts = continuous_is_context.sum(dim=1)
+            if not bool(torch.all(context_counts == context_counts[0]).item()):
+                raise ValueError("NeoVerse preprocessing expects the same number of context views in every batch item.")
+            context_indices = torch.stack(
+                [torch.nonzero(mask, as_tuple=False).flatten() for mask in continuous_is_context],
+                dim=0,
+            ).to(device=continuous_views["img"].device, dtype=torch.long)
+            recon_source_views = self._gather_views(continuous_views, context_indices)
+            recon_source_views.pop("camera_poses", None)
+            recon_source_views.pop("camera_intrs", None)
+            recon_source_views["is_target"] = torch.zeros_like(recon_source_views["is_target"])
         else:
-            recon_source_views = source_views
+            recon_source_views = dict(continuous_views)
 
         pipe.load_models_to_device(self.onload_model_names)
         with torch.amp.autocast("cuda", dtype=pipe.torch_dtype):
             skip_unused_heads = bool(getattr(pipe, "skip_unused_reconstructor_heads", False))
-            force_motion_tokens = has_gt_cameras and bool(getattr(pipe, "reuse_context_forward_tokens", True))
+            force_motion_tokens = (has_annotation_cameras or has_camera_cache) and bool(getattr(pipe, "reuse_context_forward_tokens", True))
             if bool(getattr(pipe, "reuse_reconstructor_tokens", False)):
                 try:
                     recon_output = pipe.reconstructor(
@@ -546,18 +618,38 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
                     )
                 except TypeError:
                     recon_output = pipe.reconstructor(recon_source_views, is_inference=False)
-        if has_gt_cameras:
-            render_extrinsics = source_views["camera_poses"]
-            render_intrinsics = source_views["camera_intrs"]
-            render_timestamps = source_views["timestamp"]
-            context_extrinsics = render_extrinsics[:, :context_num_int]
-            context_intrinsics = render_intrinsics[:, :context_num_int]
+        if has_annotation_cameras:
+            render_extrinsics = continuous_views["camera_poses"]
+            render_intrinsics = continuous_views["camera_intrs"]
+            render_timestamps = continuous_views["timestamp"]
+            context_extrinsics = recon_source_views["camera_poses"]
+            context_intrinsics = recon_source_views["camera_intrs"]
+        elif has_camera_cache:
+            render_extrinsics = continuous_views["camera_poses"]
+            render_intrinsics = continuous_views["camera_intrs"]
+            render_timestamps = continuous_views["timestamp"]
+            context_extrinsics = recon_output["rendered_extrinsics"]
+            context_intrinsics = recon_output["rendered_intrinsics"]
+            cached_context_extrinsics = self._gather_view_tensor(render_extrinsics, context_indices)
+            cached_norm = cached_context_extrinsics[:, :, :3, 3].norm(dim=-1).mean(dim=1, keepdim=True)
+            pred_norm = context_extrinsics[:, :, :3, 3].norm(dim=-1).mean(dim=1, keepdim=True)
+            scale_factor = (pred_norm / (cached_norm + 1e-6)).to(dtype=render_extrinsics.dtype)
+            render_extrinsics = render_extrinsics.clone()
+            render_extrinsics[:, :, :3, 3] = render_extrinsics[:, :, :3, 3] * scale_factor.unsqueeze(-1)
         else:
             render_extrinsics = recon_output["rendered_extrinsics"]
             render_intrinsics = recon_output["rendered_intrinsics"]
             render_timestamps = recon_output["rendered_timestamps"]
-            context_extrinsics = render_extrinsics[:, :context_num_int]
-            context_intrinsics = render_intrinsics[:, :context_num_int]
+            continuous_is_context = ~continuous_views["is_target"].bool()
+            context_counts = continuous_is_context.sum(dim=1)
+            if not bool(torch.all(context_counts == context_counts[0]).item()):
+                raise ValueError("NeoVerse preprocessing expects the same number of context views in every batch item.")
+            context_indices = torch.stack(
+                [torch.nonzero(mask, as_tuple=False).flatten() for mask in continuous_is_context],
+                dim=0,
+            ).to(device=render_extrinsics.device, dtype=torch.long)
+            context_extrinsics = self._gather_view_tensor(render_extrinsics, context_indices)
+            context_intrinsics = self._gather_view_tensor(render_intrinsics, context_indices)
         novel_context_poses = self.novel_view_sampling(
             context_extrinsics,
             recon_output["gs_depth"].squeeze(-1),
@@ -580,35 +672,41 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
             occlusion_thresh=self.occlusion_thresh,
         )
 
-        # Define the final target trajectory first, then render directly on it.
-        target_poses = render_extrinsics.clone()
-        target_intrs = render_intrinsics.clone()
-        target_timestamps = render_timestamps.clone()
-        sorted_is_target = None
+        target_poses = self._gather_view_tensor(render_extrinsics, target_indices)
+        target_intrs = self._gather_view_tensor(render_intrinsics, target_indices)
+        target_timestamps = self._gather_view_tensor(render_timestamps.unsqueeze(-1), target_indices).squeeze(-1)
+        source_traj = source_views.get("trajectory_index")
+        if source_traj is None:
+            source_traj_indices = torch.arange(
+                context_num_int,
+                device=render_extrinsics.device,
+                dtype=torch.long,
+            ).unsqueeze(0).expand(render_extrinsics.shape[0], -1)
+        else:
+            if not isinstance(source_traj, torch.Tensor):
+                source_traj = torch.as_tensor(source_traj, device=render_extrinsics.device, dtype=torch.long)
+            source_traj_indices = source_traj[:, :context_num_int].to(device=render_extrinsics.device, dtype=torch.long)
+        source_poses = self._gather_view_tensor(render_extrinsics, source_traj_indices)
+        source_intrs = self._gather_view_tensor(render_intrinsics, source_traj_indices)
+        target_is_target = None
         if (
             isinstance(source_views.get("is_target"), torch.Tensor)
             and source_views["is_target"].shape[:2] == render_timestamps.shape[:2]
         ):
-            sorted_is_target = source_views["is_target"].clone()
+            continuous_is_target = self._gather_view_tensor(source_views["is_target"], continuous_order)
+            target_is_target = self._gather_view_tensor(continuous_is_target, target_indices)
 
-        for b_idx in range(render_timestamps.shape[0]):
-            order_indices = torch.argsort(render_timestamps[b_idx])
-            target_poses[b_idx] = render_extrinsics[b_idx][order_indices]
-            target_intrs[b_idx] = render_intrinsics[b_idx][order_indices]
-            target_timestamps[b_idx] = render_timestamps[b_idx][order_indices]
-            if sorted_is_target is not None:
-                sorted_is_target[b_idx] = sorted_is_target[b_idx][order_indices]
-
-        target_rgb, target_depth, target_alpha = pipe.reconstructor.gs_renderer.rasterizer.forward(
+        rendered_rgb, target_depth, target_alpha = pipe.reconstructor.gs_renderer.rasterizer.forward(
             splats,
             render_viewmats=homo_matrix_inverse(target_poses),   # c2w -> w2c
             render_Ks=target_intrs,
             render_timestamps=target_timestamps,
             sh_degree=0, width=W, height=H,
         )
+        target_rgb = rearrange(target_input_video, "B T C H W -> B T H W C")
         target_mask = target_alpha > self.alpha_thresh
-        if self.mask_non_context_targets and sorted_is_target is not None:
-            target_mask = target_mask.masked_fill(sorted_is_target[:, :, None, None, None].bool(), False)
+        if self.mask_non_context_targets and target_is_target is not None:
+            target_mask = target_mask.masked_fill(target_is_target[:, :, None, None, None].bool(), False)
 
         if input_video is not None:
             if self.color_thresh[0] == self.color_thresh[1]:
@@ -617,7 +715,7 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
                 color_thresh = np.random.uniform(self.color_thresh[0], self.color_thresh[1])
             color_mask = fast_perceptual_color_distance(
                 rearrange(input_video, "B T C H W -> B T H W C"),
-                target_rgb,
+                rendered_rgb,
             ) < color_thresh
             target_mask = target_mask & color_mask.unsqueeze(-1)
         target_mask = target_mask.float()
@@ -642,6 +740,9 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
             "target_mask": target_mask,
             "target_poses": target_poses,
             "target_intrs": target_intrs,
+            "target_timestamps": target_timestamps,
+            "source_poses": source_poses,
+            "source_intrs": source_intrs,
         }
         if "token_list" in recon_output:
             output["reconstructor_token_list"] = recon_output["token_list"]
