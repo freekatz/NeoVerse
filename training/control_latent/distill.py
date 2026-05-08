@@ -685,27 +685,44 @@ def cache_scalar(value):
     return value
 
 
-def frozen_cache_signature(data, cfg):
+FROZEN_CACHE_SIGNATURE_FIELDS = (
+    "video_name",
+    "image_name",
+    "timestamp",
+    "is_target",
+    "scene_idx",
+    "variant_id",
+    "context_strategy",
+    "trajectory_index",
+    "target_trajectory_index",
+    "camera_cache_path",
+    "temporal_augmentation",
+    "temporal_order",
+    "temporal_trajectory_profile",
+    "temporal_trajectory_type",
+)
+
+
+def frozen_cache_view_metadata(data):
     views = []
     for view in data:
-        views.append(
-            {
-                "video_name": cache_scalar(view.get("video_name")),
-                "image_name": cache_scalar(view.get("image_name")),
-                "timestamp": cache_scalar(view.get("timestamp")),
-                "is_target": cache_scalar(view.get("is_target")),
-                "scene_idx": cache_scalar(view.get("scene_idx")),
-                "variant_id": cache_scalar(view.get("variant_id")),
-                "context_strategy": cache_scalar(view.get("context_strategy")),
-                "trajectory_index": cache_scalar(view.get("trajectory_index")),
-                "target_trajectory_index": cache_scalar(view.get("target_trajectory_index")),
-                "camera_cache_path": cache_scalar(view.get("camera_cache_path")),
-                "temporal_augmentation": cache_scalar(view.get("temporal_augmentation")),
-                "temporal_order": cache_scalar(view.get("temporal_order")),
-                "temporal_trajectory_profile": cache_scalar(view.get("temporal_trajectory_profile")),
-                "temporal_trajectory_type": cache_scalar(view.get("temporal_trajectory_type")),
-            }
-        )
+        views.append({key: cache_scalar(view.get(key)) for key in FROZEN_CACHE_SIGNATURE_FIELDS})
+    return views
+
+
+def frozen_cache_dataset_index(data):
+    if not data:
+        return None
+    idx = data[0].get("idx")
+    if isinstance(idx, (list, tuple)) and len(idx) >= 1:
+        return cache_scalar(idx[0])
+    if isinstance(idx, np.ndarray) and idx.size >= 1:
+        return cache_scalar(idx.reshape(-1)[0])
+    return cache_scalar(idx)
+
+
+def frozen_cache_signature(data, cfg):
+    views = frozen_cache_view_metadata(data)
     cfg_signature = {
         "model_path": cfg.get("model_path", None),
         "reconstructor_path": cfg.get("reconstructor_path", None),
@@ -763,6 +780,22 @@ def save_frozen_cache(path, cache, cfg):
     tmp_path = f"{path}.tmp.{os.getpid()}"
     torch.save(payload, tmp_path)
     os.replace(tmp_path, path)
+    sidecar = {
+        key: payload.get(key)
+        for key in (
+            "cache_format_version",
+            "cache_signature",
+            "dataset_index",
+            "signature_views",
+        )
+        if key in payload
+    }
+    if sidecar:
+        json_path = str(Path(path).with_suffix(".json"))
+        json_tmp_path = f"{json_path}.tmp.{os.getpid()}"
+        with open(json_tmp_path, "w") as handle:
+            json.dump(sidecar, handle, indent=2, default=json_default)
+        os.replace(json_tmp_path, json_path)
 
 
 def looks_like_frozen_cache(data):
@@ -1088,6 +1121,10 @@ class ControlLatentDistillModule(torch.nn.Module):
             ).permute(0, 2, 1, 3, 4).contiguous()
 
         cache = {
+            "cache_format_version": 2,
+            "cache_signature": frozen_cache_signature(data, self.cfg),
+            "dataset_index": frozen_cache_dataset_index(data),
+            "signature_views": frozen_cache_view_metadata(data),
             "teacher": teacher.detach(),
             "tokens": token_pack["tokens"].detach(),
             "token_dim": int(token_pack["token_dim"]),

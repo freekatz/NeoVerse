@@ -17,7 +17,8 @@ Stable user paths:
   ./cli cache build-camera [builder args]
   ./cli cache build-frozen [builder args]
   ./cli cache inspect [inspect args]
-  ./cli eval last CONFIG CHECKPOINT [dataset indices...]
+  ./cli eval frozen-cache CONFIG CHECKPOINT [metric args...]
+  ./cli eval last CONFIG CHECKPOINT [dataset indices...]  # legacy visual smoke test
   ./cli volc auth import [AccessKey.txt]
   ./cli volc submit train-cache|build-camera|build-frozen [args]
 
@@ -89,7 +90,13 @@ EOF
 usage_eval() {
   cat <<'EOF'
 Usage:
-  ./cli eval last CONFIG CHECKPOINT [dataset indices...]
+  ./cli eval frozen-cache CONFIG CHECKPOINT [metric args...]
+  ./cli eval val CONFIG CHECKPOINT [metric args...]
+  ./cli eval last CONFIG CHECKPOINT [dataset indices...]  # legacy visual smoke test
+
+Examples:
+  ./cli eval frozen-cache outputs/.../config.yaml outputs/.../adapter_last.pt
+  ./cli eval frozen-cache outputs/.../config.yaml outputs/.../adapter_last.pt --max_samples 8 --modes student
 EOF
 }
 
@@ -286,6 +293,14 @@ eval_last() {
   done
 }
 
+eval_frozen_cache() {
+  if [[ "$#" -lt 2 ]]; then
+    usage_eval >&2
+    exit 2
+  fi
+  "${PYTHON}" tools/eval/evaluate_frozen_cache_metrics.py "$@"
+}
+
 debug_temporal() {
   "${PYTHON}" tools/diagnostics/compare_temporal_trajectories.py "$@"
 }
@@ -408,6 +423,7 @@ dispatch_eval() {
   fi
   case "${subcmd}" in
     help|-h|--help) usage_eval ;;
+    frozen-cache|val|metrics) eval_frozen_cache "$@" ;;
     last) eval_last "$@" ;;
     *) usage_eval >&2; die "Unknown eval command: ${subcmd}" ;;
   esac
