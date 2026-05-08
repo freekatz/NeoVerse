@@ -10,45 +10,85 @@ usage() {
   cat <<'EOF'
 NeoVerse local commands
 
-Usage:
-  ./cli train-online-time [extra OmegaConf overrides...]
-  ./cli train-online-fast [extra OmegaConf overrides...]
-  ./cli build-camera-cache [args for experiments/build_spatialvid_camera_cache.py]
-  ./cli build-frozen-cache [args for experiments/build_spatialvid_frozen_cache.py]
-  ./cli compare-temporal [args for experiments/compare_temporal_trajectories.py]
-  ./cli eval-last CONFIG CHECKPOINT [dataset indices...]
+Primary commands:
+  ./cli train online [extra OmegaConf overrides...]
+  ./cli train cache [extra OmegaConf overrides...]
+  ./cli train fast [extra OmegaConf overrides...]
+  ./cli cache build-camera [builder args]
+  ./cli cache build-frozen [builder args]
+  ./cli cache inspect [args]
+  ./cli eval last CONFIG CHECKPOINT [dataset indices...]
+  ./cli debug temporal [args]
+
+Legacy aliases still work:
+  ./cli train-online-time
+  ./cli train-online-fast
+  ./cli build-camera-cache
+  ./cli build-frozen-cache
+  ./cli compare-temporal
+  ./cli eval-last
   ./cli dry-run-time
-
-Training presets:
-  train-online-time  Online distillation with temporal augmentation enabled.
-                     Default profile is forward_pause.
-                     Override with TEMPORAL_TRAJECTORY_PROFILE=mixed_fzr for stronger F/Z/R/backward control.
-
-  train-online-fast  Previous online_fast_gtcam-style run without temporal augmentation.
-
-  compare-temporal  Defaults to --reconstruct_from all so forward=F:81 checks all-input replay.
-                    Use --reconstruct_from context for training-teacher-like sparse-context rendering.
-
-  build-camera-cache  Builds fixed 81-frame clip camera caches. Supports GPU_LIST
-                      sharding like training. Train with CAMERA_CACHE_DIR=<same output_dir>
-                      CAMERA_CACHE_REQUIRED=true.
-
-  build-frozen-cache  Builds fixed clip + fixed trajectory frozen caches. Train with
-                      USE_FROZEN_CACHE=1 or FROZEN_CACHE_DIR=<cache_dir> to sample
-                      those .pt cache files directly.
 
 Useful env overrides:
   GPU_LIST=0,1
-  RUN_NAME=online_time_forward_pause
+  RUN_NAME=train_cache
   MAX_STEPS=200000
   DATA_ROOT=data/SpatialVID_full
-  FIXED_CLIPS_PER_SCENE=16
+  FROZEN_CACHE_DIR=outputs/NeoVerseControlLatentDistill/frozen_cache
   CAMERA_CACHE_DIR=outputs/NeoVerseControlLatentDistill/camera_cache
+  FIXED_CLIPS_PER_SCENE=16
   TRAJECTORIES_PER_CLIP=8|16
-  TEMPORAL_VARIANT_PROFILE_WEIGHTS=forward_pause:0.5,mixed_fzr:0.4,backward:0.1
-  TEMPORAL_TRAJECTORY_PROFILE=forward_pause|mixed_fzr
+  FROZEN_CACHE_EVAL_RATIO=0.05
+  EVAL_FREQ=500
   DRY_RUN=1
 EOF
+}
+
+usage_train() {
+  cat <<'EOF'
+Usage:
+  ./cli train online [extra OmegaConf overrides...]
+  ./cli train cache [extra OmegaConf overrides...]
+  ./cli train fast [extra OmegaConf overrides...]
+
+Commands:
+  online  Online SpatialVID training with temporal augmentation enabled.
+  cache   Train directly from frozen_cache/*.pt with deterministic train/eval split.
+  fast    Previous online_fast_gtcam-style run without temporal augmentation.
+EOF
+}
+
+usage_cache() {
+  cat <<'EOF'
+Usage:
+  ./cli cache build-camera [builder args]
+  ./cli cache build-frozen [builder args]
+  ./cli cache inspect [--cache_dir DIR] [--eval_ratio RATIO] [--sample N]
+
+Commands:
+  build-camera  Build fixed 81-frame camera caches.
+  build-frozen  Build fixed clip + trajectory frozen forward caches.
+  inspect       Report cache count, size, and deterministic train/eval split.
+EOF
+}
+
+usage_eval() {
+  cat <<'EOF'
+Usage:
+  ./cli eval last CONFIG CHECKPOINT [dataset indices...]
+EOF
+}
+
+usage_debug() {
+  cat <<'EOF'
+Usage:
+  ./cli debug temporal [args for compare_temporal_trajectories.py]
+EOF
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 2
 }
 
 common_online_env() {
@@ -66,7 +106,7 @@ common_online_env() {
   export REUSE_CONTEXT_FORWARD_TOKENS="${REUSE_CONTEXT_FORWARD_TOKENS:-true}"
 }
 
-train_online_time() {
+train_online() {
   common_online_env
   export RUN_NAME="${RUN_NAME:-online_time_forward_pause}"
   export TEMPORAL_AUGMENTATION="${TEMPORAL_AUGMENTATION:-true}"
@@ -78,30 +118,45 @@ train_online_time() {
   bash scripts/train_distill_control_latent_online.sh "$@"
 }
 
-train_online_fast() {
+train_fast() {
   common_online_env
   export RUN_NAME="${RUN_NAME:-online_fast_gtcam}"
   export TEMPORAL_AUGMENTATION="${TEMPORAL_AUGMENTATION:-false}"
   bash scripts/train_distill_control_latent_online.sh "$@"
 }
 
-compare_temporal() {
+train_cache() {
+  common_online_env
+  export RUN_NAME="${RUN_NAME:-train_cache}"
+  export USE_FROZEN_CACHE="${USE_FROZEN_CACHE:-1}"
+  export TRAIN_FROM_FROZEN_CACHE="${TRAIN_FROM_FROZEN_CACHE:-true}"
+  export FROZEN_CACHE_SPLIT="${FROZEN_CACHE_SPLIT:-train}"
+  export PRELOAD_FROZEN_CACHE="${PRELOAD_FROZEN_CACHE:-false}"
+  export CACHE_FROZEN_OUTPUTS="${CACHE_FROZEN_OUTPUTS:-false}"
+  bash scripts/train_distill_control_latent_online.sh "$@"
+}
+
+debug_temporal() {
   "${PYTHON}" experiments/compare_temporal_trajectories.py "$@"
 }
 
-build_camera_cache() {
+cache_build_camera() {
   export GPU_LIST="${GPU_LIST:-0,1}"
   bash scripts/build_spatialvid_camera_cache.sh "$@"
 }
 
-build_frozen_cache() {
+cache_build_frozen() {
   export GPU_LIST="${GPU_LIST:-0,1}"
   bash scripts/build_spatialvid_frozen_cache.sh "$@"
 }
 
+cache_inspect() {
+  "${PYTHON}" tools/cache/inspect_cache.py "$@"
+}
+
 eval_last() {
   if [[ "$#" -lt 2 ]]; then
-    echo "Usage: ./cli eval-last CONFIG CHECKPOINT [dataset indices...]" >&2
+    echo "Usage: ./cli eval last CONFIG CHECKPOINT [dataset indices...]" >&2
     exit 2
   fi
   local config="$1"
@@ -122,6 +177,94 @@ eval_last() {
   done
 }
 
+dispatch_train() {
+  local subcmd="${1:-help}"
+  if [[ "$#" -gt 0 ]]; then
+    shift
+  fi
+  case "${subcmd}" in
+    help|-h|--help)
+      usage_train
+      ;;
+    online|online-time|time)
+      train_online "$@"
+      ;;
+    cache|frozen-cache)
+      train_cache "$@"
+      ;;
+    fast|online-fast)
+      train_fast "$@"
+      ;;
+    *)
+      usage_train >&2
+      die "Unknown train command: ${subcmd}"
+      ;;
+  esac
+}
+
+dispatch_cache() {
+  local subcmd="${1:-help}"
+  if [[ "$#" -gt 0 ]]; then
+    shift
+  fi
+  case "${subcmd}" in
+    help|-h|--help)
+      usage_cache
+      ;;
+    build-camera|camera)
+      cache_build_camera "$@"
+      ;;
+    build-frozen|frozen)
+      cache_build_frozen "$@"
+      ;;
+    inspect|status)
+      cache_inspect "$@"
+      ;;
+    *)
+      usage_cache >&2
+      die "Unknown cache command: ${subcmd}"
+      ;;
+  esac
+}
+
+dispatch_eval() {
+  local subcmd="${1:-help}"
+  if [[ "$#" -gt 0 ]]; then
+    shift
+  fi
+  case "${subcmd}" in
+    help|-h|--help)
+      usage_eval
+      ;;
+    last)
+      eval_last "$@"
+      ;;
+    *)
+      usage_eval >&2
+      die "Unknown eval command: ${subcmd}"
+      ;;
+  esac
+}
+
+dispatch_debug() {
+  local subcmd="${1:-help}"
+  if [[ "$#" -gt 0 ]]; then
+    shift
+  fi
+  case "${subcmd}" in
+    help|-h|--help)
+      usage_debug
+      ;;
+    temporal)
+      debug_temporal "$@"
+      ;;
+    *)
+      usage_debug >&2
+      die "Unknown debug command: ${subcmd}"
+      ;;
+  esac
+}
+
 cmd="${1:-help}"
 if [[ "$#" -gt 0 ]]; then
   shift
@@ -131,23 +274,35 @@ case "${cmd}" in
   help|-h|--help)
     usage
     ;;
+  train)
+    dispatch_train "$@"
+    ;;
+  cache)
+    dispatch_cache "$@"
+    ;;
+  eval)
+    dispatch_eval "$@"
+    ;;
+  debug)
+    dispatch_debug "$@"
+    ;;
   train-online-time)
-    train_online_time "$@"
+    train_online "$@"
     ;;
   train-online-fast)
-    train_online_fast "$@"
+    train_fast "$@"
     ;;
   dry-run-time)
-    DRY_RUN=1 train_online_time "$@"
+    DRY_RUN=1 train_online "$@"
     ;;
   compare-temporal)
-    compare_temporal "$@"
+    debug_temporal "$@"
     ;;
   build-camera-cache)
-    build_camera_cache "$@"
+    cache_build_camera "$@"
     ;;
   build-frozen-cache)
-    build_frozen_cache "$@"
+    cache_build_frozen "$@"
     ;;
   eval-last)
     eval_last "$@"
