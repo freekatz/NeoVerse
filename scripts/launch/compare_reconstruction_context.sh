@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # Usage examples:
-#   bash scripts/compare_reconstruction_context.sh
-#   DATASET_INDEX=3 NUM_CONTEXT_VIEWS=20 bash scripts/compare_reconstruction_context.sh
-#   USE_CAMERA_ANNOTATIONS=true DATASET_INDEX=0 bash scripts/compare_reconstruction_context.sh
+#   bash scripts/launch/compare_reconstruction_context.sh
+#   DATASET_INDEX=3 NUM_CONTEXT_VIEWS=20 bash scripts/launch/compare_reconstruction_context.sh
+#   USE_CAMERA_ANNOTATIONS=true DATASET_INDEX=0 bash scripts/launch/compare_reconstruction_context.sh
 
 timestamp_utc() {
   date -u "+%Y%m%d_%H%M%S"
@@ -20,7 +20,7 @@ die() {
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CODE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+CODE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 VENV_PATH="${VENV_PATH:-/root/vepfs/envs/neoverse}"
 ENV_PYTHON="${ENV_PYTHON:-${VENV_PATH}/bin/python}"
@@ -52,7 +52,7 @@ export PYTHONPATH="${CODE_DIR}:${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
 cmd=(
-  "${ENV_PYTHON}" experiments/compare_reconstruction_context.py
+  "${ENV_PYTHON}" tools/diagnostics/compare_reconstruction_context.py
   --config "${CONFIG}"
   --output_dir "${OUTPUT_DIR}"
   --dataset_index "${DATASET_INDEX}"

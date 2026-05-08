@@ -1,9 +1,14 @@
 import argparse
 import json
 import os
+import sys
 
 import torch
 from omegaconf import OmegaConf
+
+CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if CODE_DIR not in sys.path:
+    sys.path.insert(0, CODE_DIR)
 
 try:
     from .compare_reconstruction_context import (
@@ -30,7 +35,7 @@ except ImportError:
         timestamp_order,
     )
 from diffsynth.data import save_video
-from training.data.datasets.spatialvid import SpatialVID
+from train_distill_control_latent import build_spatialvid_dataset
 
 
 def make_local_yaw_turnback(poses, max_degrees=180.0):
@@ -112,7 +117,7 @@ def main():
     )
     pipe.eval()
 
-    dataset = eval(cfg.train_dataset)
+    dataset = build_spatialvid_dataset(cfg)
     source_views = dataset[int(args.dataset_index)]
     batched = batch_dataset_views(source_views, pipe.device)
 

@@ -10,7 +10,7 @@ import torch
 from omegaconf import OmegaConf
 from PIL import Image, ImageDraw
 
-CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
@@ -19,7 +19,7 @@ from diffsynth.models import ModelManager
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
 from diffsynth.utils import ModelConfig
 from diffsynth.utils.auxiliary import homo_matrix_inverse
-from training.data.datasets.spatialvid import SpatialVID
+from train_distill_control_latent import build_spatialvid_dataset
 
 
 CAMERA_KEYS = {"camera_poses", "camera_intrs"}
@@ -675,7 +675,7 @@ def main():
     pipe = load_reconstructor_pipeline(cfg, device=device, enable_vram_management=args.enable_vram_management)
     pipe.eval()
 
-    dataset = eval(cfg.train_dataset)
+    dataset = build_spatialvid_dataset(cfg)
     sample_metrics = []
     sample_dirs = []
     for index in parse_indices(args.dataset_indices):

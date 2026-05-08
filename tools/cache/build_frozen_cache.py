@@ -8,7 +8,7 @@ from omegaconf import OmegaConf
 from torch.utils.data._utils.collate import default_collate
 from tqdm import tqdm
 
-CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
@@ -190,7 +190,7 @@ def main():
     OmegaConf.save(cfg, os.path.join(cfg.output_path, f"config_shard{args.shard_index}.yaml"))
 
     device = torch.device(args.device if torch.cuda.is_available() or str(args.device) == "cpu" else "cpu")
-    dataset = eval(cfg.train_dataset, vars(train_mod))
+    dataset = train_mod.build_spatialvid_dataset(cfg)
     model = None
 
     total = len(dataset) if args.limit is None else min(len(dataset), int(args.limit))

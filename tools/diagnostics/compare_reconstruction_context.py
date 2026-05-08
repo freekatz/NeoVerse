@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import sys
 from copy import deepcopy
 
 import numpy as np
@@ -8,12 +9,16 @@ import torch
 from omegaconf import OmegaConf
 from PIL import Image, ImageDraw
 
+CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if CODE_DIR not in sys.path:
+    sys.path.insert(0, CODE_DIR)
+
 from diffsynth.data import save_video
 from diffsynth.models import ModelManager
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
 from diffsynth.utils import ModelConfig
 from diffsynth.utils.auxiliary import homo_matrix_inverse
-from training.data.datasets.spatialvid import SpatialVID
+from train_distill_control_latent import build_spatialvid_dataset
 
 
 def zero_drop_probs(pipeline_kwargs):
@@ -362,7 +367,7 @@ def main():
     )
     pipe.eval()
 
-    dataset = eval(cfg.train_dataset)
+    dataset = build_spatialvid_dataset(cfg)
     source_views = dataset[int(args.dataset_index)]
     batched = batch_dataset_views(source_views, pipe.device)
 

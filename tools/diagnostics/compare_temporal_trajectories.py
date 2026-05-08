@@ -9,13 +9,13 @@ from datetime import datetime
 import torch
 from omegaconf import OmegaConf
 
-CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
 from diffsynth.data import save_video
 from diffsynth.utils.auxiliary import homo_matrix_inverse
-from experiments.compare_camera_annotation_modes import (
+from tools.diagnostics.compare_camera_annotation_modes import (
     batch_dataset_views,
     drop_camera_annotations,
     load_reconstructor_pipeline,
@@ -69,7 +69,7 @@ def reorder_views_by_timestamp(views):
         return views
     order = torch.argsort(timestamps, dim=1)
     if order.shape[0] != 1:
-        raise ValueError("compare-temporal currently expects batch size 1 for timestamp reordering.")
+        raise ValueError("debug temporal currently expects batch size 1 for timestamp reordering.")
     index = order[0].to(device=timestamps.device)
     num_views = timestamps.shape[1]
     reordered = {}

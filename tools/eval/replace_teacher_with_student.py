@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 import numpy as np
 from copy import deepcopy
 
@@ -9,11 +10,16 @@ from omegaconf import OmegaConf
 from PIL import Image, ImageDraw
 from tqdm import tqdm
 
+CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if CODE_DIR not in sys.path:
+    sys.path.insert(0, CODE_DIR)
+
 from diffsynth.data import save_video
 from diffsynth.utils.auxiliary import homo_matrix_inverse
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline, model_fn_wan_video
 from hooks.extract_vggt_tokens import extract_vggt_tokens
 from train_distill_control_latent import (
+    build_spatialvid_dataset,
     build_adapter,
     extract_source_times,
     extract_target_times,
@@ -22,7 +28,6 @@ from train_distill_control_latent import (
     continuous_view_order_indices,
     target_trajectory_indices,
 )
-from training.data.datasets.spatialvid import SpatialVID
 
 
 def zero_drop_probs(pipeline_kwargs):
@@ -476,7 +481,10 @@ def save_eval_condition_videos(output_dir, render_conditions, camera_embed=None,
     source_frames = _tensor_to_pil_video(source_video)
     saved_frames["input_source_views"] = source_frames
     save_video(source_frames, os.path.join(output_dir, "input_source_views.mp4"), fps=fps)
-    gt_81_frames = _source_timeline_video(views, source_video, render_conditions["target_timestamps"])
+    if isinstance(render_conditions.get("gt_target_rgb"), torch.Tensor):
+        gt_81_frames = _tensor_to_pil_video(render_conditions["gt_target_rgb"][0].detach().float().cpu().clamp(0, 1))
+    else:
+        gt_81_frames = _source_timeline_video(views, source_video, render_conditions["target_timestamps"])
     saved_frames["gt_81_sorted"] = gt_81_frames
     save_video(gt_81_frames, os.path.join(output_dir, "gt_81_sorted.mp4"), fps=fps)
 
@@ -542,17 +550,8 @@ def build_render_conditions(pipe, source_views, args, cfg):
     )
     if has_gt_cameras:
         recon_views, context_num = slice_context_views(views)
-    else:
-        order = continuous_view_order_indices(views, device=views["img"].device)
-        if order is None or order.shape != views["timestamp"].shape:
-            order = torch.argsort(views["timestamp"], dim=1)
-        recon_views = gather_views(views, order)
-        if isinstance(recon_views.get("is_target"), torch.Tensor):
-            recon_views["is_target"] = torch.zeros_like(recon_views["is_target"])
-        context_num = int((~views["is_target"][0].bool()).sum().item()) if isinstance(views.get("is_target"), torch.Tensor) else views["img"].shape[1]
-    with torch.amp.autocast("cuda", dtype=pipe.torch_dtype, enabled=str(pipe.device).startswith("cuda")):
-        predictions = pipe.reconstructor(recon_views, is_inference=False)
-    if has_gt_cameras:
+        with torch.amp.autocast("cuda", dtype=pipe.torch_dtype, enabled=str(pipe.device).startswith("cuda")):
+            predictions = pipe.reconstructor(recon_views, is_inference=False)
         order = continuous_view_order_indices(views, device=views["img"].device)
         if order is None or order.shape != views["timestamp"].shape:
             order = torch.argsort(views["timestamp"], dim=1)
@@ -561,16 +560,36 @@ def build_render_conditions(pipe, source_views, args, cfg):
         render_intrs = continuous_views["camera_intrs"]
         render_timestamps = continuous_views["timestamp"]
     else:
-        render_poses = predictions["rendered_extrinsics"]
-        render_intrs = predictions["rendered_intrinsics"]
-        render_timestamps = predictions["rendered_timestamps"]
+        order = continuous_view_order_indices(views, device=views["img"].device)
+        if order is None or order.shape != views["timestamp"].shape:
+            order = torch.argsort(views["timestamp"], dim=1)
+        camera_oracle_views = gather_views(views, order)
+        if isinstance(camera_oracle_views.get("is_target"), torch.Tensor):
+            camera_oracle_views["is_target"] = torch.zeros_like(camera_oracle_views["is_target"])
+        with torch.amp.autocast("cuda", dtype=pipe.torch_dtype, enabled=str(pipe.device).startswith("cuda")):
+            camera_predictions = pipe.reconstructor(camera_oracle_views, is_inference=False)
+        render_poses = camera_predictions["rendered_extrinsics"].detach()
+        render_intrs = camera_predictions["rendered_intrinsics"].detach()
+        render_timestamps = camera_predictions["rendered_timestamps"].detach()
+        del camera_predictions
+        if str(pipe.device).startswith("cuda"):
+            torch.cuda.empty_cache()
+        recon_views, context_num = slice_context_views(views)
+        context_num = int((~views["is_target"][0].bool()).sum().item()) if isinstance(views.get("is_target"), torch.Tensor) else views["img"].shape[1]
+        with torch.amp.autocast("cuda", dtype=pipe.torch_dtype, enabled=str(pipe.device).startswith("cuda")):
+            predictions = pipe.reconstructor(recon_views, is_inference=False)
+    print(
+        "Render condition mode: "
+        f"{'gt_camera_context_splats' if has_gt_cameras else 'camera_oracle_context_splats'}; "
+        f"context_views={context_num}; target_views={int(views['img'].shape[1])}"
+    )
     temporal_conditions = build_temporal_target_conditions(
         views,
         render_poses,
         render_intrs,
         render_timestamps,
     )
-    _, target_depth, target_alpha = pipe.reconstructor.gs_renderer.rasterizer.forward(
+    rendered_rgb, target_depth, target_alpha = pipe.reconstructor.gs_renderer.rasterizer.forward(
         predictions["splats"],
         render_viewmats=homo_matrix_inverse(temporal_conditions["target_poses"]),
         render_Ks=temporal_conditions["target_intrs"],
@@ -585,7 +604,8 @@ def build_render_conditions(pipe, source_views, args, cfg):
         target_mask = target_mask.masked_fill(temporal_conditions["target_is_target"][:, :, None, None, None].bool(), 0)
     return {
         "source_views": views,
-        "target_rgb": temporal_conditions["target_rgb"],
+        "target_rgb": rendered_rgb,
+        "gt_target_rgb": temporal_conditions["target_rgb"],
         "target_depth": target_depth,
         "target_mask": target_mask,
         "target_poses": temporal_conditions["target_poses"],
@@ -824,7 +844,7 @@ def main():
     pipe.eval()
     adapter = load_adapter(pipe, cfg, args.checkpoint, pipe.device) if "student" in requested_modes else None
 
-    dataset = eval(cfg.train_dataset)
+    dataset = build_spatialvid_dataset(cfg)
     source_views = dataset[int(args.dataset_index)]
     prompt = source_views[0]["prompt"]
     render_conditions = build_render_conditions(pipe, source_views, args, cfg)

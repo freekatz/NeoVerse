@@ -2,13 +2,13 @@
 set -euo pipefail
 
 # Usage examples:
-#   DRY_RUN=1 bash scripts/train_distill_control_latent.sh
-#   RUN_NAME=neoverse_distill_v1 bash scripts/train_distill_control_latent.sh
-#   GPU_LIST=0,1 RUN_NAME=neoverse_distill_v1 bash scripts/train_distill_control_latent.sh
-#   LAUNCH_MODE=background RUN_NAME=neoverse_distill_v1 bash scripts/train_distill_control_latent.sh
-#   ADAPTER_TYPE=conv RUN_NAME=neoverse_distill_conv bash scripts/train_distill_control_latent.sh
+#   DRY_RUN=1 bash scripts/launch/train_distill.sh
+#   RUN_NAME=neoverse_distill_v1 bash scripts/launch/train_distill.sh
+#   GPU_LIST=0,1 RUN_NAME=neoverse_distill_v1 bash scripts/launch/train_distill.sh
+#   LAUNCH_MODE=background RUN_NAME=neoverse_distill_v1 bash scripts/launch/train_distill.sh
+#   ADAPTER_TYPE=conv RUN_NAME=neoverse_distill_conv bash scripts/launch/train_distill.sh
 #   On Volcengine/MLP with MLP_* env vars already set:
-#     RUN_NAME=neoverse_distill_v1 bash scripts/train_distill_control_latent.sh
+#     RUN_NAME=neoverse_distill_v1 bash scripts/launch/train_distill.sh
 
 timestamp_utc() {
   date -u "+%Y%m%d_%H%M%S"
@@ -31,12 +31,11 @@ run_cmd() {
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CODE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+CODE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 MODE="${MODE:-train}"
 LAUNCH_MODE="${LAUNCH_MODE:-foreground}"
 DRY_RUN="${DRY_RUN:-0}"
-FAST_FROZEN_CACHE="${FAST_FROZEN_CACHE:-1}"
 
 VENV_PATH="${VENV_PATH:-/root/vepfs/envs/neoverse}"
 ENV_PYTHON="${ENV_PYTHON:-${VENV_PATH}/bin/python}"
@@ -67,9 +66,9 @@ TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
 
-# Default distillation student is the cross-attention RoPE adapter. Override with
-# ADAPTER_TYPE=conv to use the older convolutional adapter.
-ADAPTER_TYPE="${ADAPTER_TYPE:-cross_attention_rope}"
+# Adapter defaults live in configs/distill_control_latent.yaml. Set
+# ADAPTER_TYPE=conv or ADAPTER_TYPE=cross_attention_rope to override per run.
+ADAPTER_TYPE="${ADAPTER_TYPE:-}"
 
 LAUNCHER="${LAUNCHER:-accelerate}"
 USE_DISTRIBUTED="${USE_DISTRIBUTED:-auto}"
@@ -180,11 +179,6 @@ GLOBAL_NUM_PROCESSES=$((DIST_NPROC_PER_NODE * DIST_NNODES))
 MAX_STEPS_VALUE="${MAX_STEPS:-200000}"
 NUM_EPOCHS_VALUE="${NUM_EPOCHS:-${MAX_STEPS_VALUE}}"
 TRAJECTORIES_PER_CLIP_VALUE="${TRAJECTORIES_PER_CLIP:-${VARIANTS_PER_SCENE:-1}}"
-CUDA_PRELOAD_MIN_PROCESSES="${CUDA_PRELOAD_MIN_PROCESSES:-8}"
-DEFAULT_PRELOAD_FROZEN_CACHE_DEVICE="${PRELOAD_FROZEN_CACHE_DEVICE:-cpu}"
-if [[ -z "${PRELOAD_FROZEN_CACHE_DEVICE:-}" && "${GLOBAL_NUM_PROCESSES}" -ge "${CUDA_PRELOAD_MIN_PROCESSES}" ]]; then
-  DEFAULT_PRELOAD_FROZEN_CACHE_DEVICE="cuda"
-fi
 
 TRAIN_OVERRIDES=(
   "output_path=${OUTPUT_PATH}"
@@ -207,22 +201,6 @@ TRAIN_OVERRIDES=(
   "max_steps=${MAX_STEPS_VALUE}"
   "num_epochs=${NUM_EPOCHS_VALUE}"
 )
-
-if [[ "${FAST_FROZEN_CACHE}" == "1" ]]; then
-  FROZEN_CACHE_DIR="${FROZEN_CACHE_DIR:-${CODE_DIR}/outputs/${PROJECT_NAME}/frozen_cache}"
-  TRAIN_OVERRIDES+=(
-    "frozen_cache_dir=${FROZEN_CACHE_DIR}"
-    "frozen_cache_read=${FROZEN_CACHE_READ:-true}"
-    "frozen_cache_write=${FROZEN_CACHE_WRITE:-true}"
-    "preload_frozen_cache=${PRELOAD_FROZEN_CACHE:-true}"
-    "preload_frozen_cache_device=${DEFAULT_PRELOAD_FROZEN_CACHE_DEVICE}"
-    "preload_frozen_cache_batch_size=${PRELOAD_FROZEN_CACHE_BATCH_SIZE:-1}"
-    "save_optimizer_intermediate=${SAVE_OPTIMIZER_INTERMEDIATE:-false}"
-  )
-  if [[ -z "${SEED:-}" ]]; then
-    TRAIN_OVERRIDES+=("seed=1")
-  fi
-fi
 
 append_override_if_set() {
   local env_name="$1"
@@ -296,9 +274,7 @@ append_override_if_set "CROSS_REROPE_INTERVAL" "adapter.rerope_interval"
 append_override_if_set "CROSS_POST_NUM_RES_BLOCKS" "adapter.post_num_res_blocks"
 append_override_if_set "CACHE_TRAIN_BATCH" "cache_train_batch"
 append_override_if_set "CACHE_FROZEN_OUTPUTS" "cache_frozen_outputs"
-if [[ "${FAST_FROZEN_CACHE}" != "1" ]]; then
-  append_override_if_set "FROZEN_CACHE_DIR" "frozen_cache_dir"
-fi
+append_override_if_set "FROZEN_CACHE_DIR" "frozen_cache_dir"
 append_override_if_set "TRAIN_FROM_FROZEN_CACHE" "train_from_frozen_cache"
 append_override_if_set "FROZEN_CACHE_PATTERN" "frozen_cache_pattern"
 append_override_if_set "FROZEN_CACHE_SPLIT" "frozen_cache_split"
@@ -325,7 +301,6 @@ cat > "${CONFIG_FILE}" <<EOF
 MODE=${MODE}
 LAUNCH_MODE=${LAUNCH_MODE}
 DRY_RUN=${DRY_RUN}
-FAST_FROZEN_CACHE=${FAST_FROZEN_CACHE}
 CODE_DIR=${CODE_DIR}
 VENV_PATH=${VENV_PATH}
 ENV_PYTHON=${ENV_PYTHON}
@@ -341,8 +316,6 @@ FROZEN_CACHE_REQUIRED=${FROZEN_CACHE_REQUIRED:-}
 FROZEN_CACHE_SPLIT=${FROZEN_CACHE_SPLIT:-}
 FROZEN_CACHE_EVAL_RATIO=${FROZEN_CACHE_EVAL_RATIO:-}
 FROZEN_CACHE_SPLIT_SEED=${FROZEN_CACHE_SPLIT_SEED:-}
-DEFAULT_PRELOAD_FROZEN_CACHE_DEVICE=${DEFAULT_PRELOAD_FROZEN_CACHE_DEVICE}
-CUDA_PRELOAD_MIN_PROCESSES=${CUDA_PRELOAD_MIN_PROCESSES}
 LOG_DIR=${LOG_DIR}
 LOG_FILE=${LOG_FILE}
 PID_FILE=${PID_FILE}
@@ -398,7 +371,6 @@ log "dist_nnodes=${DIST_NNODES}"
 log "dist_node_rank=${DIST_NODE_RANK}"
 log "dist_master_addr=${DIST_MASTER_ADDR}"
 log "dist_master_port=${DIST_MASTER_PORT}"
-log "default_preload_frozen_cache_device=${DEFAULT_PRELOAD_FROZEN_CACHE_DEVICE}"
 log "default_overrides=${TRAIN_OVERRIDES[*]}"
 log "extra_overrides=$*"
 log "config_file=${CONFIG_FILE}"
@@ -413,8 +385,8 @@ run_cmd "${ENV_PYTHON}" -m py_compile \
   training/data/base_dataset.py \
   training/data/datasets/spatialvid.py \
   training/data/temporal_trajectory.py \
-  experiments/build_spatialvid_camera_cache.py \
-  experiments/build_spatialvid_frozen_cache.py
+  tools/cache/build_camera_cache.py \
+  tools/cache/build_frozen_cache.py
 
 launch_cmd=(
   "${ACCELERATE}" launch

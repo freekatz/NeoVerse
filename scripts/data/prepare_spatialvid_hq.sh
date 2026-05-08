@@ -15,10 +15,10 @@ set -euo pipefail
 # Usage:
 #   SOURCE_ROOT=/root/tos/cmh/datasets/SpatialVID-HQ \
 #   DEST_ROOT=/root/vepfs/diffsynth-dev/papers/neoverse/code/data/SpatialVID_full \
-#   bash scripts/prepare_spatialvid_hq.sh
+#   bash scripts/data/prepare_spatialvid_hq.sh
 #
 # If one archive is known bad and you want to continue without that group:
-#   SKIP_BAD_ARCHIVES=1 bash scripts/prepare_spatialvid_hq.sh
+#   SKIP_BAD_ARCHIVES=1 bash scripts/data/prepare_spatialvid_hq.sh
 
 timestamp_utc() {
   date -u "+%Y-%m-%dT%H:%M:%SZ"
@@ -41,7 +41,7 @@ run_cmd() {
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CODE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+CODE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 SOURCE_ROOT="${SOURCE_ROOT:-/root/tos/cmh/datasets/SpatialVID-HQ}"
 DEST_ROOT="${DEST_ROOT:-${CODE_DIR}/data/SpatialVID_full}"

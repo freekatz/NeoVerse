@@ -8,20 +8,20 @@
 - `diffsynth/models/student_adapters.py`：包含 `ConvAdapter` baseline 和 `CrossAttentionRoPEAdapter` ablation，默认输出早期 condition embedding。
 - `train_distill_control_latent.py`：teacher-student latent distillation 训练入口。
 - `configs/distill_control_latent.yaml`：默认训练配置。
-- `eval_replace_teacher_with_student.py`：用 student `c` 替换 teacher `c`，再经过 frozen control blocks 生成 hints 并跑 generation 对比。
+- `tools/eval/replace_teacher_with_student.py`：用 student `c` 替换 teacher `c`，再经过 frozen control blocks 生成 hints 并跑 generation 对比。
 
 ## 训练
 
 在 `code/` 目录下运行：
 
 ```bash
-accelerate launch train_distill_control_latent.py configs/distill_control_latent.yaml
+./cli train cache
 ```
 
-`configs/distill_control_latent.yaml` 是唯一默认配置，默认 `max_steps: 20000`。正式长训请运行：
+`configs/distill_control_latent.yaml` 是唯一默认配置，默认 `max_steps: 20000`。如果要跑在线训练而不是 frozen cache：
 
 ```bash
-bash scripts/train_distill_control_latent.sh
+./cli train online
 ```
 
 脚本会把每次运行写到 `outputs/NeoVerseControlLatentDistill/YYYY-MM-DD/HH-MM-SS/`，日志写到该目录下的 `logs/`，并启用 `auto_resume: true`；如果显式设置 `OUTPUT_PATH` 指向已有 run 目录，且其中已有 `adapter_last.pt`，会自动恢复 adapter 和 optimizer。
@@ -29,10 +29,10 @@ bash scripts/train_distill_control_latent.sh
 临时 smoke test 不需要单独配置文件，直接用命令行覆盖：
 
 ```bash
-accelerate launch train_distill_control_latent.py configs/distill_control_latent.yaml max_steps=1 num_workers=0 output_path=outputs/tmp/distill_smoke
+MAX_STEPS=1 NUM_WORKERS=0 RUN_NAME=distill_smoke ./cli train cache
 ```
 
-默认配置使用卷积版 adapter。若更换 reconstructor 或 backbone preset，需要检查配置中的 `token.token_dim` 和 `token.token_groups`。当前仓库自带的 NeoVerse `reconstructor.ckpt` 会被识别为 WorldMirror，预期为：
+默认配置使用 cross-attention + RoPE adapter。若要切回卷积版，运行时加 `ADAPTER_TYPE=conv`。更换 reconstructor 或 backbone preset 时，需要检查配置中的 `token.token_dim` 和 `token.token_groups`。当前仓库自带的 NeoVerse `reconstructor.ckpt` 会被识别为 WorldMirror，预期为：
 
 - `token_dim: 2048`
 - `token_groups: 5`
@@ -49,7 +49,7 @@ accelerate launch train_distill_control_latent.py configs/distill_control_latent
 在 `code/` 目录下运行：
 
 ```bash
-python eval_replace_teacher_with_student.py \
+python tools/eval/replace_teacher_with_student.py \
   configs/distill_control_latent.yaml \
   outputs/NeoVerseControlLatentDistill/YYYY-MM-DD/HH-MM-SS/adapter_last.pt \
   --output_dir outputs/distill_eval \
@@ -78,14 +78,13 @@ python eval_replace_teacher_with_student.py \
 
 ## 常见改动
 
-切换到 cross-attention + RoPE adapter 时，在配置中把：
+切换到卷积 adapter 时，运行：
 
-```yaml
-adapter:
-  type: cross_attention_rope
+```bash
+ADAPTER_TYPE=conv ./cli train cache
 ```
 
-并按显存情况调整：
+cross-attention + RoPE adapter 是默认值，显存不够时优先调：
 
 - `source_pool_hw`
 - `max_source_tokens`

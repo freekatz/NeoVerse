@@ -15,13 +15,14 @@ train_distill_control_latent.py
 ```text
 configs/distill_control_latent.yaml
 train_distill_control_latent.py
-eval_replace_teacher_with_student.py
-experiments/compare_reconstruction_context.py
+cli
+tools/eval/replace_teacher_with_student.py
+tools/diagnostics/compare_reconstruction_context.py
 README_distill_adapter.md
-scripts/train_distill_control_latent.sh
-scripts/overfit_conv_gpu0.sh
-scripts/overfit_cross_gpu1.sh
-scripts/compare_reconstruction_context.sh
+scripts/launch/train_distill.sh
+scripts/overfit/conv_gpu0.sh
+scripts/overfit/cross_gpu1.sh
+scripts/launch/compare_reconstruction_context.sh
 hooks/extract_vggt_tokens.py
 diffsynth/models/student_adapters.py
 ```
@@ -32,11 +33,12 @@ diffsynth/models/student_adapters.py
 | --- | --- |
 | `train_distill_control_latent.py` | 蒸馏训练主入口。冻结 NeoVerse reconstructor、VAE、control branch，只训练 student adapter。 |
 | `configs/distill_control_latent.yaml` | 默认蒸馏配置。控制数据、context 帧数、adapter 结构、loss、缓存、resume 等。 |
-| `scripts/train_distill_control_latent.sh` | 推荐训练入口。封装环境变量、accelerate、多 GPU、日志、自动 resume、frozen cache。 |
+| `cli` | 推荐本地入口，统一训练、cache 构建、评估、诊断和 overfit 命令。 |
+| `scripts/launch/train_distill.sh` | CLI 调用的训练 launcher。封装环境变量、accelerate、多 GPU、日志、自动 resume、frozen cache。 |
 | `hooks/extract_vggt_tokens.py` | 从 reconstructor 中提取中间层 tokens，默认取 `[4, 11, 17, 23]` 层，并可追加 camera token。 |
-| `diffsynth/models/student_adapters.py` | Student Adapter 实现。包含默认 `conv` adapter 和 `cross_attention_rope` ablation。 |
-| `eval_replace_teacher_with_student.py` | 用训练好的 student 替换 teacher condition，跑 teacher / student 视频生成对比。 |
-| `experiments/compare_reconstruction_context.py` | 不跑 diffusion，只对比“81 帧全量输入重建”和“稀疏 context 输入重建”的 81 帧渲染视频。 |
+| `diffsynth/models/student_adapters.py` | Student Adapter 实现。默认使用 `cross_attention_rope`，也保留 `conv` 对照。 |
+| `tools/eval/replace_teacher_with_student.py` | 用训练好的 student 替换 teacher condition，跑 teacher / student 视频生成对比。 |
+| `tools/diagnostics/compare_reconstruction_context.py` | 不跑 diffusion，只对比“81 帧全量输入重建”和“稀疏 context 输入重建”的 81 帧渲染视频。 |
 | `README_distill_adapter.md` | 更偏实现细节的旧说明。本文档是更完整的上手手册。 |
 
 ## 2. 一句话流程
@@ -46,25 +48,22 @@ diffsynth/models/student_adapters.py
 ```bash
 cd /root/vepfs/diffsynth-dev/papers/neoverse/code
 
-RUN_NAME=distill_conv_ctx10_20 bash scripts/train_distill_control_latent.sh
+./cli train cache
 ```
 
 训练后评估：
 
 ```bash
-/root/vepfs/envs/neoverse/bin/python eval_replace_teacher_with_student.py \
+./cli eval last \
   configs/distill_control_latent.yaml \
-  outputs/NeoVerseControlLatentDistill/YYYY-MM-DD/HH-MM-SS/adapter_last.pt \
-  --output_dir outputs/distill_eval/run0 \
-  --dataset_index 0 \
-  --modes teacher,student
+  outputs/NeoVerseControlLatentDistill/YYYY-MM-DD/HH-MM-SS/adapter_last.pt
 ```
 
 诊断用：看 81 帧全量重建 vs 20 帧 context 重建。
 
 ```bash
 USE_CAMERA_ANNOTATIONS=true DATASET_INDEX=0 NUM_CONTEXT_VIEWS=20 \
-  bash scripts/compare_reconstruction_context.sh
+  bash scripts/launch/compare_reconstruction_context.sh
 ```
 
 ## 3. 环境和模型
@@ -78,7 +77,7 @@ USE_CAMERA_ANNOTATIONS=true DATASET_INDEX=0 NUM_CONTEXT_VIEWS=20 \
 如果你的环境不在这个位置，可以覆盖：
 
 ```bash
-VENV_PATH=/path/to/env bash scripts/train_distill_control_latent.sh
+VENV_PATH=/path/to/env ./cli train cache
 ```
 
 模型默认放在：
@@ -105,7 +104,7 @@ load_text_encoder: false
 load_vae: true
 ```
 
-原因是训练目标是 early condition embedding，不需要完整 diffusion denoising。真正做 `eval_replace_teacher_with_student.py` 生成视频时才需要加载完整 NeoVerse diffusion 模型。
+原因是训练目标是 early condition embedding，不需要完整 diffusion denoising。真正做 `tools/eval/replace_teacher_with_student.py` 生成视频时才需要加载完整 NeoVerse diffusion 模型。
 
 ## 4. 数据格式
 
@@ -236,13 +235,14 @@ text encoder
 student adapter
 ```
 
-默认 adapter 是卷积版：
+默认 adapter 是 cross-attention + RoPE：
 
 ```yaml
 adapter:
-  type: conv
+  type: cross_attention_rope
   hidden_dim: 512
-  num_res_blocks: 4
+  num_heads: 8
+  num_blocks: 4
 ```
 
 默认 token 设置适配当前 `models/NeoVerse/reconstructor.ckpt`：
@@ -264,10 +264,10 @@ token:
 ```bash
 cd /root/vepfs/diffsynth-dev/papers/neoverse/code
 
-RUN_NAME=distill_conv_ctx10_20 bash scripts/train_distill_control_latent.sh
+./cli train cache
 ```
 
-默认值：使用当前可见 GPU，`NUM_VIEWS=81`，context 数量 `10-20`，`LEARNING_RATE=1e-4`，`MAX_STEPS=20000`，并开启 `FAST_FROZEN_CACHE=1`。
+默认推荐从 frozen cache 训练：直接枚举 `outputs/NeoVerseControlLatentDistill/frozen_cache/*.pt`，并按稳定 hash 切 train/eval。在线训练用 `./cli train online`。
 
 输出目录：
 
@@ -278,13 +278,13 @@ outputs/NeoVerseControlLatentDistill/YYYY-MM-DD/HH-MM-SS/
 如果只是检查命令，不启动训练：
 
 ```bash
-DRY_RUN=1 RUN_NAME=distill_conv_ctx10_20 bash scripts/train_distill_control_latent.sh
+DRY_RUN=1 ./cli train cache
 ```
 
 如果只是做 1 step smoke test：
 
 ```bash
-RUN_NAME=smoke MAX_STEPS=1 NUM_WORKERS=0 bash scripts/train_distill_control_latent.sh
+MAX_STEPS=1 NUM_WORKERS=0 ./cli train cache
 ```
 
 指定 GPU 时加 `GPU_LIST=0` 或 `GPU_LIST=0,1`。后台长跑加 `LAUNCH_MODE=background`。
@@ -293,12 +293,13 @@ RUN_NAME=smoke MAX_STEPS=1 NUM_WORKERS=0 bash scripts/train_distill_control_late
 
 这条训练线最慢的部分不是 adapter，而是每个 step 都要跑 frozen reconstructor、VAE、control branch 来构造 teacher label 和 tokens。
 
-脚本默认开启 `FAST_FROZEN_CACHE=1`，等价于打开：
+cache 训练入口等价于打开：
 
 ```yaml
 frozen_cache_read: true
-frozen_cache_write: true
-preload_frozen_cache: true
+train_from_frozen_cache: true
+frozen_cache_write: false
+preload_frozen_cache: false
 preload_frozen_cache_device: cpu
 preload_frozen_cache_batch_size: 1
 save_optimizer_intermediate: false
@@ -313,7 +314,7 @@ outputs/NeoVerseControlLatentDistill/frozen_cache/
 如果要放到更大的盘：
 
 ```bash
-FROZEN_CACHE_DIR=/path/to/frozen_cache bash scripts/train_distill_control_latent.sh
+FROZEN_CACHE_DIR=/path/to/frozen_cache ./cli train cache
 ```
 
 ### 不建议一上来全塞 GPU
@@ -332,7 +333,7 @@ FROZEN_CACHE_DIR=/path/to/frozen_cache bash scripts/train_distill_control_latent
 ```bash
 PRELOAD_FROZEN_CACHE_DEVICE=cuda \
 MAX_STEPS=100 \
-bash scripts/train_distill_control_latent.sh
+./cli train cache
 ```
 
 但正式长跑建议保持：
@@ -354,7 +355,7 @@ resume_optimizer: true
 
 ```bash
 OUTPUT_PATH=outputs/NeoVerseControlLatentDistill/2026-04-30/12-00-00 \
-bash scripts/train_distill_control_latent.sh
+./cli train cache
 ```
 
 手动指定 checkpoint：
@@ -362,7 +363,7 @@ bash scripts/train_distill_control_latent.sh
 ```bash
 RESUME_FROM=outputs/.../adapter_last.pt \
 GPU_LIST=0 \
-bash scripts/train_distill_control_latent.sh
+./cli train cache
 ```
 
 输出文件：
@@ -397,13 +398,13 @@ time/target_frames
 卷积 adapter，默认 GPU 0：
 
 ```bash
-MAX_STEPS=20000 bash scripts/overfit_conv_gpu0.sh
+MAX_STEPS=20000 ./cli overfit conv
 ```
 
 Cross-attention + RoPE adapter，默认 GPU 1：
 
 ```bash
-MAX_STEPS=20000 bash scripts/overfit_cross_gpu1.sh
+MAX_STEPS=20000 ./cli overfit cross
 ```
 
 常用覆盖：
@@ -412,7 +413,7 @@ MAX_STEPS=20000 bash scripts/overfit_cross_gpu1.sh
 VIDEO_NAME=c93dd173-51dd-54f9-bead-b835a485db24.mp4 \
 NUM_CONTEXT_VIEWS=16 \
 MAX_STEPS=2000 \
-bash scripts/overfit_conv_gpu0.sh
+./cli overfit conv
 ```
 
 Overfit 脚本会打开：
@@ -425,10 +426,10 @@ num_workers=0
 
 ## 10. 替换评估：teacher / student
 
-训练完后，用 `eval_replace_teacher_with_student.py` 看 student 是否能替代 teacher condition。
+训练完后，用 `tools/eval/replace_teacher_with_student.py` 看 student 是否能替代 teacher condition。
 
 ```bash
-/root/vepfs/envs/neoverse/bin/python eval_replace_teacher_with_student.py \
+/root/vepfs/envs/neoverse/bin/python tools/eval/replace_teacher_with_student.py \
   configs/distill_control_latent.yaml \
   outputs/NeoVerseControlLatentDistill/YYYY-MM-DD/HH-MM-SS/adapter_last.pt \
   --output_dir outputs/distill_eval/run0 \
@@ -468,7 +469,7 @@ outputs/distill_eval/run0/
 示例：
 
 ```bash
-/root/vepfs/envs/neoverse/bin/python eval_replace_teacher_with_student.py \
+/root/vepfs/envs/neoverse/bin/python tools/eval/replace_teacher_with_student.py \
   configs/distill_control_latent.yaml \
   outputs/.../adapter_last.pt \
   --output_dir outputs/distill_eval/fast \
@@ -496,7 +497,7 @@ outputs/distill_eval/run0/
 USE_CAMERA_ANNOTATIONS=true \
 DATASET_INDEX=0 \
 NUM_CONTEXT_VIEWS=20 \
-bash scripts/compare_reconstruction_context.sh
+bash scripts/launch/compare_reconstruction_context.sh
 ```
 
 输出目录默认：
@@ -528,7 +529,7 @@ USE_CAMERA_ANNOTATIONS=true \
 DATASET_INDEX=0 \
 NUM_CONTEXT_VIEWS=20 \
 OUTPUT_DIR=outputs/reconstruction_context_compare/run_dataset0_ctx20_gtcam \
-bash scripts/compare_reconstruction_context.sh
+bash scripts/launch/compare_reconstruction_context.sh
 ```
 
 如果你要检查 claim，请优先看：
@@ -569,16 +570,15 @@ metadata.json
 | `PRINT_FREQ` | `10` | 打印间隔。 |
 | `SAVE_FREQ` | `500` | 覆盖保存 `adapter_last.pt` 的间隔。 |
 | `VIS_FREQ` | `500` | heatmap 可视化间隔。 |
-| `FAST_FROZEN_CACHE` | `1` | 默认打开 frozen cache 加速；设为 `0` 可关闭。 |
 | `FROZEN_CACHE_DIR` | `outputs/.../frozen_cache` | frozen cache 目录。 |
-| `PRELOAD_FROZEN_CACHE_DEVICE` | `cpu` | frozen cache preload 到 CPU 或 CUDA。 |
+| `TRAIN_FROM_FROZEN_CACHE` | `true` via `./cli train cache` | 直接从 `.pt` cache 文件采样训练。 |
 
 ### OmegaConf 覆盖
 
 除了环境变量，也可以在命令最后直接写 dotlist：
 
 ```bash
-GPU_LIST=0 bash scripts/train_distill_control_latent.sh \
+GPU_LIST=0 ./cli train cache \
   adapter.hidden_dim=768 \
   adapter.num_res_blocks=6 \
   loss.stat_weight=0.02 \
@@ -587,17 +587,23 @@ GPU_LIST=0 bash scripts/train_distill_control_latent.sh \
 
 ## 13. 切换 adapter
 
-默认是卷积 adapter：
+默认是 cross-attention + RoPE adapter：
 
 ```yaml
 adapter:
-  type: conv
+  type: cross_attention_rope
 ```
 
-切到 cross-attention + RoPE：
+切到卷积 adapter：
 
 ```bash
-GPU_LIST=0 bash scripts/train_distill_control_latent.sh \
+ADAPTER_TYPE=conv ./cli train cache
+```
+
+调整 cross-attention + RoPE：
+
+```bash
+GPU_LIST=0 ./cli train cache \
   adapter.type=cross_attention_rope \
   adapter.token_dim=null \
   adapter.num_heads=8 \
@@ -612,7 +618,7 @@ GPU_LIST=0 bash scripts/train_distill_control_latent.sh \
 或者直接用：
 
 ```bash
-MAX_STEPS=2000 bash scripts/overfit_cross_gpu1.sh
+MAX_STEPS=2000 ./cli overfit cross
 ```
 
 显存不够时优先降：
@@ -685,7 +691,7 @@ Overfit 单视频时，`condition/l1` 应该能明显下降。如果 overfit 都
 
 ### Q4：GPU 利用率低怎么办？
 
-默认已经开启 `FAST_FROZEN_CACHE=1`。它会把 frozen teacher 的重计算变成 cache 读写和轻量 adapter 训练。正式长跑建议 cache preload 到 CPU，不建议直接全塞 GPU。
+优先用 `./cli train cache`，它会直接从 frozen cache 文件采样，避免训练时重跑 frozen teacher。先用 `./cli cache inspect` 看 cache 数量、大小和 train/eval 切分。
 
 ### Q5：最新 checkpoint 没有 optimizer，能 resume 吗？
 
@@ -693,7 +699,7 @@ Overfit 单视频时，`condition/l1` 应该能明显下降。如果 overfit 都
 
 ### Q6：评估为什么比训练更吃显存？
 
-训练 early condition embedding 时默认不加载 DiT/text encoder。`eval_replace_teacher_with_student.py` 要真正跑 generation，所以会加载完整 Wan DiT、text encoder、VAE、control branch 和 reconstructor。显存不够就加：
+训练 early condition embedding 时默认不加载 DiT/text encoder。`tools/eval/replace_teacher_with_student.py` 要真正跑 generation，所以会加载完整 Wan DiT、text encoder、VAE、control branch 和 reconstructor。显存不够就加：
 
 ```bash
 --enable_vram_management
@@ -705,7 +711,7 @@ Overfit 单视频时，`condition/l1` 应该能明显下降。如果 overfit 都
 
 ```bash
 USE_CAMERA_ANNOTATIONS=true DATASET_INDEX=0 NUM_CONTEXT_VIEWS=20 \
-  bash scripts/compare_reconstruction_context.sh
+  bash scripts/launch/compare_reconstruction_context.sh
 ```
 
 然后打开输出目录下的 `index.html`。
@@ -721,8 +727,8 @@ config.yaml
 run_config.env
 adapter_last.pt
 TensorBoard 曲线
-eval_replace_teacher_with_student.py 输出视频
-experiments/compare_reconstruction_context.py 输出视频和 metadata.json
+tools/eval/replace_teacher_with_student.py 输出视频
+tools/diagnostics/compare_reconstruction_context.py 输出视频和 metadata.json
 ```
 
 如果要写论文或报告，建议至少做这些对比：
@@ -739,7 +745,7 @@ experiments/compare_reconstruction_context.py 输出视频和 metadata.json
 训练后评估：
 
 ```bash
-/root/vepfs/envs/neoverse/bin/python eval_replace_teacher_with_student.py \
+/root/vepfs/envs/neoverse/bin/python tools/eval/replace_teacher_with_student.py \
   configs/distill_control_latent.yaml \
   outputs/NeoVerseControlLatentDistill/YYYY-MM-DD/HH-MM-SS/adapter_last.pt \
   --output_dir outputs/distill_eval/exp_name_dataset0 \
@@ -755,5 +761,5 @@ USE_CAMERA_ANNOTATIONS=true \
 DATASET_INDEX=0 \
 NUM_CONTEXT_VIEWS=20 \
 OUTPUT_DIR=outputs/reconstruction_context_compare/exp_name_dataset0_ctx20 \
-bash scripts/compare_reconstruction_context.sh
+bash scripts/launch/compare_reconstruction_context.sh
 ```

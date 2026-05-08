@@ -45,7 +45,6 @@ temporal_variant_profile_weights: ""
 fixed_clips_per_scene: 0
 camera_cache_dir: ""
 camera_cache_required: false
-train_dataset: SpatialVID(split=None, ROOT="${data_root}", video_ids=${video_ids}, video_paths=${video_paths}, use_camera_annotations=${use_camera_annotations}, continuous_target_frames=${continuous_target_frames}, force_first_context=${force_first_context}, timestamp_unit="${timestamp_unit}", temporal_augmentation=${temporal_augmentation}, temporal_trajectory_profile="${temporal_trajectory_profile}", temporal_order="${temporal_order}", temporal_max_condition_frames=${temporal_max_condition_frames}, context_sampling_strategy="${context_sampling_strategy}", context_sampling_weights=${context_sampling_weights}, variants_per_scene=${variants_per_scene}, trajectories_per_clip=${trajectories_per_clip}, temporal_variant_profile_weights="${temporal_variant_profile_weights}", fixed_clips_per_scene=${fixed_clips_per_scene}, camera_cache_dir="${camera_cache_dir}", camera_cache_required=${camera_cache_required}, min_interval=1, max_interval=1, height=${height}, width=${width}, num_views=${num_views}, min_num_context_views=${min_num_context_views}, max_num_context_views=${max_num_context_views}, seed=${dataset_seed})
 
 camera_condition_normalization:
   enabled: false
@@ -82,7 +81,7 @@ token:
   token_groups: 5
 
 adapter:
-  type: conv
+  type: cross_attention_rope
   output_mode: condition_embedding
   input_channels: null
   hidden_dim: 512
@@ -91,26 +90,24 @@ adapter:
   condition_time_dim: 128
   use_text_context: false
   use_dit_state: false
-  # For cross-attention ablation:
-  # type: cross_attention_rope
-  # output_mode: condition_embedding
-  # token_dim: null
-  # hidden_dim: 512
-  # num_heads: 8
-  # num_blocks: 4
-  # source_pool_hw: [16, 16]
-  # max_source_tokens: 32768
-  # query_chunk_size: 4096
-  # use_rope: true
-  # use_dit_state: false
-  # max_token_groups: null
-  # use_group_embedding: true
-  # use_local_grid: true
-  # use_time_film: true
-  # time_film_dim: 128
-  # time_position_mode: reroped
-  # rerope_interval: 4.0
-  # post_num_res_blocks: 2
+  # Conv-only fields above are ignored by the cross-attention adapter. They are
+  # kept here so ADAPTER_TYPE=conv can switch adapter families without a second
+  # config file.
+  token_dim: null
+  num_heads: 8
+  num_blocks: 4
+  source_pool_hw: [16, 16]
+  max_source_tokens: 32768
+  query_chunk_size: 4096
+  use_rope: true
+  max_token_groups: null
+  use_group_embedding: true
+  use_local_grid: true
+  use_time_film: true
+  time_film_dim: 128
+  time_position_mode: reroped
+  rerope_interval: 4.0
+  post_num_res_blocks: 2
 
 target_latent_shapes: condition_embedding_auto
 
