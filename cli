@@ -10,27 +10,30 @@ usage() {
   cat <<'EOF'
 NeoVerse local commands
 
-Usage:
-  ./cli train base CONFIG [args]
-  ./cli train online [extra OmegaConf overrides...]
-  ./cli train online-noaug [extra OmegaConf overrides...]
+Stable user paths:
   ./cli train cache [extra OmegaConf overrides...]
   ./cli infer neoverse [args]
   ./cli app neoverse [args]
-  ./cli app degradation [args]
-  ./cli app wan-4step [args]
   ./cli cache build-camera [builder args]
   ./cli cache build-frozen [builder args]
   ./cli cache inspect [inspect args]
   ./cli eval last CONFIG CHECKPOINT [dataset indices...]
-  ./cli eval generation-suite run|analyze|report|adapter-cache [args]
-  ./cli profile distill-step [args]
   ./cli volc auth import [AccessKey.txt]
   ./cli volc submit train-cache|build-camera|build-frozen [args]
-  ./cli debug temporal [args]
-  ./cli debug reconstruction [args]
-  ./cli overfit conv|cross [extra OmegaConf overrides...]
-  ./cli data prepare-spatialvid-hq [args]
+
+Development paths:
+  ./cli train online|online-noaug [extra OmegaConf overrides...]
+  ./cli dev profile distill-step [args]
+  ./cli dev debug temporal|reconstruction [args]
+  ./cli dev overfit conv|cross [extra OmegaConf overrides...]
+  ./cli dev data prepare-spatialvid-hq [args]
+  ./cli dev app degradation|wan-4step [args]
+  ./cli legacy train-base CONFIG [args]
+
+Compatibility aliases still work:
+  ./cli train base CONFIG [args]
+  ./cli profile|debug|overfit|data ...
+  ./cli app degradation|wan-4step [args]
 
 Useful env overrides:
   GPU_LIST=0,1
@@ -50,16 +53,16 @@ EOF
 usage_train() {
   cat <<'EOF'
 Usage:
-  ./cli train base CONFIG [args]
+  ./cli train cache [extra OmegaConf overrides...]
   ./cli train online [extra OmegaConf overrides...]
   ./cli train online-noaug [extra OmegaConf overrides...]
-  ./cli train cache [extra OmegaConf overrides...]
+  ./cli train base CONFIG [args]
 
 Commands:
-  base    Run the original NeoVerse training entry.
-  online  Online SpatialVID training with temporal augmentation.
-  online-noaug  Online training without temporal augmentation.
   cache   Train directly from frozen_cache/*.pt with deterministic train/eval split.
+  online  Dev path: online SpatialVID training with temporal augmentation.
+  online-noaug  Dev path: online training without temporal augmentation.
+  base    Legacy path: run the original NeoVerse training entry.
 EOF
 }
 
@@ -74,6 +77,12 @@ usage_app() {
   cat <<'EOF'
 Usage:
   ./cli app neoverse [args]
+
+Development app aliases:
+  ./cli dev app degradation [args]
+  ./cli dev app wan-4step [args]
+
+Compatibility aliases:
   ./cli app degradation [args]
   ./cli app wan-4step [args]
 EOF
@@ -92,23 +101,15 @@ usage_eval() {
   cat <<'EOF'
 Usage:
   ./cli eval last CONFIG CHECKPOINT [dataset indices...]
-  ./cli eval generation-suite run|analyze|report|adapter-cache [args]
-EOF
-}
-
-usage_generation_suite() {
-  cat <<'EOF'
-Usage:
-  ./cli eval generation-suite run [args]
-  ./cli eval generation-suite analyze [args]
-  ./cli eval generation-suite report [args]
-  ./cli eval generation-suite adapter-cache [args]
 EOF
 }
 
 usage_profile() {
   cat <<'EOF'
 Usage:
+  ./cli dev profile distill-step [args]
+
+Compatibility alias:
   ./cli profile distill-step [args]
 EOF
 }
@@ -131,6 +132,10 @@ EOF
 usage_debug() {
   cat <<'EOF'
 Usage:
+  ./cli dev debug temporal [args]
+  ./cli dev debug reconstruction [args]
+
+Compatibility aliases:
   ./cli debug temporal [args]
   ./cli debug reconstruction [args]
 EOF
@@ -139,6 +144,10 @@ EOF
 usage_overfit() {
   cat <<'EOF'
 Usage:
+  ./cli dev overfit conv [extra OmegaConf overrides...]
+  ./cli dev overfit cross [extra OmegaConf overrides...]
+
+Compatibility aliases:
   ./cli overfit conv [extra OmegaConf overrides...]
   ./cli overfit cross [extra OmegaConf overrides...]
 EOF
@@ -147,7 +156,49 @@ EOF
 usage_data() {
   cat <<'EOF'
 Usage:
+  ./cli dev data prepare-spatialvid-hq [args]
+
+Compatibility alias:
   ./cli data prepare-spatialvid-hq [args]
+EOF
+}
+
+usage_dev() {
+  cat <<'EOF'
+Usage:
+  ./cli dev train online [extra OmegaConf overrides...]
+  ./cli dev train online-noaug [extra OmegaConf overrides...]
+  ./cli dev profile distill-step [args]
+  ./cli dev debug temporal|reconstruction [args]
+  ./cli dev overfit conv|cross [extra OmegaConf overrides...]
+  ./cli dev data prepare-spatialvid-hq [args]
+  ./cli dev app degradation|wan-4step [args]
+EOF
+}
+
+usage_dev_train() {
+  cat <<'EOF'
+Usage:
+  ./cli dev train online [extra OmegaConf overrides...]
+  ./cli dev train online-noaug [extra OmegaConf overrides...]
+EOF
+}
+
+usage_dev_app() {
+  cat <<'EOF'
+Usage:
+  ./cli dev app degradation [args]
+  ./cli dev app wan-4step [args]
+EOF
+}
+
+usage_legacy() {
+  cat <<'EOF'
+Usage:
+  ./cli legacy train-base CONFIG [args]
+
+Compatibility alias:
+  ./cli train base CONFIG [args]
 EOF
 }
 
@@ -261,21 +312,6 @@ eval_last() {
       --modes teacher,student \
       --enable_vram_management
   done
-}
-
-eval_generation_suite() {
-  local subcmd="${1:-help}"
-  if [[ "$#" -gt 0 ]]; then
-    shift
-  fi
-  case "${subcmd}" in
-    help|-h|--help) usage_generation_suite ;;
-    run) "${PYTHON}" experiments/archive/midterm/run_generation_suite.py "$@" ;;
-    analyze) "${PYTHON}" experiments/archive/midterm/analyze_generation_suite.py "$@" ;;
-    report) "${PYTHON}" experiments/archive/midterm/report_generation_suite.py "$@" ;;
-    adapter-cache) "${PYTHON}" experiments/archive/midterm/adapter_cache_eval.py "$@" ;;
-    *) usage_generation_suite >&2; die "Unknown generation-suite command: ${subcmd}" ;;
-  esac
 }
 
 debug_temporal() {
@@ -404,7 +440,6 @@ dispatch_eval() {
   case "${subcmd}" in
     help|-h|--help) usage_eval ;;
     last) eval_last "$@" ;;
-    generation-suite) eval_generation_suite "$@" ;;
     *) usage_eval >&2; die "Unknown eval command: ${subcmd}" ;;
   esac
 }
@@ -472,6 +507,61 @@ dispatch_data() {
   esac
 }
 
+dispatch_dev_train() {
+  local subcmd="${1:-help}"
+  if [[ "$#" -gt 0 ]]; then
+    shift
+  fi
+  case "${subcmd}" in
+    help|-h|--help) usage_dev_train ;;
+    online) train_online "$@" ;;
+    online-noaug) train_online_noaug "$@" ;;
+    *) usage_dev_train >&2; die "Unknown dev train command: ${subcmd}" ;;
+  esac
+}
+
+dispatch_dev_app() {
+  local subcmd="${1:-help}"
+  if [[ "$#" -gt 0 ]]; then
+    shift
+  fi
+  case "${subcmd}" in
+    help|-h|--help) usage_dev_app ;;
+    degradation) app_degradation "$@" ;;
+    wan-4step) app_wan_4step "$@" ;;
+    *) usage_dev_app >&2; die "Unknown dev app command: ${subcmd}" ;;
+  esac
+}
+
+dispatch_dev() {
+  local subcmd="${1:-help}"
+  if [[ "$#" -gt 0 ]]; then
+    shift
+  fi
+  case "${subcmd}" in
+    help|-h|--help) usage_dev ;;
+    train) dispatch_dev_train "$@" ;;
+    profile) dispatch_profile "$@" ;;
+    debug) dispatch_debug "$@" ;;
+    overfit) dispatch_overfit "$@" ;;
+    data) dispatch_data "$@" ;;
+    app) dispatch_dev_app "$@" ;;
+    *) usage_dev >&2; die "Unknown dev command: ${subcmd}" ;;
+  esac
+}
+
+dispatch_legacy() {
+  local subcmd="${1:-help}"
+  if [[ "$#" -gt 0 ]]; then
+    shift
+  fi
+  case "${subcmd}" in
+    help|-h|--help) usage_legacy ;;
+    train-base) train_base "$@" ;;
+    *) usage_legacy >&2; die "Unknown legacy command: ${subcmd}" ;;
+  esac
+}
+
 cmd="${1:-help}"
 if [[ "$#" -gt 0 ]]; then
   shift
@@ -489,5 +579,7 @@ case "${cmd}" in
   debug) dispatch_debug "$@" ;;
   overfit) dispatch_overfit "$@" ;;
   data) dispatch_data "$@" ;;
+  dev) dispatch_dev "$@" ;;
+  legacy) dispatch_legacy "$@" ;;
   *) usage >&2; die "Unknown command: ${cmd}" ;;
 esac

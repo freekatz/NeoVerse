@@ -56,18 +56,29 @@ frozen cache -> adapter 训练
 ## 常用命令
 
 ```bash
+# 主路径
 ./cli train cache                 # 主训练，从 frozen cache 读
-./cli train online                # 在线时序增强训练，调试用
-./cli train online-noaug          # 在线无时序增强，sanity check
 
 ./cli cache build-camera          # 建 camera cache
 ./cli cache build-frozen          # 建 frozen cache
 ./cli cache inspect               # 看 cache 数量、大小、train/eval 切分
 
-./cli profile distill-step        # 单 step profile
-./cli debug temporal              # 时序轨迹诊断
-./cli debug reconstruction        # 重建诊断
+./cli eval last CONFIG CHECKPOINT # 评估 checkpoint
+
+# 开发/诊断
+./cli train online                # 在线时序增强训练，调试用
+./cli train online-noaug          # 在线无时序增强，sanity check
+./cli dev profile distill-step    # 单 step profile
+./cli dev debug temporal          # 时序轨迹诊断
+./cli dev debug reconstruction    # 重建诊断
+./cli dev data prepare-spatialvid-hq
+
+# Legacy
+./cli legacy train-base training/configs/train.yaml
 ```
+
+兼容入口仍可用：`./cli profile ...`、`./cli debug ...`、`./cli overfit ...`、
+`./cli data ...`、`./cli train base ...`。
 
 ## 火山任务
 
