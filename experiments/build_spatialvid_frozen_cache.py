@@ -69,6 +69,16 @@ def build_cfg(args):
         dataset_seed = cfg.get("dataset_seed", cfg.get("seed", 0))
     if dataset_seed in (None, "null", "None"):
         dataset_seed = 0
+    camera_condition_normalize = (
+        parse_bool(args.camera_condition_normalize)
+        if args.camera_condition_normalize is not None
+        else True
+    )
+    camera_condition_min_translation_scale = (
+        float(args.camera_condition_min_translation_scale)
+        if args.camera_condition_min_translation_scale is not None
+        else 1.0
+    )
 
     overrides = {
         "output_path": args.run_output_dir,
@@ -87,7 +97,7 @@ def build_cfg(args):
             if args.temporal_variant_profile_weights is not None
             else cfg.get("temporal_variant_profile_weights", "")
         ),
-        "context_sampling_strategy": args.context_sampling_strategy or cfg.get("context_sampling_strategy", "mixed"),
+        "context_sampling_strategy": args.context_sampling_strategy or "mixed",
         "variants_per_scene": int(trajectories_per_clip),
         "trajectories_per_clip": int(trajectories_per_clip),
         "fixed_clips_per_scene": int(fixed_clips_per_scene),
@@ -96,6 +106,10 @@ def build_cfg(args):
         if args.camera_cache_required is not None
         else parse_bool(cfg.get("camera_cache_required", False)),
         "dataset_seed": int(dataset_seed),
+        "camera_condition_normalization": {
+            "enabled": bool(camera_condition_normalize),
+            "min_translation_scale": float(camera_condition_min_translation_scale),
+        },
         "num_workers": 0,
         "pin_memory": False,
         "persistent_workers": False,
@@ -150,6 +164,8 @@ def main():
     parser.add_argument("--temporal_variant_profile_weights", default=None)
     parser.add_argument("--temporal_order", default=None)
     parser.add_argument("--context_sampling_strategy", default=None)
+    parser.add_argument("--camera_condition_normalize", default=None)
+    parser.add_argument("--camera_condition_min_translation_scale", default=None)
     parser.add_argument("--camera_cache_dir", default=None)
     parser.add_argument("--camera_cache_required", default=None)
     parser.add_argument("--dataset_seed", type=int, default=None)

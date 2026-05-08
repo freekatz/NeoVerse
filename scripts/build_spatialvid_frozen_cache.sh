@@ -107,6 +107,9 @@ common_args=(
   --fixed_clips_per_scene "${FIXED_CLIPS_PER_SCENE:-16}"
   --trajectories_per_clip "${TRAJECTORIES_PER_CLIP:-8}"
   --temporal_variant_profile_weights "${TEMPORAL_VARIANT_PROFILE_WEIGHTS:-forward_pause:0.5,mixed_fzr:0.4,backward:0.1}"
+  --context_sampling_strategy "${CONTEXT_SAMPLING_STRATEGY:-mixed}"
+  --camera_condition_normalize "${CAMERA_CONDITION_NORMALIZE:-true}"
+  --camera_condition_min_translation_scale "${CAMERA_CONDITION_MIN_TRANSLATION_SCALE:-1.0}"
 )
 
 append_arg_if_set() {
@@ -126,7 +129,6 @@ append_arg_if_set "CAMERA_CACHE_DIR" "--camera_cache_dir"
 append_arg_if_set "CAMERA_CACHE_REQUIRED" "--camera_cache_required"
 append_arg_if_set "TEMPORAL_TRAJECTORY_PROFILE" "--temporal_trajectory_profile"
 append_arg_if_set "TEMPORAL_ORDER" "--temporal_order"
-append_arg_if_set "CONTEXT_SAMPLING_STRATEGY" "--context_sampling_strategy"
 append_arg_if_set "DATASET_SEED" "--dataset_seed"
 append_arg_if_set "LIMIT" "--limit"
 append_arg_if_set "VIDEO_IDS" "--video_ids"
