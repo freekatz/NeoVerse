@@ -18,7 +18,7 @@ from diffsynth.models import ModelManager
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
 from diffsynth.utils import ModelConfig
 from diffsynth.utils.auxiliary import homo_matrix_inverse
-from tools.train.distill_control_latent import build_spatialvid_dataset
+from training.control_latent.distill import build_spatialvid_dataset
 
 
 def zero_drop_probs(pipeline_kwargs):
@@ -327,7 +327,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Compare 81-frame reconstruction rendering with sparse-context reconstruction rendering."
     )
-    parser.add_argument("--config", default="configs/distill_control_latent.yaml")
+    parser.add_argument("--config", default="configs/distill/control_latent.yaml")
     parser.add_argument("--output_dir", default="outputs/reconstruction_context_compare")
     parser.add_argument("--dataset_index", type=int, default=0)
     parser.add_argument("--num_frames", type=int, default=81)

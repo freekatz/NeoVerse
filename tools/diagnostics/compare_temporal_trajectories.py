@@ -235,7 +235,7 @@ def save_html(output_dir, runs):
 
 def main():
     parser = argparse.ArgumentParser(description="Render fixed NeoVerse conditions with explicit temporal trajectories.")
-    parser.add_argument("--config", default="configs/distill_control_latent.yaml")
+    parser.add_argument("--config", default="configs/distill/control_latent.yaml")
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--data_root", default=None)
     parser.add_argument("--index", type=int, default=0)

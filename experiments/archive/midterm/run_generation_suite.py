@@ -10,9 +10,7 @@ from pathlib import Path
 import yaml
 
 
-CODE_DIR = Path(__file__).resolve().parents[2]
-BEST_CONFIG = CODE_DIR / "outputs/NeoVerseControlLatentDistill/2026-05-04/17-05-14/config.yaml"
-BEST_CKPT = CODE_DIR / "outputs/NeoVerseControlLatentDistill/2026-05-04/17-05-14/adapter_last.pt"
+CODE_DIR = Path(__file__).resolve().parents[3]
 
 
 def load_yaml(path):
@@ -24,6 +22,11 @@ def dump_yaml(data, path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(data, handle, sort_keys=False)
+
+
+def resolve_code_path(value):
+    path = Path(value).expanduser()
+    return path.resolve() if path.is_absolute() else (CODE_DIR / path).resolve()
 
 
 def make_config(base, config_dir, name, **updates):
@@ -77,6 +80,8 @@ def run_command(cmd, cwd, log_path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_root", default=None)
+    parser.add_argument("--config", required=True, help="Base distillation config or saved run config.")
+    parser.add_argument("--checkpoint", required=True, help="Adapter checkpoint used for student runs.")
     parser.add_argument("--python", default="/root/vepfs/envs/neoverse/bin/python")
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--steps", type=int, default=4)
@@ -93,7 +98,9 @@ def main():
     run_root.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    base = load_yaml(BEST_CONFIG)
+    base_config = resolve_code_path(args.config)
+    checkpoint = resolve_code_path(args.checkpoint)
+    base = load_yaml(base_config)
     base["data_root"] = "data/SpatialVID"
     base["dataset_seed"] = int(base.get("seed", 2))
     base.setdefault("use_camera_annotations", False)
@@ -166,8 +173,8 @@ def main():
 
     manifest = {
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "best_config": str(BEST_CONFIG),
-        "checkpoint": str(BEST_CKPT),
+        "base_config": str(base_config),
+        "checkpoint": str(checkpoint),
         "steps": args.steps,
         "seed": args.seed,
         "runs": [],
@@ -185,9 +192,9 @@ def main():
             run_dir.mkdir(parents=True, exist_ok=True)
             cmd = [
                 args.python,
-                "tools/eval/replace_teacher_with_student.py",
+                "tools/eval/render_student_comparison.py",
                 str(configs[run["config"]]),
-                str(BEST_CKPT),
+                str(checkpoint),
                 "--output_dir",
                 str(run_dir),
                 "--dataset_index",

@@ -31,7 +31,7 @@ temporal_augmentation: false
 temporal_trajectory_profile: forward_pause
 temporal_order: trajectory
 temporal_max_condition_frames: 8
-context_sampling_strategy: uniform
+context_sampling_strategy: mixed
 context_sampling_weights:
   uniform_first: 0.25
   random_first: 0.30
@@ -47,7 +47,7 @@ camera_cache_dir: ""
 camera_cache_required: false
 
 camera_condition_normalization:
-  enabled: false
+  enabled: true
   normalize_poses: true
   normalize_intrinsics: true
   normalize_plucker: true

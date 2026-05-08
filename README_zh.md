@@ -29,7 +29,7 @@ cd /root/vepfs/diffsynth-dev/papers/neoverse/code
 
 ```bash
 ./cli eval last \
-  configs/distill_control_latent.yaml \
+  configs/distill/control_latent.yaml \
   outputs/NeoVerseControlLatentDistill/YYYY-MM-DD/HH-MM-SS/adapter_last.pt
 ```
 
@@ -82,6 +82,18 @@ cd /root/vepfs/diffsynth-dev/papers/neoverse/code
 ```
 
 加载某个 adapter checkpoint，跑 teacher/student generation 对比。不传 index 时默认跑 `0 17 33 81 159 240 319`。
+
+```text
+./cli eval generation-suite run|analyze|report|adapter-cache
+```
+
+归档的中期评估入口。`run` 不再硬编码 checkpoint，必须显式传 `--config` 和 `--checkpoint`。
+
+```text
+./cli profile distill-step
+```
+
+单 step 性能分解工具。源码在 `tools/profile/`，输出默认写入已忽略的 `profile_output/`。
 
 ```text
 ./cli debug temporal
@@ -294,14 +306,14 @@ SKIP_BAD_ARCHIVES=1 ./cli data prepare-spatialvid-hq
 
 ```bash
 ./cli eval last \
-  configs/distill_control_latent.yaml \
+  configs/distill/control_latent.yaml \
   outputs/NeoVerseControlLatentDistill/YYYY-MM-DD/HH-MM-SS/adapter_last.pt
 ```
 
 只跑某几个样本：
 
 ```bash
-./cli eval last configs/distill_control_latent.yaml outputs/.../adapter_last.pt 0 17 33
+./cli eval last configs/distill/control_latent.yaml outputs/.../adapter_last.pt 0 17 33
 ```
 
 输出会写到 checkpoint 目录下：
@@ -329,19 +341,21 @@ USE_CAMERA_ANNOTATIONS=true DATASET_INDEX=0 NUM_CONTEXT_VIEWS=20 \
 
 ```text
 cli                                      统一本地入口
-configs/distill_control_latent.yaml      蒸馏训练配置
-tools/train/                             训练入口和蒸馏训练主模块
+configs/distill/control_latent.yaml      蒸馏训练配置
+tools/train/                             训练入口
 tools/inference/                         推理入口
 tools/apps/                              Gradio/FastAPI 应用入口
+training/control_latent/                 蒸馏训练库代码
 
 scripts/launch/                          训练和 cache 构建 launcher
 scripts/overfit/                         单视频 overfit
 scripts/data/                            数据整理
 
 tools/cache/                             camera/frozen cache 工具
-tools/eval/                              teacher/student 替换评估
+tools/eval/                              teacher/student 生成对比评估
 tools/diagnostics/                       temporal 和 reconstruction 诊断
-experiments/midterm/                     中期实验脚本
+tools/profile/                           性能 profiling 工具
+experiments/archive/midterm/             中期实验归档脚本
 ```
 
 ## 11. 输出目录清理规则

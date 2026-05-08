@@ -17,8 +17,8 @@ if CODE_DIR not in sys.path:
 from diffsynth.data import save_video
 from diffsynth.utils.auxiliary import homo_matrix_inverse
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline, model_fn_wan_video
-from hooks.extract_vggt_tokens import extract_vggt_tokens
-from tools.train.distill_control_latent import (
+from training.control_latent.reconstructor_tokens import extract_vggt_tokens
+from training.control_latent.distill import (
     build_spatialvid_dataset,
     build_adapter,
     extract_source_times,

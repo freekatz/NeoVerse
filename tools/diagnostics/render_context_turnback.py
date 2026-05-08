@@ -35,7 +35,7 @@ except ImportError:
         timestamp_order,
     )
 from diffsynth.data import save_video
-from tools.train.distill_control_latent import build_spatialvid_dataset
+from training.control_latent.distill import build_spatialvid_dataset
 
 
 def make_local_yaw_turnback(poses, max_degrees=180.0):
@@ -76,7 +76,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Render sparse-context reconstruction with a camera that gradually turns back."
     )
-    parser.add_argument("--config", default="configs/distill_control_latent.yaml")
+    parser.add_argument("--config", default="configs/distill/control_latent.yaml")
     parser.add_argument("--output_dir", default="outputs/reconstruction_context_compare/run_dataset0_ctx20_gtcam")
     parser.add_argument("--dataset_index", type=int, default=0)
     parser.add_argument("--num_frames", type=int, default=81)

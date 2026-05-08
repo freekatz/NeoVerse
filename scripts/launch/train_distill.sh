@@ -32,6 +32,7 @@ run_cmd() {
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+source "${SCRIPT_DIR}/runtime_env.sh"
 
 MODE="${MODE:-train}"
 LAUNCH_MODE="${LAUNCH_MODE:-foreground}"
@@ -40,7 +41,7 @@ DRY_RUN="${DRY_RUN:-0}"
 VENV_PATH="${VENV_PATH:-/root/vepfs/envs/neoverse}"
 ENV_PYTHON="${ENV_PYTHON:-${VENV_PATH}/bin/python}"
 ACCELERATE="${ACCELERATE:-${VENV_PATH}/bin/accelerate}"
-CONFIG="${CONFIG:-configs/distill_control_latent.yaml}"
+CONFIG="${CONFIG:-configs/distill/control_latent.yaml}"
 
 PROJECT_NAME="${PROJECT_NAME:-NeoVerseControlLatentDistill}"
 RUN_DATE="${RUN_DATE:-$(date +%F)}"
@@ -59,14 +60,14 @@ PID_FILE="${PID_FILE:-${LOG_DIR}/run.pid}"
 CONFIG_FILE="${CONFIG_FILE:-${LOG_DIR}/run_config.env}"
 
 GPU_LIST="${GPU_LIST:-}"
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${GPU_LIST}}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
 MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
 PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
 
-# Adapter defaults live in configs/distill_control_latent.yaml. Set
+# Adapter defaults live in configs/distill/control_latent.yaml. Set
 # ADAPTER_TYPE=conv or ADAPTER_TYPE=cross_attention_rope to override per run.
 ADAPTER_TYPE="${ADAPTER_TYPE:-}"
 
@@ -129,37 +130,23 @@ export TOKENIZERS_PARALLELISM
 export PYTORCH_CUDA_ALLOC_CONF
 export TORCH_NCCL_ASYNC_ERROR_HANDLING
 export PYTHONPATH="${CODE_DIR}:${PYTHONPATH:-}"
+RESOLVED_GPU_LIST="$(neoverse_resolve_gpu_list "${GPU_LIST}" "${CUDA_VISIBLE_DEVICES}" "${MLP_WORKER_GPU:-}" "${ENV_PYTHON}")"
+GPU_LIST="${GPU_LIST:-${RESOLVED_GPU_LIST}}"
+if [[ -z "${CUDA_VISIBLE_DEVICES}" ]]; then
+  CUDA_VISIBLE_DEVICES="${RESOLVED_GPU_LIST}"
+fi
+neoverse_split_csv "${CUDA_VISIBLE_DEVICES:-${GPU_LIST}}"
+LOCAL_VISIBLE_GPU_COUNT="${#NEOVERSE_SPLIT_ITEMS[@]}"
 if [[ -n "${CUDA_VISIBLE_DEVICES}" ]]; then
   export CUDA_VISIBLE_DEVICES
 fi
 
-detect_local_gpu_count() {
-  if [[ -n "${CUDA_VISIBLE_DEVICES}" ]]; then
-    "${ENV_PYTHON}" - "${CUDA_VISIBLE_DEVICES}" <<'PY'
-import sys
-
-items = [item.strip() for item in sys.argv[1].split(",") if item.strip()]
-print(len(items))
-PY
-    return
-  fi
-
-  "${ENV_PYTHON}" - <<'PY'
-import torch
-
-print(torch.cuda.device_count())
-PY
-}
-
-if [[ "${USE_DISTRIBUTED}" == "auto" && -z "${DIST_NPROC_PER_NODE}" && "${DIST_NNODES}" == "1" ]]; then
-  auto_local_gpu_count="$(detect_local_gpu_count)"
-  if [[ "${auto_local_gpu_count}" =~ ^[0-9]+$ && "${auto_local_gpu_count}" -gt 0 ]]; then
-    DIST_NPROC_PER_NODE="${auto_local_gpu_count}"
-  fi
-fi
-
 if [[ -z "${DIST_NPROC_PER_NODE}" ]]; then
-  DIST_NPROC_PER_NODE=1
+  if [[ "${USE_DISTRIBUTED}" == "auto" && "${LOCAL_VISIBLE_GPU_COUNT}" -gt 0 ]]; then
+    DIST_NPROC_PER_NODE="${LOCAL_VISIBLE_GPU_COUNT}"
+  else
+    DIST_NPROC_PER_NODE=1
+  fi
 fi
 
 is_distributed=0
@@ -171,8 +158,17 @@ elif [[ "${USE_DISTRIBUTED}" == "auto" ]]; then
   fi
 fi
 
+neoverse_validate_non_negative_int "DIST_NPROC_PER_NODE" "${DIST_NPROC_PER_NODE}" || die "Invalid DIST_NPROC_PER_NODE=${DIST_NPROC_PER_NODE}"
+neoverse_validate_non_negative_int "DIST_NNODES" "${DIST_NNODES}" || die "Invalid DIST_NNODES=${DIST_NNODES}"
+neoverse_validate_non_negative_int "DIST_NODE_RANK" "${DIST_NODE_RANK}" || die "Invalid DIST_NODE_RANK=${DIST_NODE_RANK}"
 if [[ "${DIST_NPROC_PER_NODE}" -le 0 || "${DIST_NNODES}" -le 0 ]]; then
   die "Invalid distributed size: DIST_NPROC_PER_NODE=${DIST_NPROC_PER_NODE}, DIST_NNODES=${DIST_NNODES}"
+fi
+if [[ "${DIST_NODE_RANK}" -ge "${DIST_NNODES}" ]]; then
+  die "DIST_NODE_RANK=${DIST_NODE_RANK} must be smaller than DIST_NNODES=${DIST_NNODES}"
+fi
+if [[ "${LOCAL_VISIBLE_GPU_COUNT}" -gt 0 && "${DIST_NPROC_PER_NODE}" -gt "${LOCAL_VISIBLE_GPU_COUNT}" ]]; then
+  die "DIST_NPROC_PER_NODE=${DIST_NPROC_PER_NODE} exceeds visible GPU count ${LOCAL_VISIBLE_GPU_COUNT} from CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}. Set GPU_LIST/CUDA_VISIBLE_DEVICES or DIST_NPROC_PER_NODE consistently."
 fi
 
 GLOBAL_NUM_PROCESSES=$((DIST_NPROC_PER_NODE * DIST_NNODES))
@@ -321,6 +317,7 @@ LOG_FILE=${LOG_FILE}
 PID_FILE=${PID_FILE}
 GPU_LIST=${GPU_LIST}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}
+LOCAL_VISIBLE_GPU_COUNT=${LOCAL_VISIBLE_GPU_COUNT}
 MIXED_PRECISION=${MIXED_PRECISION}
 PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}
 USE_DISTRIBUTED=${USE_DISTRIBUTED}
@@ -364,6 +361,7 @@ log "output_path=${OUTPUT_PATH}"
 log "log_file=${LOG_FILE}"
 log "config=${CONFIG}"
 log "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-unset}"
+log "local_visible_gpu_count=${LOCAL_VISIBLE_GPU_COUNT}"
 log "is_distributed=${is_distributed}"
 log "global_num_processes=${GLOBAL_NUM_PROCESSES}"
 log "dist_nproc_per_node=${DIST_NPROC_PER_NODE}"
@@ -378,10 +376,11 @@ log "config_file=${CONFIG_FILE}"
 run_cmd bash -n "$0"
 run_cmd "${ENV_PYTHON}" -m py_compile \
   tools/train/distill_control_latent.py \
+  training/control_latent/distill.py \
+  training/control_latent/reconstructor_tokens.py \
   diffsynth/models/student_adapters.py \
   diffsynth/pipelines/wan_video_neoverse.py \
   diffsynth/models/wan_video_neoverse_controller.py \
-  hooks/extract_vggt_tokens.py \
   training/data/base_dataset.py \
   training/data/datasets/spatialvid.py \
   training/data/temporal_trajectory.py \

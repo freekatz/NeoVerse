@@ -12,8 +12,8 @@ CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
-from tools.train import distill_control_latent as train_mod
-from tools.train.distill_control_latent import ControlLatentDistillModule, frozen_cache_signature
+from training.control_latent import distill as train_mod
+from training.control_latent.distill import ControlLatentDistillModule, frozen_cache_signature
 
 
 def parse_bool(value):
@@ -150,7 +150,7 @@ def prepare_model(cfg, device):
 
 def main():
     parser = argparse.ArgumentParser(description="Build fixed clip/trajectory frozen forward caches for SpatialVID distillation.")
-    parser.add_argument("--config", default="configs/distill_control_latent.yaml")
+    parser.add_argument("--config", default="configs/distill/control_latent.yaml")
     parser.add_argument("--data_root", default=None)
     parser.add_argument("--output_dir", default="outputs/NeoVerseControlLatentDistill/frozen_cache")
     parser.add_argument("--run_output_dir", default="outputs/NeoVerseControlLatentDistill/frozen_cache_build")

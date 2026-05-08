@@ -24,19 +24,24 @@ die() {
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+source "${SCRIPT_DIR}/runtime_env.sh"
 
 LAUNCH_MODE="${LAUNCH_MODE:-foreground}"
 DRY_RUN="${DRY_RUN:-0}"
 VENV_PATH="${VENV_PATH:-/root/vepfs/envs/neoverse}"
 ENV_PYTHON="${ENV_PYTHON:-${PYTHON:-${VENV_PATH}/bin/python}}"
-CONFIG="${CONFIG:-configs/distill_control_latent.yaml}"
+CONFIG="${CONFIG:-configs/distill/control_latent.yaml}"
 PROJECT_NAME="${PROJECT_NAME:-NeoVerseControlLatentDistill}"
 RUN_TIME="${RUN_TIME:-$(timestamp_utc)}"
 OUTPUT_DIR="${FROZEN_CACHE_DIR:-${OUTPUT_DIR:-${CODE_DIR}/outputs/${PROJECT_NAME}/frozen_cache}}"
 LOG_DIR="${LOG_DIR:-${CODE_DIR}/outputs/${PROJECT_NAME}/frozen_cache_logs/${RUN_TIME}}"
 RUN_OUTPUT_DIR="${RUN_OUTPUT_DIR:-${LOG_DIR}/run_output}"
 PID_FILE="${PID_FILE:-${LOG_DIR}/run.pid}"
-GPU_LIST="${GPU_LIST:-${CUDA_VISIBLE_DEVICES:-0}}"
+GPU_LIST="${GPU_LIST:-}"
+CACHE_NNODES="${CACHE_NNODES:-${MLP_WORKER_NUM:-1}}"
+CACHE_NODE_RANK="${CACHE_NODE_RANK:-${MLP_ROLE_INDEX:-0}}"
+CACHE_GLOBAL_NUM_SHARDS="${CACHE_GLOBAL_NUM_SHARDS:-}"
+CACHE_GLOBAL_SHARD_OFFSET="${CACHE_GLOBAL_SHARD_OFFSET:-}"
 DEFAULT_CAMERA_CACHE_DIR="${DEFAULT_CAMERA_CACHE_DIR:-${CODE_DIR}/outputs/${PROJECT_NAME}/camera_cache}"
 USE_CAMERA_CACHE="${USE_CAMERA_CACHE:-auto}"
 
@@ -69,16 +74,36 @@ if [[ "${LAUNCH_MODE}" == "background" && "${_NEOVERSE_FROZEN_CACHE_BG:-0}" != "
   exit 0
 fi
 
-IFS=',' read -r -a raw_gpus <<< "${GPU_LIST}"
-gpu_ids=()
-for gpu in "${raw_gpus[@]}"; do
-  gpu="${gpu//[[:space:]]/}"
-  if [[ -n "${gpu}" ]]; then
-    gpu_ids+=("${gpu}")
-  fi
-done
+GPU_LIST="$(neoverse_resolve_gpu_list "${GPU_LIST}" "${CUDA_VISIBLE_DEVICES:-}" "${MLP_WORKER_GPU:-}" "${ENV_PYTHON}")"
+neoverse_split_csv "${GPU_LIST}"
+gpu_ids=("${NEOVERSE_SPLIT_ITEMS[@]}")
 if [[ "${#gpu_ids[@]}" -eq 0 ]]; then
   die "GPU_LIST is empty"
+fi
+neoverse_validate_non_negative_int "CACHE_NNODES" "${CACHE_NNODES}" || die "Invalid CACHE_NNODES=${CACHE_NNODES}"
+neoverse_validate_non_negative_int "CACHE_NODE_RANK" "${CACHE_NODE_RANK}" || die "Invalid CACHE_NODE_RANK=${CACHE_NODE_RANK}"
+if [[ "${CACHE_NNODES}" -le 0 ]]; then
+  die "CACHE_NNODES must be positive, got ${CACHE_NNODES}"
+fi
+if [[ "${CACHE_NODE_RANK}" -ge "${CACHE_NNODES}" ]]; then
+  die "CACHE_NODE_RANK=${CACHE_NODE_RANK} must be smaller than CACHE_NNODES=${CACHE_NNODES}"
+fi
+
+local_num_shards="${#gpu_ids[@]}"
+if [[ -z "${CACHE_GLOBAL_NUM_SHARDS}" ]]; then
+  CACHE_GLOBAL_NUM_SHARDS=$((local_num_shards * CACHE_NNODES))
+fi
+if [[ -z "${CACHE_GLOBAL_SHARD_OFFSET}" ]]; then
+  CACHE_GLOBAL_SHARD_OFFSET=$((CACHE_NODE_RANK * local_num_shards))
+fi
+neoverse_validate_non_negative_int "CACHE_GLOBAL_NUM_SHARDS" "${CACHE_GLOBAL_NUM_SHARDS}" || die "Invalid CACHE_GLOBAL_NUM_SHARDS=${CACHE_GLOBAL_NUM_SHARDS}"
+neoverse_validate_non_negative_int "CACHE_GLOBAL_SHARD_OFFSET" "${CACHE_GLOBAL_SHARD_OFFSET}" || die "Invalid CACHE_GLOBAL_SHARD_OFFSET=${CACHE_GLOBAL_SHARD_OFFSET}"
+if [[ "${CACHE_GLOBAL_NUM_SHARDS}" -le 0 ]]; then
+  die "CACHE_GLOBAL_NUM_SHARDS must be positive, got ${CACHE_GLOBAL_NUM_SHARDS}"
+fi
+max_global_shard_index=$((CACHE_GLOBAL_SHARD_OFFSET + local_num_shards - 1))
+if [[ "${max_global_shard_index}" -ge "${CACHE_GLOBAL_NUM_SHARDS}" ]]; then
+  die "Shard range ${CACHE_GLOBAL_SHARD_OFFSET}-${max_global_shard_index} exceeds CACHE_GLOBAL_NUM_SHARDS=${CACHE_GLOBAL_NUM_SHARDS}"
 fi
 
 if [[ -z "${CAMERA_CACHE_DIR:-}" ]]; then
@@ -145,7 +170,11 @@ log "output_dir=${OUTPUT_DIR}"
 log "log_dir=${LOG_DIR}"
 log "run_output_dir=${RUN_OUTPUT_DIR}"
 log "gpu_list=${GPU_LIST}"
-log "num_shards=${#gpu_ids[@]}"
+log "local_num_shards=${local_num_shards}"
+log "cache_nnodes=${CACHE_NNODES}"
+log "cache_node_rank=${CACHE_NODE_RANK}"
+log "cache_global_num_shards=${CACHE_GLOBAL_NUM_SHARDS}"
+log "cache_global_shard_offset=${CACHE_GLOBAL_SHARD_OFFSET}"
 log "camera_cache_dir=${CAMERA_CACHE_DIR:-}"
 log "camera_cache_required=${CAMERA_CACHE_REQUIRED:-}"
 log "common_args=${common_args[*]}"
@@ -153,12 +182,14 @@ log "extra_args=$*"
 
 if [[ "${DRY_RUN}" == "1" ]]; then
   log "+ bash -n $0"
-  log "+ ${ENV_PYTHON} -m py_compile tools/cache/build_frozen_cache.py tools/train/distill_control_latent.py training/data/datasets/spatialvid.py training/data/temporal_trajectory.py"
+  log "+ ${ENV_PYTHON} -m py_compile tools/cache/build_frozen_cache.py tools/train/distill_control_latent.py training/control_latent/distill.py training/control_latent/reconstructor_tokens.py training/data/datasets/spatialvid.py training/data/temporal_trajectory.py"
 else
   bash -n "$0"
   "${ENV_PYTHON}" -m py_compile \
     tools/cache/build_frozen_cache.py \
     tools/train/distill_control_latent.py \
+    training/control_latent/distill.py \
+    training/control_latent/reconstructor_tokens.py \
     training/data/datasets/spatialvid.py \
     training/data/temporal_trajectory.py
 fi
@@ -166,16 +197,17 @@ fi
 pids=()
 for shard_index in "${!gpu_ids[@]}"; do
   gpu="${gpu_ids[shard_index]}"
+  global_shard_index=$((CACHE_GLOBAL_SHARD_OFFSET + shard_index))
   safe_gpu="${gpu//[^A-Za-z0-9_.-]/_}"
-  shard_log="${LOG_DIR}/shard_${shard_index}_gpu_${safe_gpu}.log"
-  shard_run_output="${RUN_OUTPUT_DIR}/shard_${shard_index}"
+  shard_log="${LOG_DIR}/shard_${global_shard_index}_node_${CACHE_NODE_RANK}_gpu_${safe_gpu}.log"
+  shard_run_output="${RUN_OUTPUT_DIR}/shard_${global_shard_index}"
   shard_cmd=(
     "${ENV_PYTHON}" tools/cache/build_frozen_cache.py
     "${common_args[@]}"
     --run_output_dir "${shard_run_output}"
     --device cuda:0
-    --num_shards "${#gpu_ids[@]}"
-    --shard_index "${shard_index}"
+    --num_shards "${CACHE_GLOBAL_NUM_SHARDS}"
+    --shard_index "${global_shard_index}"
     "$@"
   )
   log "+ CUDA_VISIBLE_DEVICES=${gpu} ${shard_cmd[*]} 2>&1 | tee ${shard_log}"

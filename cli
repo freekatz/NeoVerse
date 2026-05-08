@@ -23,6 +23,8 @@ Usage:
   ./cli cache build-frozen [builder args]
   ./cli cache inspect [inspect args]
   ./cli eval last CONFIG CHECKPOINT [dataset indices...]
+  ./cli eval generation-suite run|analyze|report|adapter-cache [args]
+  ./cli profile distill-step [args]
   ./cli debug temporal [args]
   ./cli debug reconstruction [args]
   ./cli overfit conv|cross [extra OmegaConf overrides...]
@@ -88,6 +90,24 @@ usage_eval() {
   cat <<'EOF'
 Usage:
   ./cli eval last CONFIG CHECKPOINT [dataset indices...]
+  ./cli eval generation-suite run|analyze|report|adapter-cache [args]
+EOF
+}
+
+usage_generation_suite() {
+  cat <<'EOF'
+Usage:
+  ./cli eval generation-suite run [args]
+  ./cli eval generation-suite analyze [args]
+  ./cli eval generation-suite report [args]
+  ./cli eval generation-suite adapter-cache [args]
+EOF
+}
+
+usage_profile() {
+  cat <<'EOF'
+Usage:
+  ./cli profile distill-step [args]
 EOF
 }
 
@@ -120,7 +140,7 @@ die() {
 }
 
 common_online_env() {
-  export GPU_LIST="${GPU_LIST:-0,1}"
+  export GPU_LIST="${GPU_LIST:-${CUDA_VISIBLE_DEVICES:-}}"
   export CAMERA_CONDITION_NORMALIZE="${CAMERA_CONDITION_NORMALIZE:-true}"
   export CAMERA_CONDITION_MIN_TRANSLATION_SCALE="${CAMERA_CONDITION_MIN_TRANSLATION_SCALE:-1.0}"
   export USE_CAMERA_ANNOTATIONS="${USE_CAMERA_ANNOTATIONS:-false}"
@@ -192,12 +212,10 @@ train_online_noaug() {
 }
 
 cache_build_camera() {
-  export GPU_LIST="${GPU_LIST:-0,1}"
   bash scripts/launch/build_camera_cache.sh "$@"
 }
 
 cache_build_frozen() {
-  export GPU_LIST="${GPU_LIST:-0,1}"
   bash scripts/launch/build_frozen_cache.sh "$@"
 }
 
@@ -218,7 +236,7 @@ eval_last() {
     indices=(0 17 33 81 159 240 319)
   fi
   for index in "${indices[@]}"; do
-    "${PYTHON}" tools/eval/replace_teacher_with_student.py \
+    "${PYTHON}" tools/eval/render_student_comparison.py \
       "${config}" \
       "${checkpoint}" \
       --output_dir "$(dirname "${checkpoint}")/eval_idx${index}" \
@@ -226,6 +244,21 @@ eval_last() {
       --modes teacher,student \
       --enable_vram_management
   done
+}
+
+eval_generation_suite() {
+  local subcmd="${1:-help}"
+  if [[ "$#" -gt 0 ]]; then
+    shift
+  fi
+  case "${subcmd}" in
+    help|-h|--help) usage_generation_suite ;;
+    run) "${PYTHON}" experiments/archive/midterm/run_generation_suite.py "$@" ;;
+    analyze) "${PYTHON}" experiments/archive/midterm/analyze_generation_suite.py "$@" ;;
+    report) "${PYTHON}" experiments/archive/midterm/report_generation_suite.py "$@" ;;
+    adapter-cache) "${PYTHON}" experiments/archive/midterm/adapter_cache_eval.py "$@" ;;
+    *) usage_generation_suite >&2; die "Unknown generation-suite command: ${subcmd}" ;;
+  esac
 }
 
 debug_temporal() {
@@ -246,6 +279,10 @@ overfit_cross() {
 
 data_prepare_spatialvid_hq() {
   bash scripts/data/prepare_spatialvid_hq.sh "$@"
+}
+
+profile_distill_step() {
+  "${PYTHON}" tools/profile/distill_step.py "$@"
 }
 
 infer_neoverse() {
@@ -327,7 +364,20 @@ dispatch_eval() {
   case "${subcmd}" in
     help|-h|--help) usage_eval ;;
     last) eval_last "$@" ;;
+    generation-suite) eval_generation_suite "$@" ;;
     *) usage_eval >&2; die "Unknown eval command: ${subcmd}" ;;
+  esac
+}
+
+dispatch_profile() {
+  local subcmd="${1:-help}"
+  if [[ "$#" -gt 0 ]]; then
+    shift
+  fi
+  case "${subcmd}" in
+    help|-h|--help) usage_profile ;;
+    distill-step) profile_distill_step "$@" ;;
+    *) usage_profile >&2; die "Unknown profile command: ${subcmd}" ;;
   esac
 }
 
@@ -381,6 +431,7 @@ case "${cmd}" in
   app) dispatch_app "$@" ;;
   cache) dispatch_cache "$@" ;;
   eval) dispatch_eval "$@" ;;
+  profile) dispatch_profile "$@" ;;
   debug) dispatch_debug "$@" ;;
   overfit) dispatch_overfit "$@" ;;
   data) dispatch_data "$@" ;;

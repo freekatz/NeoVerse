@@ -24,7 +24,7 @@ CODE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 VENV_PATH="${VENV_PATH:-/root/vepfs/envs/neoverse}"
 ENV_PYTHON="${ENV_PYTHON:-${VENV_PATH}/bin/python}"
-CONFIG="${CONFIG:-configs/distill_control_latent.yaml}"
+CONFIG="${CONFIG:-configs/distill/control_latent.yaml}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/reconstruction_context_compare/$(timestamp_utc)}"
 if [[ "${OUTPUT_DIR}" != /* ]]; then
   OUTPUT_DIR="${CODE_DIR}/${OUTPUT_DIR}"

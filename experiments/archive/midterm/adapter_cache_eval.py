@@ -13,7 +13,7 @@ from pathlib import Path
 import torch
 import yaml
 
-CODE_DIR = Path(__file__).resolve().parents[2]
+CODE_DIR = Path(__file__).resolve().parents[3]
 if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
 

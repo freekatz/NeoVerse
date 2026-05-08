@@ -19,7 +19,7 @@ from diffsynth.models import ModelManager
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
 from diffsynth.utils import ModelConfig
 from diffsynth.utils.auxiliary import homo_matrix_inverse
-from tools.train.distill_control_latent import build_spatialvid_dataset
+from training.control_latent.distill import build_spatialvid_dataset
 
 
 CAMERA_KEYS = {"camera_poses", "camera_intrs"}
@@ -639,7 +639,7 @@ def parse_indices(text):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Compare USE_CAMERA_ANNOTATIONS=true/false teacher render semantics.")
-    parser.add_argument("--config", default="configs/distill_control_latent.yaml")
+    parser.add_argument("--config", default="configs/distill/control_latent.yaml")
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--dataset_indices", default="0")
     parser.add_argument("--num_frames", type=int, default=81)
