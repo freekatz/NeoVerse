@@ -20,12 +20,12 @@ from accelerate import Accelerator
 from accelerate import InitProcessGroupKwargs
 from omegaconf import OmegaConf
 from PIL import Image
-from torch.utils.tensorboard import SummaryWriter
 
 from diffsynth.models.student_adapters import build_student_adapter
 from diffsynth.models.wan_video_dit import sinusoidal_embedding_1d
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
 from training.control_latent.reconstructor_tokens import compose_views_from_list, extract_vggt_tokens, pack_worldmirror_token_list
+from training.swanlab_utils import init_swanlab_logger
 from training.data.datasets.spatialvid import SpatialVID
 
 
@@ -485,6 +485,21 @@ def add_time_metrics(metrics, target_times, source_times, device):
         metrics["time/source_end_s"] = source_times_f[:, -1].mean()
         if target_times is not None:
             metrics["time/source_target_start_delta_s"] = (source_times_f[:, 0] - target_times.detach().float()[:, 0]).abs().mean()
+
+
+def compact_distill_log_metrics(metrics, prefix, lr=None):
+    key_map = {
+        "loss": "loss",
+        "condition/l1": "l1",
+        "condition/cosine": "cosine",
+    }
+    out = {}
+    for source_key, target_key in key_map.items():
+        if source_key in metrics:
+            out[f"{prefix}/{target_key}"] = metrics[source_key]
+    if lr is not None:
+        out[f"{prefix}/lr"] = lr
+    return out
 
 
 def detach_optional_tensor(x):
@@ -1401,7 +1416,16 @@ def main():
             print(f"Checkpoint step={step} already reached max_steps={int(cfg.max_steps)}. Exiting.")
         accelerator.end_training()
         return
-    writer = SummaryWriter(log_dir=cfg.output_path) if accelerator.is_main_process else None
+    experiment_logger = (
+        init_swanlab_logger(
+            cfg,
+            default_project="NeoVerseControlLatentDistill",
+            default_experiment_name=os.path.basename(os.path.normpath(str(cfg.output_path))),
+            output_path=str(cfg.output_path),
+        )
+        if accelerator.is_main_process
+        else None
+    )
 
     cached_train_batch = None
     if bool(cfg.get("cache_train_batch", False)):
@@ -1483,9 +1507,9 @@ def main():
                         f"{k}={v:.4g}" for k, v in metrics_float.items() if k == "loss" or k.endswith("/l1")
                     )
                     print(f"epoch={epoch} step={step} dt={elapsed:.2f}s {summary}")
-                    if writer is not None:
-                        for key, value in metrics_float.items():
-                            writer.add_scalar(key, value, step)
+                    if experiment_logger is not None:
+                        lr = optimizer.param_groups[0]["lr"]
+                        experiment_logger.log(compact_distill_log_metrics(metrics_float, "train", lr=lr), step=step)
                     shapes = accelerator.unwrap_model(model).last_shapes
                     print(f"token_shape={shapes['tokens']} output_grid={shapes['output_grid']}")
                     first_key = next(iter(shapes["teacher"]))
@@ -1502,9 +1526,8 @@ def main():
                                 if k == "loss" or k.endswith("/l1")
                             )
                             print(f"eval step={step} dt={time.time() - eval_start:.2f}s {summary}")
-                            if writer is not None:
-                                for key, value in eval_metrics.items():
-                                    writer.add_scalar(f"eval/{key}", value, step)
+                            if experiment_logger is not None:
+                                experiment_logger.log(compact_distill_log_metrics(eval_metrics, "eval"), step=step)
                         else:
                             print(f"eval step={step} skipped: no eval batches")
 
@@ -1530,14 +1553,14 @@ def main():
 
                 if cfg.get("max_steps", None) is not None and step >= int(cfg.max_steps):
                     save_checkpoint(accelerator, model, optimizer, cfg, cfg.output_path, step, epoch=epoch, name="adapter_last.pt")
-                    if writer is not None:
-                        writer.close()
+                    if experiment_logger is not None:
+                        experiment_logger.finish()
                     accelerator.end_training()
                     return
 
     save_checkpoint(accelerator, model, optimizer, cfg, cfg.output_path, step, epoch=int(cfg.num_epochs) - 1, name="adapter_last.pt")
-    if writer is not None:
-        writer.close()
+    if experiment_logger is not None:
+        experiment_logger.finish()
     accelerator.end_training()
 
 

@@ -12,7 +12,7 @@ import logging
 from accelerate import Accelerator
 from accelerate import InitProcessGroupKwargs
 from accelerate.logging import get_logger
-from torch.utils.tensorboard import SummaryWriter
+from training.swanlab_utils import init_swanlab_logger
 
 printer = get_logger(__name__)
 
@@ -455,8 +455,15 @@ def launch_training_task(
         start_epoch = args.start_epoch
         resume_step = args.resume_step
 
-    log_writer = (
-        SummaryWriter(log_dir=args.output_path) if accelerator.is_main_process else None
+    experiment_logger = (
+        init_swanlab_logger(
+            args,
+            default_project="DiffSynth",
+            default_experiment_name=os.path.basename(os.path.normpath(str(args.output_path))),
+            output_path=args.output_path,
+        )
+        if accelerator.is_main_process
+        else None
     )
 
     printer.info("Start training")
@@ -500,15 +507,16 @@ def launch_training_task(
                         torch.tensor(loss_value).to(accelerator.device)
                     ).mean()  # MUST BE EXECUTED BY ALL NODES
 
-                    if log_writer is None:
-                        continue
-                    """ We use epoch_1000x as the x-axis in tensorboard.
-                    This calibrates different curves when batch size changes.
-                    """
-                    epoch_1000x = int(epoch_f * 1000)
-                    log_writer.add_scalar("train_loss", loss_value_reduce, step)
-                    log_writer.add_scalar("train_lr", lr, step)
-                    log_writer.add_scalar("train_iter", epoch_1000x, step)
+                    if experiment_logger is not None:
+                        epoch_1000x = int(epoch_f * 1000)
+                        experiment_logger.log(
+                            {
+                                "train/loss": loss_value_reduce,
+                                "train/lr": lr,
+                                "train/epoch_1000x": epoch_1000x,
+                            },
+                            step=step,
+                        )
             if (
                 data_iter_step % int(args.save_freq * len(dataloader)) == 0
                 and iter_step != 0
@@ -517,3 +525,5 @@ def launch_training_task(
                 print("saving at step", data_iter_step)
                 metric_logger.save(accelerator, model, epoch_id, data_iter_step)
         metric_logger.save(accelerator, model, epoch_id + 1)
+    if experiment_logger is not None:
+        experiment_logger.finish()

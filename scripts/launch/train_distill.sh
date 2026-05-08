@@ -290,6 +290,13 @@ append_override_if_set "EVAL_FREQ" "eval_freq"
 append_override_if_set "EVAL_STEPS" "eval_steps"
 append_override_if_set "EVAL_BATCH_SIZE" "eval_batch_size"
 append_override_if_set "EVAL_NUM_WORKERS" "eval_num_workers"
+append_override_if_set "SWANLAB_ENABLED" "swanlab_enabled"
+append_override_if_set "SWANLAB_PROJECT" "swanlab_project"
+append_override_if_set "SWANLAB_EXPERIMENT_NAME" "swanlab_experiment_name"
+append_override_if_set "SWANLAB_WORKSPACE" "swanlab_workspace"
+append_override_if_set "SWANLAB_MODE" "swanlab_mode"
+append_override_if_set "SWANLAB_LOGDIR" "swanlab_logdir"
+append_override_if_set "SWANLAB_TAGS" "swanlab_tags"
 
 read -r -a accelerate_extra_args <<< "${ACCELERATE_EXTRA_ARGS}"
 
@@ -351,6 +358,13 @@ TRAJECTORIES_PER_CLIP_VALUE=${TRAJECTORIES_PER_CLIP_VALUE}
 TEMPORAL_VARIANT_PROFILE_WEIGHTS=${TEMPORAL_VARIANT_PROFILE_WEIGHTS:-}
 CAMERA_CACHE_DIR=${CAMERA_CACHE_DIR:-}
 CAMERA_CACHE_REQUIRED=${CAMERA_CACHE_REQUIRED:-}
+SWANLAB_ENABLED=${SWANLAB_ENABLED:-}
+SWANLAB_PROJECT=${SWANLAB_PROJECT:-}
+SWANLAB_EXPERIMENT_NAME=${SWANLAB_EXPERIMENT_NAME:-}
+SWANLAB_WORKSPACE=${SWANLAB_WORKSPACE:-}
+SWANLAB_MODE=${SWANLAB_MODE:-}
+SWANLAB_LOGDIR=${SWANLAB_LOGDIR:-}
+SWANLAB_TAGS=${SWANLAB_TAGS:-}
 TRAIN_OVERRIDES=${TRAIN_OVERRIDES[*]}
 EXTRA_OVERRIDES=$*
 EOF

@@ -30,11 +30,6 @@ Development paths:
   ./cli dev app degradation|wan-4step [args]
   ./cli legacy train-base CONFIG [args]
 
-Compatibility aliases still work:
-  ./cli train base CONFIG [args]
-  ./cli profile|debug|overfit|data ...
-  ./cli app degradation|wan-4step [args]
-
 Useful env overrides:
   GPU_LIST=0,1
   RUN_NAME=train_cache
@@ -56,13 +51,11 @@ Usage:
   ./cli train cache [extra OmegaConf overrides...]
   ./cli train online [extra OmegaConf overrides...]
   ./cli train online-noaug [extra OmegaConf overrides...]
-  ./cli train base CONFIG [args]
 
 Commands:
   cache   Train directly from frozen_cache/*.pt with deterministic train/eval split.
   online  Dev path: online SpatialVID training with temporal augmentation.
   online-noaug  Dev path: online training without temporal augmentation.
-  base    Legacy path: run the original NeoVerse training entry.
 EOF
 }
 
@@ -78,13 +71,9 @@ usage_app() {
 Usage:
   ./cli app neoverse [args]
 
-Development app aliases:
+Development app commands:
   ./cli dev app degradation [args]
   ./cli dev app wan-4step [args]
-
-Compatibility aliases:
-  ./cli app degradation [args]
-  ./cli app wan-4step [args]
 EOF
 }
 
@@ -108,9 +97,6 @@ usage_profile() {
   cat <<'EOF'
 Usage:
   ./cli dev profile distill-step [args]
-
-Compatibility alias:
-  ./cli profile distill-step [args]
 EOF
 }
 
@@ -134,10 +120,6 @@ usage_debug() {
 Usage:
   ./cli dev debug temporal [args]
   ./cli dev debug reconstruction [args]
-
-Compatibility aliases:
-  ./cli debug temporal [args]
-  ./cli debug reconstruction [args]
 EOF
 }
 
@@ -146,10 +128,6 @@ usage_overfit() {
 Usage:
   ./cli dev overfit conv [extra OmegaConf overrides...]
   ./cli dev overfit cross [extra OmegaConf overrides...]
-
-Compatibility aliases:
-  ./cli overfit conv [extra OmegaConf overrides...]
-  ./cli overfit cross [extra OmegaConf overrides...]
 EOF
 }
 
@@ -157,9 +135,6 @@ usage_data() {
   cat <<'EOF'
 Usage:
   ./cli dev data prepare-spatialvid-hq [args]
-
-Compatibility alias:
-  ./cli data prepare-spatialvid-hq [args]
 EOF
 }
 
@@ -196,9 +171,6 @@ usage_legacy() {
   cat <<'EOF'
 Usage:
   ./cli legacy train-base CONFIG [args]
-
-Compatibility alias:
-  ./cli train base CONFIG [args]
 EOF
 }
 
@@ -384,7 +356,6 @@ dispatch_train() {
   fi
   case "${subcmd}" in
     help|-h|--help) usage_train ;;
-    base) train_base "$@" ;;
     online) train_online "$@" ;;
     online-noaug) train_online_noaug "$@" ;;
     cache) train_cache "$@" ;;
@@ -412,8 +383,6 @@ dispatch_app() {
   case "${subcmd}" in
     help|-h|--help) usage_app ;;
     neoverse) app_neoverse "$@" ;;
-    degradation) app_degradation "$@" ;;
-    wan-4step) app_wan_4step "$@" ;;
     *) usage_app >&2; die "Unknown app command: ${subcmd}" ;;
   esac
 }
@@ -574,11 +543,7 @@ case "${cmd}" in
   app) dispatch_app "$@" ;;
   cache) dispatch_cache "$@" ;;
   eval) dispatch_eval "$@" ;;
-  profile) dispatch_profile "$@" ;;
   volc) dispatch_volc "$@" ;;
-  debug) dispatch_debug "$@" ;;
-  overfit) dispatch_overfit "$@" ;;
-  data) dispatch_data "$@" ;;
   dev) dispatch_dev "$@" ;;
   legacy) dispatch_legacy "$@" ;;
   *) usage >&2; die "Unknown command: ${cmd}" ;;

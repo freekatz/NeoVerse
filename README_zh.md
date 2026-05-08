@@ -77,9 +77,6 @@ frozen cache -> adapter 训练
 ./cli legacy train-base training/configs/train.yaml
 ```
 
-兼容入口仍可用：`./cli profile ...`、`./cli debug ...`、`./cli overfit ...`、
-`./cli data ...`、`./cli train base ...`。
-
 ## 火山任务
 
 先导入密钥到本机 MLP CLI 配置，密钥不会写入仓库：
@@ -147,6 +144,8 @@ FIXED_CLIPS_PER_SCENE=16
 TRAJECTORIES_PER_CLIP=8
 FROZEN_CACHE_EVAL_RATIO=0.05
 EVAL_FREQ=500
+SWANLAB_MODE=cloud        # 需要 SWANLAB_API_KEY；本地离线可改 offline
+SWANLAB_PROJECT=NeoVerseControlLatentDistill
 ```
 
 例子：

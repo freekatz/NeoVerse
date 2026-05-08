@@ -10,6 +10,7 @@ import yaml
 CODE_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_JOB_ROOT = CODE_DIR / "deploy" / "volc" / "generated"
 DEFAULT_MLP_VOLC = "/root/.volc/bin/volc"
+PRIVATE_ENV_NAMES = {"SWANLAB_API_KEY"}
 
 PRESET_COMMANDS = {
     "train-cache": "./cli train cache",
@@ -44,7 +45,7 @@ def parse_env(items):
         name, value = item.split("=", 1)
         if not name:
             raise ValueError(f"--env expects non-empty KEY, got {item!r}")
-        result.append({"Name": name, "Value": value, "IsPrivate": False})
+        result.append({"Name": name, "Value": value, "IsPrivate": name in PRIVATE_ENV_NAMES})
     return result
 
 
@@ -53,6 +54,13 @@ def optional_env(name):
     if value is None:
         return []
     return [{"Name": name, "Value": value, "IsPrivate": False}]
+
+
+def private_optional_env(name):
+    value = env_value(name)
+    if value is None:
+        return []
+    return [{"Name": name, "Value": value, "IsPrivate": True}]
 
 
 def resolve_path(path):
@@ -77,8 +85,18 @@ def build_envs(args):
         "CACHE_NODE_RANK",
         "CACHE_GLOBAL_NUM_SHARDS",
         "CACHE_GLOBAL_SHARD_OFFSET",
+        "SWANLAB_ENABLED",
+        "SWANLAB_PROJECT",
+        "SWANLAB_EXPERIMENT_NAME",
+        "SWANLAB_WORKSPACE",
+        "SWANLAB_MODE",
+        "SWANLAB_LOGDIR",
+        "SWANLAB_TAGS",
+        "SWANLAB_HOST",
+        "SWANLAB_WEB_HOST",
     ):
         envs.extend(optional_env(name))
+    envs.extend(private_optional_env("SWANLAB_API_KEY"))
     envs.extend(parse_env(args.env))
     return envs
 

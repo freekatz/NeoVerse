@@ -157,6 +157,14 @@ preload_frozen_cache_device: cpu
 preload_frozen_cache_batch_size: 1
 shuffle_preloaded_frozen_cache: true
 
+swanlab_enabled: true
+swanlab_project: NeoVerseControlLatentDistill
+swanlab_experiment_name: null
+swanlab_workspace: null
+swanlab_mode: cloud
+swanlab_logdir: null
+swanlab_tags: []
+
 output_path: ./outputs/NeoVerseControlLatentDistill/manual
 auto_resume: true
 resume_from: null

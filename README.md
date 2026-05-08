@@ -267,7 +267,7 @@ We provide 20 sample clips from [SpatialVID](https://huggingface.co/datasets/Fel
 Run the base NeoVerse training entry with:
 
 ```bash
-./cli train base training/configs/train.yaml
+./cli legacy train-base training/configs/train.yaml
 ```
 
 Training configuration (data paths, learning rate, batch size, etc.) is specified in [`training/configs/train.yaml`](training/configs/train.yaml).
