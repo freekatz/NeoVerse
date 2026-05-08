@@ -144,7 +144,9 @@ gradient_accumulation_steps: 1
 clip_grad: 1.0
 cache_train_batch: false
 cache_frozen_outputs: false
+train_from_frozen_cache: false
 frozen_cache_dir: null
+frozen_cache_pattern: "*.pt"
 frozen_cache_read: true
 frozen_cache_write: false
 frozen_cache_required: false

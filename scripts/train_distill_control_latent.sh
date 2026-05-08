@@ -299,6 +299,8 @@ append_override_if_set "CACHE_FROZEN_OUTPUTS" "cache_frozen_outputs"
 if [[ "${FAST_FROZEN_CACHE}" != "1" ]]; then
   append_override_if_set "FROZEN_CACHE_DIR" "frozen_cache_dir"
 fi
+append_override_if_set "TRAIN_FROM_FROZEN_CACHE" "train_from_frozen_cache"
+append_override_if_set "FROZEN_CACHE_PATTERN" "frozen_cache_pattern"
 append_override_if_set "FROZEN_CACHE_READ" "frozen_cache_read"
 append_override_if_set "FROZEN_CACHE_WRITE" "frozen_cache_write"
 append_override_if_set "FROZEN_CACHE_REQUIRED" "frozen_cache_required"

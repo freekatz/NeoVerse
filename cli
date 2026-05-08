@@ -33,9 +33,9 @@ Training presets:
                       sharding like training. Train with CAMERA_CACHE_DIR=<same output_dir>
                       CAMERA_CACHE_REQUIRED=true.
 
-  build-frozen-cache  Builds fixed clip + fixed trajectory frozen caches. Use the
-                      same FIXED_CLIPS_PER_SCENE, TRAJECTORIES_PER_CLIP,
-                      CAMERA_CACHE_DIR, and DATASET_SEED when training.
+  build-frozen-cache  Builds fixed clip + fixed trajectory frozen caches. Train with
+                      USE_FROZEN_CACHE=1 or FROZEN_CACHE_DIR=<cache_dir> to sample
+                      those .pt cache files directly.
 
 Useful env overrides:
   GPU_LIST=0,1

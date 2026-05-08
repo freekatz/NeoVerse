@@ -6,6 +6,7 @@ import os
 import random
 import time
 from collections import OrderedDict
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -675,6 +676,34 @@ def batch_preloaded_frozen_cache(caches, batch_size: int):
     return batches
 
 
+class FrozenForwardCacheDataset(torch.utils.data.Dataset):
+    def __init__(self, cache_dir, pattern="*.pt"):
+        self.cache_dir = str(cache_dir)
+        self.pattern = str(pattern or "*.pt")
+        root = Path(self.cache_dir)
+        if not root.is_dir():
+            raise FileNotFoundError(f"Frozen cache directory does not exist: {self.cache_dir}")
+        self.paths = sorted(str(path) for path in root.glob(self.pattern) if path.is_file())
+        if len(self.paths) == 0:
+            raise FileNotFoundError(f"No frozen cache files matched {self.pattern!r} in {self.cache_dir}")
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        path = self.paths[int(idx)]
+        cache = torch.load(path, map_location="cpu")
+        if not looks_like_frozen_cache(cache):
+            raise ValueError(f"Invalid frozen forward cache file: {path}")
+        cache = dict(cache)
+        cache["cache_path"] = path
+        return cache
+
+
+def collate_frozen_cache_entries(entries):
+    return merge_frozen_cache_entries(entries)
+
+
 class ControlLatentDistillModule(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -1018,13 +1047,29 @@ def main():
     if accelerator.is_main_process:
         OmegaConf.save(cfg, os.path.join(cfg.output_path, "config.yaml"))
 
-    dataset = eval(cfg.train_dataset)
+    train_from_frozen_cache = bool(cfg.get("train_from_frozen_cache", False))
+    if train_from_frozen_cache:
+        if not cfg.get("frozen_cache_dir", None):
+            raise ValueError("train_from_frozen_cache=true requires frozen_cache_dir.")
+        dataset = FrozenForwardCacheDataset(
+            cfg.frozen_cache_dir,
+            pattern=cfg.get("frozen_cache_pattern", "*.pt"),
+        )
+        if accelerator.is_main_process:
+            print(
+                f"Using frozen forward cache dataset: {len(dataset)} files "
+                f"from {cfg.frozen_cache_dir} pattern={cfg.get('frozen_cache_pattern', '*.pt')!r}"
+            )
+    else:
+        dataset = eval(cfg.train_dataset)
     dataloader_kwargs = {
         "batch_size": int(cfg.batch_size),
         "shuffle": True,
         "num_workers": int(cfg.num_workers),
         "pin_memory": bool(cfg.pin_memory),
     }
+    if train_from_frozen_cache:
+        dataloader_kwargs["collate_fn"] = collate_frozen_cache_entries
     if int(cfg.num_workers) > 0:
         dataloader_kwargs["persistent_workers"] = bool(cfg.get("persistent_workers", True))
         if cfg.get("prefetch_factor", None) is not None:
@@ -1073,11 +1118,14 @@ def main():
             total_text = "unknown" if preload_total is None else str(preload_total)
             print(f"Preloading frozen cache from DataLoader to {preload_device} ({total_text} batches on this process).")
         for preload_idx, preload_batch in enumerate(dataloader, start=1):
-            cache = unwrapped.get_forward_cache(preload_batch, device=preload_cache_device)
-            if preload_device == "cpu":
-                cache = cache_to_cpu(cache, dtype=cache_float_dtype(cfg))
+            if looks_like_frozen_cache(preload_batch):
+                cache = cache_to_target_device(
+                    preload_batch,
+                    preload_cache_device,
+                    dtype=cache_float_dtype(cfg) if cache_target_is_cpu(preload_cache_device) else None,
+                )
             else:
-                cache = cache_to_device(cache, accelerator.device)
+                cache = unwrapped.get_forward_cache(preload_batch, device=preload_cache_device)
             preloaded_frozen_batches.append(cache)
             if accelerator.is_main_process and preload_log_freq > 0 and (
                 preload_idx == 1 or preload_idx % preload_log_freq == 0
