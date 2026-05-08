@@ -1252,6 +1252,8 @@ def load_checkpoint(accelerator, model, optimizer, resume_path, load_optimizer=T
     step = int(checkpoint.get("step", 0))
     if accelerator.is_main_process:
         print(f"Resumed adapter checkpoint from {resume_path} at step={step}")
+        if load_optimizer and "optimizer" not in checkpoint:
+            print("WARNING: checkpoint has no optimizer state; continuing with a fresh optimizer.")
     return step
 
 
@@ -1511,6 +1513,9 @@ def main():
                     save_heatmaps(os.path.join(cfg.output_path, "visuals"), step, teacher, student, output_grid)
 
                 if int(cfg.save_freq) > 0 and step % int(cfg.save_freq) == 0:
+                    include_optimizer = bool(cfg.get("resume_optimizer", True)) or bool(
+                        cfg.get("save_optimizer_intermediate", False)
+                    )
                     save_checkpoint(
                         accelerator,
                         model,
@@ -1520,7 +1525,7 @@ def main():
                         step,
                         epoch=epoch,
                         name="adapter_last.pt",
-                        include_optimizer=bool(cfg.get("save_optimizer_intermediate", False)),
+                        include_optimizer=include_optimizer,
                     )
 
                 if cfg.get("max_steps", None) is not None and step >= int(cfg.max_steps):

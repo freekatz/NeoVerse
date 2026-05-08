@@ -161,6 +161,8 @@ output_path: ./outputs/NeoVerseControlLatentDistill/manual
 auto_resume: true
 resume_from: null
 resume_optimizer: true
+# adapter_last.pt keeps optimizer state when resume_optimizer=true; this flag
+# only forces optimizer saving for custom runs that disable resume_optimizer.
 save_optimizer_intermediate: false
 print_freq: 10
 eval_freq: 500
