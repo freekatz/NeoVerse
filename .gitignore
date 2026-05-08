@@ -8,3 +8,5 @@ __pycache__
 /models
 /data/
 /profile_output/
+/deploy/volc/generated/
+/deploy/volc/env.local

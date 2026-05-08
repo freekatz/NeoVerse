@@ -25,6 +25,8 @@ Usage:
   ./cli eval last CONFIG CHECKPOINT [dataset indices...]
   ./cli eval generation-suite run|analyze|report|adapter-cache [args]
   ./cli profile distill-step [args]
+  ./cli volc auth import [AccessKey.txt]
+  ./cli volc submit train-cache|build-camera|build-frozen [args]
   ./cli debug temporal [args]
   ./cli debug reconstruction [args]
   ./cli overfit conv|cross [extra OmegaConf overrides...]
@@ -108,6 +110,21 @@ usage_profile() {
   cat <<'EOF'
 Usage:
   ./cli profile distill-step [args]
+EOF
+}
+
+usage_volc() {
+  cat <<'EOF'
+Usage:
+  ./cli volc auth import [AccessKey.txt]
+  ./cli volc submit train-cache|build-camera|build-frozen [args]
+
+Common env:
+  VOLC_RESOURCE_QUEUE_NAME
+  VOLC_IMAGE_URL
+  VOLC_FLAVOR
+  VOLC_VEPFS_ID
+  DRY_RUN=1
 EOF
 }
 
@@ -285,6 +302,29 @@ profile_distill_step() {
   "${PYTHON}" tools/profile/distill_step.py "$@"
 }
 
+load_volc_env_local() {
+  local env_file="${VOLC_ENV_FILE:-${CODE_DIR}/deploy/volc/env.local}"
+  if [[ -f "${env_file}" ]]; then
+    set -a
+    # shellcheck source=/dev/null
+    source "${env_file}"
+    set +a
+  fi
+}
+
+volc_auth() {
+  "${PYTHON}" tools/volc/import_auth.py "$@"
+}
+
+volc_submit() {
+  if [[ "$#" -lt 1 ]]; then
+    usage_volc >&2
+    exit 2
+  fi
+  load_volc_env_local
+  "${PYTHON}" tools/volc/submit_job.py "$@"
+}
+
 infer_neoverse() {
   "${PYTHON}" tools/inference/neoverse_inference.py "$@"
 }
@@ -381,6 +421,19 @@ dispatch_profile() {
   esac
 }
 
+dispatch_volc() {
+  local subcmd="${1:-help}"
+  if [[ "$#" -gt 0 ]]; then
+    shift
+  fi
+  case "${subcmd}" in
+    help|-h|--help) usage_volc ;;
+    auth) volc_auth "$@" ;;
+    submit) volc_submit "$@" ;;
+    *) usage_volc >&2; die "Unknown volc command: ${subcmd}" ;;
+  esac
+}
+
 dispatch_debug() {
   local subcmd="${1:-help}"
   if [[ "$#" -gt 0 ]]; then
@@ -432,6 +485,7 @@ case "${cmd}" in
   cache) dispatch_cache "$@" ;;
   eval) dispatch_eval "$@" ;;
   profile) dispatch_profile "$@" ;;
+  volc) dispatch_volc "$@" ;;
   debug) dispatch_debug "$@" ;;
   overfit) dispatch_overfit "$@" ;;
   data) dispatch_data "$@" ;;
