@@ -37,6 +37,14 @@ def bool_env(name, default=False):
     return str_to_bool(value)
 
 
+def parse_csv_values(value):
+    if value in (None, "", "null", "None"):
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
 def parse_env(items):
     result = []
     for item in items or []:
@@ -63,6 +71,17 @@ def private_optional_env(name):
     return [{"Name": name, "Value": value, "IsPrivate": True}]
 
 
+def dedupe_envs(envs):
+    deduped = {}
+    order = []
+    for env in envs:
+        name = env["Name"]
+        if name not in deduped:
+            order.append(name)
+        deduped[name] = env
+    return [deduped[name] for name in order]
+
+
 def resolve_path(path):
     path = Path(path)
     return path if path.is_absolute() else (CODE_DIR / path)
@@ -73,11 +92,19 @@ def build_envs(args):
     for name in (
         "RUN_NAME",
         "DATA_ROOT",
+        "VIDEO_IDS",
+        "VIDEO_PATHS",
         "MAX_STEPS",
         "FROZEN_CACHE_DIR",
         "CAMERA_CACHE_DIR",
+        "CAMERA_CACHE_REQUIRED",
+        "CAMERA_CONDITION_NORMALIZE",
+        "CAMERA_CONDITION_MIN_TRANSLATION_SCALE",
         "FIXED_CLIPS_PER_SCENE",
         "TRAJECTORIES_PER_CLIP",
+        "LIMIT",
+        "OVERWRITE",
+        "CONTINUE_ON_ERROR",
         "FROZEN_CACHE_EVAL_RATIO",
         "EVAL_FREQ",
         "PRELOAD_FROZEN_CACHE",
@@ -98,7 +125,7 @@ def build_envs(args):
         envs.extend(optional_env(name))
     envs.extend(private_optional_env("SWANLAB_API_KEY"))
     envs.extend(parse_env(args.env))
-    return envs
+    return dedupe_envs(envs)
 
 
 def storage_config(args):
@@ -112,6 +139,16 @@ def storage_config(args):
     if args.vepfs_sub_path:
         storage["SubPath"] = args.vepfs_sub_path
     return [storage]
+
+
+def retry_config(args):
+    policy_sets = parse_csv_values(args.retry_policy_sets) if args.enable_retry else []
+    return {
+        "EnableRetry": bool(args.enable_retry),
+        "MaxRetryTimes": int(args.max_retry_times),
+        "IntervalSeconds": int(args.retry_interval_seconds),
+        "PolicySets": policy_sets,
+    }
 
 
 def build_conf(args):
@@ -142,6 +179,7 @@ def build_conf(args):
         conf["Priority"] = args.priority
     if args.active_deadline_seconds:
         conf["ActiveDeadlineSeconds"] = args.active_deadline_seconds
+    conf["RetryOptions"] = retry_config(args)
     envs = build_envs(args)
     if envs:
         conf["Envs"] = envs
@@ -204,6 +242,10 @@ def main():
     parser.add_argument("--priority", type=int, default=None if env_value("VOLC_PRIORITY") is None else int(env_value("VOLC_PRIORITY")))
     parser.add_argument("--preemptible", nargs="?", const=True, type=str_to_bool, default=bool_env("VOLC_PREEMPTIBLE", False))
     parser.add_argument("--active-deadline-seconds", default=env_value("VOLC_ACTIVE_DEADLINE_SECONDS", ""))
+    parser.add_argument("--enable-retry", nargs="?", const=True, type=str_to_bool, default=bool_env("VOLC_ENABLE_RETRY", True))
+    parser.add_argument("--max-retry-times", type=int, default=int(env_value("VOLC_MAX_RETRY_TIMES", "5")))
+    parser.add_argument("--retry-interval-seconds", type=int, default=int(env_value("VOLC_RETRY_INTERVAL_SECONDS", "120")))
+    parser.add_argument("--retry-policy-sets", default=env_value("VOLC_RETRY_POLICY_SETS", "Failed"))
     parser.add_argument("--access-type", default=env_value("VOLC_ACCESS_TYPE", "Queue"))
     parser.add_argument("--vepfs-id", default=env_value("VOLC_VEPFS_ID", ""))
     parser.add_argument("--vepfs-sub-path", default=env_value("VOLC_VEPFS_SUB_PATH", ""))

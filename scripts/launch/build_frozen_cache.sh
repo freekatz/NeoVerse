@@ -126,6 +126,20 @@ if [[ -z "${CAMERA_CACHE_DIR:-}" ]]; then
   esac
 fi
 
+if [[ -z "${VIDEO_IDS:-}" && -n "${CAMERA_CACHE_DIR:-}" ]]; then
+  case "${CAMERA_CACHE_REQUIRED:-}" in
+    1|true|yes|on)
+      [[ -d "${CAMERA_CACHE_DIR}" ]] || die "CAMERA_CACHE_DIR does not exist: ${CAMERA_CACHE_DIR}"
+      VIDEO_IDS="$(
+        find "${CAMERA_CACHE_DIR}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+          | sort \
+          | paste -sd, -
+      )"
+      [[ -n "${VIDEO_IDS}" ]] || die "No scene directories found under CAMERA_CACHE_DIR=${CAMERA_CACHE_DIR}"
+      ;;
+  esac
+fi
+
 common_args=(
   --config "${CONFIG}"
   --output_dir "${OUTPUT_DIR}"

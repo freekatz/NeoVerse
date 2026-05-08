@@ -35,7 +35,7 @@ Useful env overrides:
   GPU_LIST=0,1
   RUN_NAME=train_cache
   MAX_STEPS=200000
-  DATA_ROOT=data/SpatialVID_full
+  DATA_ROOT=data/SpatialVID
   FROZEN_CACHE_DIR=outputs/NeoVerseControlLatentDistill/frozen_cache
   CAMERA_CACHE_DIR=outputs/NeoVerseControlLatentDistill/camera_cache
   FIXED_CLIPS_PER_SCENE=16
