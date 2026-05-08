@@ -676,16 +676,81 @@ def batch_preloaded_frozen_cache(caches, batch_size: int):
     return batches
 
 
+def frozen_cache_split_score(path, seed: int) -> float:
+    name = Path(path).name
+    digest = hashlib.sha256(f"{int(seed)}:{name}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=False) / float(1 << 64)
+
+
+def split_frozen_cache_paths(paths, eval_ratio: float, seed: int, mode: str = "hash"):
+    mode = str(mode or "hash").strip().lower()
+    if mode != "hash":
+        raise ValueError(f"Unsupported frozen_cache_split_mode={mode!r}; expected 'hash'.")
+    eval_ratio = float(eval_ratio)
+    if eval_ratio < 0.0 or eval_ratio >= 1.0:
+        raise ValueError(f"frozen_cache_eval_ratio must be in [0, 1), got {eval_ratio}.")
+    paths = sorted(str(path) for path in paths)
+    if eval_ratio <= 0.0 or len(paths) <= 1:
+        return paths, []
+
+    scored = [(frozen_cache_split_score(path, seed), path) for path in paths]
+    train_paths = [path for score, path in scored if score >= eval_ratio]
+    eval_paths = [path for score, path in scored if score < eval_ratio]
+    if len(eval_paths) == 0:
+        score, path = min(scored, key=lambda item: item[0])
+        eval_paths = [path]
+        train_paths = [candidate for _, candidate in scored if candidate != path]
+    elif len(train_paths) == 0:
+        score, path = max(scored, key=lambda item: item[0])
+        train_paths = [path]
+        eval_paths = [candidate for _, candidate in scored if candidate != path]
+    return sorted(train_paths), sorted(eval_paths)
+
+
 class FrozenForwardCacheDataset(torch.utils.data.Dataset):
-    def __init__(self, cache_dir, pattern="*.pt"):
+    def __init__(
+        self,
+        cache_dir,
+        pattern="*.pt",
+        split="all",
+        eval_ratio=0.05,
+        split_seed=0,
+        split_mode="hash",
+        allow_empty=False,
+    ):
         self.cache_dir = str(cache_dir)
         self.pattern = str(pattern or "*.pt")
+        self.split = str(split or "all").strip().lower()
+        self.eval_ratio = float(eval_ratio)
+        self.split_seed = int(split_seed)
+        self.split_mode = str(split_mode or "hash")
         root = Path(self.cache_dir)
         if not root.is_dir():
             raise FileNotFoundError(f"Frozen cache directory does not exist: {self.cache_dir}")
-        self.paths = sorted(str(path) for path in root.glob(self.pattern) if path.is_file())
-        if len(self.paths) == 0:
+        all_paths = sorted(str(path) for path in root.glob(self.pattern) if path.is_file())
+        if len(all_paths) == 0:
             raise FileNotFoundError(f"No frozen cache files matched {self.pattern!r} in {self.cache_dir}")
+        train_paths, eval_paths = split_frozen_cache_paths(
+            all_paths,
+            eval_ratio=self.eval_ratio,
+            seed=self.split_seed,
+            mode=self.split_mode,
+        )
+        if self.split == "all":
+            self.paths = all_paths
+        elif self.split == "train":
+            self.paths = train_paths
+        elif self.split == "eval":
+            self.paths = eval_paths
+        else:
+            raise ValueError(f"frozen_cache_split must be one of train/eval/all, got {self.split!r}.")
+        self.total_paths = len(all_paths)
+        self.split_counts = {"all": len(all_paths), "train": len(train_paths), "eval": len(eval_paths)}
+        if len(self.paths) == 0 and not allow_empty:
+            raise FileNotFoundError(
+                f"No frozen cache files selected for split={self.split!r} from {self.cache_dir} "
+                f"(total={len(all_paths)}, eval_ratio={self.eval_ratio})."
+            )
 
     def __len__(self):
         return len(self.paths)
@@ -702,6 +767,38 @@ class FrozenForwardCacheDataset(torch.utils.data.Dataset):
 
 def collate_frozen_cache_entries(entries):
     return merge_frozen_cache_entries(entries)
+
+
+def optional_int(value, default=None):
+    if value in {None, "", "null", "None"}:
+        return default
+    return int(value)
+
+
+def make_dataloader_kwargs(cfg, batch_size, shuffle, num_workers, collate_fn=None):
+    kwargs = {
+        "batch_size": int(batch_size),
+        "shuffle": bool(shuffle),
+        "num_workers": int(num_workers),
+        "pin_memory": bool(cfg.pin_memory),
+    }
+    if collate_fn is not None:
+        kwargs["collate_fn"] = collate_fn
+    if int(num_workers) > 0:
+        kwargs["persistent_workers"] = bool(cfg.get("persistent_workers", True))
+        if cfg.get("prefetch_factor", None) is not None:
+            kwargs["prefetch_factor"] = int(cfg.prefetch_factor)
+    return kwargs
+
+
+def validation_enabled(cfg, train_from_frozen_cache, train_split):
+    return (
+        bool(train_from_frozen_cache)
+        and str(train_split or "train").strip().lower() == "train"
+        and int(cfg.get("eval_freq", 0)) > 0
+        and int(cfg.get("eval_steps", 0)) > 0
+        and float(cfg.get("frozen_cache_eval_ratio", 0.0)) > 0.0
+    )
 
 
 class ControlLatentDistillModule(torch.nn.Module):
@@ -1029,6 +1126,40 @@ def load_checkpoint(accelerator, model, optimizer, resume_path, load_optimizer=T
     return step
 
 
+def run_validation(accelerator, model, eval_dataloader, cfg):
+    max_eval_steps = int(cfg.get("eval_steps", 0))
+    if eval_dataloader is None or max_eval_steps <= 0:
+        return {}
+
+    model.eval()
+    metric_totals = {}
+    local_batches = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+    try:
+        with torch.no_grad():
+            for eval_idx, batch in enumerate(eval_dataloader, start=1):
+                loss, metrics = model(batch)
+                local_batches += 1.0
+                metrics = dict(metrics)
+                metrics["loss"] = loss.detach()
+                for key, value in metrics.items():
+                    if isinstance(value, torch.Tensor) and value.numel() == 1:
+                        value = value.detach().float().to(device=accelerator.device)
+                        metric_totals[key] = metric_totals.get(key, torch.zeros_like(value)) + value
+                if eval_idx >= max_eval_steps:
+                    break
+    finally:
+        model.train()
+
+    total_batches = accelerator.gather(local_batches).sum()
+    if float(total_batches.detach().cpu()) <= 0:
+        return {}
+    averaged = {}
+    for key, value in metric_totals.items():
+        total = accelerator.gather(value).sum()
+        averaged[key] = float((total / total_batches).detach().cpu())
+    return averaged
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("config", type=str)
@@ -1048,40 +1179,82 @@ def main():
         OmegaConf.save(cfg, os.path.join(cfg.output_path, "config.yaml"))
 
     train_from_frozen_cache = bool(cfg.get("train_from_frozen_cache", False))
+    eval_dataloader = None
     if train_from_frozen_cache:
         if not cfg.get("frozen_cache_dir", None):
             raise ValueError("train_from_frozen_cache=true requires frozen_cache_dir.")
+        frozen_cache_split = str(cfg.get("frozen_cache_split", "train") or "train").strip().lower()
         dataset = FrozenForwardCacheDataset(
             cfg.frozen_cache_dir,
             pattern=cfg.get("frozen_cache_pattern", "*.pt"),
+            split=frozen_cache_split,
+            eval_ratio=float(cfg.get("frozen_cache_eval_ratio", 0.05)),
+            split_seed=int(cfg.get("frozen_cache_split_seed", 0)),
+            split_mode=cfg.get("frozen_cache_split_mode", "hash"),
         )
-        if accelerator.is_main_process:
-            print(
-                f"Using frozen forward cache dataset: {len(dataset)} files "
-                f"from {cfg.frozen_cache_dir} pattern={cfg.get('frozen_cache_pattern', '*.pt')!r}"
+        eval_dataset = None
+        if validation_enabled(cfg, train_from_frozen_cache, frozen_cache_split):
+            eval_dataset = FrozenForwardCacheDataset(
+                cfg.frozen_cache_dir,
+                pattern=cfg.get("frozen_cache_pattern", "*.pt"),
+                split="eval",
+                eval_ratio=float(cfg.get("frozen_cache_eval_ratio", 0.05)),
+                split_seed=int(cfg.get("frozen_cache_split_seed", 0)),
+                split_mode=cfg.get("frozen_cache_split_mode", "hash"),
+                allow_empty=True,
             )
+            if len(eval_dataset) == 0:
+                eval_dataset = None
+        if accelerator.is_main_process:
+            counts = dataset.split_counts
+            print(
+                f"Using frozen forward cache dataset: split={frozen_cache_split} selected={len(dataset)} "
+                f"total={counts['all']} train={counts['train']} eval={counts['eval']} "
+                f"dir={cfg.frozen_cache_dir} pattern={cfg.get('frozen_cache_pattern', '*.pt')!r} "
+                f"eval_ratio={float(cfg.get('frozen_cache_eval_ratio', 0.05)):.4g} "
+                f"split_seed={int(cfg.get('frozen_cache_split_seed', 0))}"
+            )
+            if eval_dataset is None:
+                print("Frozen cache validation is disabled.")
+            else:
+                print(
+                    f"Using frozen forward eval dataset: selected={len(eval_dataset)} "
+                    f"eval_freq={int(cfg.get('eval_freq', 0))} eval_steps={int(cfg.get('eval_steps', 0))}"
+                )
     else:
         dataset = eval(cfg.train_dataset)
-    dataloader_kwargs = {
-        "batch_size": int(cfg.batch_size),
-        "shuffle": True,
-        "num_workers": int(cfg.num_workers),
-        "pin_memory": bool(cfg.pin_memory),
-    }
-    if train_from_frozen_cache:
-        dataloader_kwargs["collate_fn"] = collate_frozen_cache_entries
-    if int(cfg.num_workers) > 0:
-        dataloader_kwargs["persistent_workers"] = bool(cfg.get("persistent_workers", True))
-        if cfg.get("prefetch_factor", None) is not None:
-            dataloader_kwargs["prefetch_factor"] = int(cfg.prefetch_factor)
+    collate_fn = collate_frozen_cache_entries if train_from_frozen_cache else None
+    dataloader_kwargs = make_dataloader_kwargs(
+        cfg,
+        batch_size=int(cfg.batch_size),
+        shuffle=True,
+        num_workers=int(cfg.num_workers),
+        collate_fn=collate_fn,
+    )
     dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
+    if train_from_frozen_cache and eval_dataset is not None:
+        eval_batch_size = optional_int(cfg.get("eval_batch_size", None), int(cfg.batch_size))
+        eval_num_workers = optional_int(cfg.get("eval_num_workers", None), int(cfg.num_workers))
+        eval_dataloader = torch.utils.data.DataLoader(
+            eval_dataset,
+            **make_dataloader_kwargs(
+                cfg,
+                batch_size=eval_batch_size,
+                shuffle=False,
+                num_workers=eval_num_workers,
+                collate_fn=collate_frozen_cache_entries,
+            ),
+        )
     model = ControlLatentDistillModule(cfg)
     optimizer = torch.optim.AdamW(
         model.adapter.parameters(),
         lr=float(cfg.learning_rate),
         weight_decay=float(cfg.weight_decay),
     )
-    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    if eval_dataloader is None:
+        model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    else:
+        model, optimizer, dataloader, eval_dataloader = accelerator.prepare(model, optimizer, dataloader, eval_dataloader)
     resume_path = resolve_resume_path(cfg)
     step = 0
     if resume_path is not None:
@@ -1186,6 +1359,23 @@ def main():
                     print(f"token_shape={shapes['tokens']} output_grid={shapes['output_grid']}")
                     first_key = next(iter(shapes["teacher"]))
                     print(f"teacher[{first_key}]={shapes['teacher'][first_key]} student[{first_key}]={shapes['student'][first_key]}")
+
+                if eval_dataloader is not None and int(cfg.get("eval_freq", 0)) > 0 and step % int(cfg.eval_freq) == 0:
+                    eval_start = time.time()
+                    eval_metrics = run_validation(accelerator, model, eval_dataloader, cfg)
+                    if accelerator.is_main_process:
+                        if eval_metrics:
+                            summary = " ".join(
+                                f"eval/{k}={v:.4g}"
+                                for k, v in eval_metrics.items()
+                                if k == "loss" or k.endswith("/l1")
+                            )
+                            print(f"eval step={step} dt={time.time() - eval_start:.2f}s {summary}")
+                            if writer is not None:
+                                for key, value in eval_metrics.items():
+                                    writer.add_scalar(f"eval/{key}", value, step)
+                        else:
+                            print(f"eval step={step} skipped: no eval batches")
 
                 if int(cfg.vis_freq) > 0 and step % int(cfg.vis_freq) == 0 and accelerator.is_main_process:
                     teacher, student, output_grid = accelerator.unwrap_model(model).last_visuals

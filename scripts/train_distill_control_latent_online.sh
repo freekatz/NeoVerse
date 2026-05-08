@@ -32,6 +32,7 @@ export CACHE_FROZEN_OUTPUTS="${CACHE_FROZEN_OUTPUTS:-false}"
 if [[ -n "${FROZEN_CACHE_DIR:-}" || "${USE_FROZEN_CACHE:-0}" == "1" ]]; then
   export FROZEN_CACHE_DIR="${FROZEN_CACHE_DIR:-${CODE_DIR}/outputs/NeoVerseControlLatentDistill/frozen_cache}"
   export TRAIN_FROM_FROZEN_CACHE="${TRAIN_FROM_FROZEN_CACHE:-true}"
+  export FROZEN_CACHE_SPLIT="${FROZEN_CACHE_SPLIT:-train}"
   export FROZEN_CACHE_WRITE="${FROZEN_CACHE_WRITE:-false}"
   export FROZEN_CACHE_READ="${FROZEN_CACHE_READ:-true}"
   export FROZEN_CACHE_REQUIRED="${FROZEN_CACHE_REQUIRED:-true}"

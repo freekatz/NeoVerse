@@ -147,6 +147,10 @@ cache_frozen_outputs: false
 train_from_frozen_cache: false
 frozen_cache_dir: null
 frozen_cache_pattern: "*.pt"
+frozen_cache_split: train
+frozen_cache_eval_ratio: 0.05
+frozen_cache_split_seed: 0
+frozen_cache_split_mode: hash
 frozen_cache_read: true
 frozen_cache_write: false
 frozen_cache_required: false
@@ -162,5 +166,9 @@ resume_from: null
 resume_optimizer: true
 save_optimizer_intermediate: false
 print_freq: 10
+eval_freq: 500
+eval_steps: 20
+eval_batch_size: null
+eval_num_workers: null
 save_freq: 500
 vis_freq: 0

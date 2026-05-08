@@ -301,6 +301,10 @@ if [[ "${FAST_FROZEN_CACHE}" != "1" ]]; then
 fi
 append_override_if_set "TRAIN_FROM_FROZEN_CACHE" "train_from_frozen_cache"
 append_override_if_set "FROZEN_CACHE_PATTERN" "frozen_cache_pattern"
+append_override_if_set "FROZEN_CACHE_SPLIT" "frozen_cache_split"
+append_override_if_set "FROZEN_CACHE_EVAL_RATIO" "frozen_cache_eval_ratio"
+append_override_if_set "FROZEN_CACHE_SPLIT_SEED" "frozen_cache_split_seed"
+append_override_if_set "FROZEN_CACHE_SPLIT_MODE" "frozen_cache_split_mode"
 append_override_if_set "FROZEN_CACHE_READ" "frozen_cache_read"
 append_override_if_set "FROZEN_CACHE_WRITE" "frozen_cache_write"
 append_override_if_set "FROZEN_CACHE_REQUIRED" "frozen_cache_required"
@@ -310,6 +314,10 @@ append_override_if_set "PRELOAD_FROZEN_CACHE_DEVICE" "preload_frozen_cache_devic
 append_override_if_set "PRELOAD_FROZEN_CACHE_BATCH_SIZE" "preload_frozen_cache_batch_size"
 append_override_if_set "PRELOAD_FROZEN_CACHE_LOG_FREQ" "preload_frozen_cache_log_freq"
 append_override_if_set "SHUFFLE_PRELOADED_FROZEN_CACHE" "shuffle_preloaded_frozen_cache"
+append_override_if_set "EVAL_FREQ" "eval_freq"
+append_override_if_set "EVAL_STEPS" "eval_steps"
+append_override_if_set "EVAL_BATCH_SIZE" "eval_batch_size"
+append_override_if_set "EVAL_NUM_WORKERS" "eval_num_workers"
 
 read -r -a accelerate_extra_args <<< "${ACCELERATE_EXTRA_ARGS}"
 
@@ -330,6 +338,9 @@ RUN_NAME=${RUN_NAME}
 OUTPUT_PATH=${OUTPUT_PATH}
 FROZEN_CACHE_DIR=${FROZEN_CACHE_DIR:-}
 FROZEN_CACHE_REQUIRED=${FROZEN_CACHE_REQUIRED:-}
+FROZEN_CACHE_SPLIT=${FROZEN_CACHE_SPLIT:-}
+FROZEN_CACHE_EVAL_RATIO=${FROZEN_CACHE_EVAL_RATIO:-}
+FROZEN_CACHE_SPLIT_SEED=${FROZEN_CACHE_SPLIT_SEED:-}
 DEFAULT_PRELOAD_FROZEN_CACHE_DEVICE=${DEFAULT_PRELOAD_FROZEN_CACHE_DEVICE}
 CUDA_PRELOAD_MIN_PROCESSES=${CUDA_PRELOAD_MIN_PROCESSES}
 LOG_DIR=${LOG_DIR}
