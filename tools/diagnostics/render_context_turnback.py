@@ -35,7 +35,7 @@ except ImportError:
         timestamp_order,
     )
 from diffsynth.data import save_video
-from train_distill_control_latent import build_spatialvid_dataset
+from tools.train.distill_control_latent import build_spatialvid_dataset
 
 
 def make_local_yaw_turnback(poses, max_degrees=180.0):

@@ -1,6 +1,6 @@
 # NeoVerse 蒸馏训练说明
 
-这份文档只覆盖当前仓库里新增的 NeoVerse control latent distillation 流程。原始 NeoVerse 的 app、inference、基础训练代码仍在仓库里，但当前主要工作线是训练一个 student adapter：用 reconstructor/VGGT-like backbone 的中间 tokens 直接预测 NeoVerse control branch 的 early condition embedding。
+这份文档主要覆盖当前仓库里新增的 NeoVerse control latent distillation 流程。原始 NeoVerse 的 app、inference、基础训练入口也统一收进了 `./cli`，但当前主要工作线是训练一个 student adapter：用 reconstructor/VGGT-like backbone 的中间 tokens 直接预测 NeoVerse control branch 的 early condition embedding。
 
 推荐入口只有一个：
 
@@ -102,6 +102,16 @@ cd /root/vepfs/diffsynth-dev/papers/neoverse/code
 ```
 
 整理 SpatialVID-HQ 数据目录。
+
+```text
+./cli infer neoverse
+./cli app neoverse
+./cli app degradation
+./cli app wan-4step
+./cli train base
+```
+
+原始 NeoVerse 推理、交互式应用、退化模拟应用、Wan 4-step 测试应用和基础训练入口。它们不是当前蒸馏训练主路径，但不再通过根目录 Python 文件启动。
 
 旧命令名不保留兼容别名。比如 `./cli train fast` 会报错，应使用 `./cli train online-noaug`。
 
@@ -320,7 +330,9 @@ USE_CAMERA_ANNOTATIONS=true DATASET_INDEX=0 NUM_CONTEXT_VIEWS=20 \
 ```text
 cli                                      统一本地入口
 configs/distill_control_latent.yaml      蒸馏训练配置
-train_distill_control_latent.py          训练主程序
+tools/train/                             训练入口和蒸馏训练主模块
+tools/inference/                         推理入口
+tools/apps/                              Gradio/FastAPI 应用入口
 
 scripts/launch/                          训练和 cache 构建 launcher
 scripts/overfit/                         单视频 overfit

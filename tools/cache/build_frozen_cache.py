@@ -12,8 +12,8 @@ CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
-import train_distill_control_latent as train_mod
-from train_distill_control_latent import ControlLatentDistillModule, frozen_cache_signature
+from tools.train import distill_control_latent as train_mod
+from tools.train.distill_control_latent import ControlLatentDistillModule, frozen_cache_signature
 
 
 def parse_bool(value):

@@ -1,9 +1,14 @@
 import argparse
 import copy
 import os
+import sys
 import threading
 import time
 from contextlib import nullcontext
+
+CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if CODE_DIR not in sys.path:
+    sys.path.insert(0, CODE_DIR)
 
 for proxy_env in ("ALL_PROXY", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
     os.environ.pop(proxy_env, None)

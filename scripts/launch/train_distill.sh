@@ -377,7 +377,7 @@ log "config_file=${CONFIG_FILE}"
 
 run_cmd bash -n "$0"
 run_cmd "${ENV_PYTHON}" -m py_compile \
-  train_distill_control_latent.py \
+  tools/train/distill_control_latent.py \
   diffsynth/models/student_adapters.py \
   diffsynth/pipelines/wan_video_neoverse.py \
   diffsynth/models/wan_video_neoverse_controller.py \
@@ -417,7 +417,7 @@ if [[ "${#accelerate_extra_args[@]}" -gt 0 ]]; then
 fi
 
 launch_cmd+=(
-  train_distill_control_latent.py "${CONFIG}"
+  tools/train/distill_control_latent.py "${CONFIG}"
   "${TRAIN_OVERRIDES[@]}"
   "$@"
 )

@@ -32,7 +32,7 @@ https://github.com/user-attachments/assets/4c957bd7-64e1-4a7e-9993-136740d911fe
 
 ## TL;DR
 
-- **Simple Inference Script** — Generate novel-trajectory videos with a single `python inference.py` command
+- **Simple Inference CLI** — Generate novel-trajectory videos with a single `./cli infer neoverse` command
 - **Interactive Gradio Demo** — Step-by-step web UI for reconstruction, trajectory design, and generation
 - **Multiple Reconstructors** — Supports different 3D reconstructors (e.g., [Depth Anything 3](https://depth-anything-3.github.io/)) via a plug-and-play interface
 - **Fast Inference** — Inference pipeline completes in under 30 seconds with distilled LoRA acceleration on a single A800.
@@ -110,21 +110,21 @@ Use `--trajectory` to choose from 13 built-in camera motions, and fine-tune them
 
 ```bash
 # Tilt up
-python inference.py \
+./cli infer neoverse \
     --input_path examples/videos/robot.mp4 \
     --trajectory tilt_up \
     --prompt "A two-arm robot assembles parts in front of a table." \
     --output_path outputs/tilt_up.mp4
 
 # Move right by 0.2 units
-python inference.py \
+./cli infer neoverse \
     --input_path examples/videos/tree_and_building.mp4 \
     --trajectory move_right \
     --distance 0.2 \
     --output_path outputs/move_right.mp4
 
 # Zoom in 2x by adjusting the focal length
-python inference.py \
+./cli infer neoverse \
     --input_path examples/videos/animal.mp4 \
     --trajectory static \
     --zoom_ratio 2.0 \
@@ -137,27 +137,27 @@ For full keyframe-level control, provide a trajectory JSON file via `--trajector
 
 ```bash
 # First orbit left, then pull out
-python inference.py \
+./cli infer neoverse \
     --input_path examples/videos/movie.mp4 \
     --trajectory_file examples/trajectories/orbit_left_pull_out.json \
     --alpha_threshold 0.95 \
     --output_path outputs/orbit_left_pull_out.mp4
 
 # Custom trajectory
-python inference.py \
+./cli infer neoverse \
     --input_path examples/videos/driving.mp4 \
     --trajectory_file examples/trajectories/custom.json \
     --output_path outputs/custom_traj.mp4
 
 # Custom trajectory on a static scene (single image input)
-python inference.py \
+./cli infer neoverse \
     --input_path examples/videos/jungle.png \
     --static_scene \
     --trajectory_file examples/trajectories/custom2.json \
     --output_path outputs/custom_traj2.mp4
 
 # Sparse keyframe poses with interpolation
-python inference.py \
+./cli infer neoverse \
     --input_path examples/videos/driving2.mp4 \
     --trajectory_file examples/trajectories/sparse_matrices.json \
     --output_path outputs/keyframe_interpolation.mp4
@@ -168,7 +168,7 @@ See [docs/trajectory_format.md](docs/trajectory_format.md) for the JSON schema a
 You can validate a trajectory file without running inference:
 
 ```bash
-python inference.py --trajectory_file my_trajectory.json --validate_only
+./cli infer neoverse --trajectory_file my_trajectory.json --validate_only
 ```
 
 #### Key Arguments
@@ -204,10 +204,10 @@ python inference.py --trajectory_file my_trajectory.json --validate_only
 Launch the web UI:
 
 ```bash
-python app.py
+./cli app neoverse
 
 # With low-VRAM mode
-python app.py --low_vram
+./cli app neoverse --low_vram
 ```
 
 The demo walks you through four steps:
@@ -232,14 +232,14 @@ Then pass it via `--reconstructor_path`:
 
 ```bash
 # CLI inference with Depth Anything 3
-python inference.py \
+./cli infer neoverse \
     --input_path examples/videos/driving.mp4 \
     --trajectory_file examples/trajectories/custom.json \
     --reconstructor_path models/da3_giant_1.1.safetensors \
     --output_path outputs/custom_traj_da3.mp4
 
 # Gradio demo with Depth Anything 3
-python app.py --reconstructor_path models/da3_giant_1.1.safetensors
+./cli app neoverse --reconstructor_path models/da3_giant_1.1.safetensors
 ```
 
 ## Demo Notebooks (More Coming Soon)
@@ -262,21 +262,12 @@ We release the training code for fine-tuning NeoVerse's control branch on your o
 
 We provide 20 sample clips from [SpatialVID](https://huggingface.co/datasets/FelixYuan/SpatialVID-HQ) in `data/SpatialVID/` as a minimal example to get started. During training, **only the RGB video frames and text prompts are required** — depth maps, camera extrinsics, and intrinsics are not used. The 3D structure and camera poses are estimated on-the-fly by the reconstructor. This means you can easily adapt the training pipeline to any in-the-wild monocular video dataset without any 3D annotation.
 
-### Multi-node Training with ZeRO-2
+### Base Training Entry
 
-The training script uses [Accelerate](https://huggingface.co/docs/accelerate) with DeepSpeed ZeRO Stage 2. Run it with:
+Run the base NeoVerse training entry with:
 
 ```bash
-accelerate launch \
-    --use_deepspeed \
-    --deepspeed_config_file training/configs/zero_stage2_config.json \
-    --main_process_ip $MASTER_ADDR \
-    --main_process_port $MASTER_PORT \
-    --num_machines $WORLD_SIZE \
-    --num_processes $NUM_PROCESS \
-    --machine_rank $NODE_RANK \
-    --deepspeed_multinode_launcher standard \
-    train.py training/configs/train.yaml
+./cli train base training/configs/train.yaml
 ```
 
 Training configuration (data paths, learning rate, batch size, etc.) is specified in [`training/configs/train.yaml`](training/configs/train.yaml).

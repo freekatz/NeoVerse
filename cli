@@ -11,9 +11,14 @@ usage() {
 NeoVerse local commands
 
 Usage:
+  ./cli train base CONFIG [args]
   ./cli train online [extra OmegaConf overrides...]
   ./cli train online-noaug [extra OmegaConf overrides...]
   ./cli train cache [extra OmegaConf overrides...]
+  ./cli infer neoverse [args]
+  ./cli app neoverse [args]
+  ./cli app degradation [args]
+  ./cli app wan-4step [args]
   ./cli cache build-camera [builder args]
   ./cli cache build-frozen [builder args]
   ./cli cache inspect [inspect args]
@@ -41,14 +46,32 @@ EOF
 usage_train() {
   cat <<'EOF'
 Usage:
+  ./cli train base CONFIG [args]
   ./cli train online [extra OmegaConf overrides...]
   ./cli train online-noaug [extra OmegaConf overrides...]
   ./cli train cache [extra OmegaConf overrides...]
 
 Commands:
+  base    Run the original NeoVerse training entry.
   online  Online SpatialVID training with temporal augmentation.
   online-noaug  Online training without temporal augmentation.
   cache   Train directly from frozen_cache/*.pt with deterministic train/eval split.
+EOF
+}
+
+usage_infer() {
+  cat <<'EOF'
+Usage:
+  ./cli infer neoverse [args]
+EOF
+}
+
+usage_app() {
+  cat <<'EOF'
+Usage:
+  ./cli app neoverse [args]
+  ./cli app degradation [args]
+  ./cli app wan-4step [args]
 EOF
 }
 
@@ -122,6 +145,10 @@ disable_frozen_cache() {
 
 launch_train() {
   bash scripts/launch/train_distill.sh "$@"
+}
+
+train_base() {
+  "${PYTHON}" tools/train/base_train.py "$@"
 }
 
 train_online() {
@@ -221,6 +248,22 @@ data_prepare_spatialvid_hq() {
   bash scripts/data/prepare_spatialvid_hq.sh "$@"
 }
 
+infer_neoverse() {
+  "${PYTHON}" tools/inference/neoverse_inference.py "$@"
+}
+
+app_neoverse() {
+  "${PYTHON}" tools/apps/neoverse_app.py "$@"
+}
+
+app_degradation() {
+  "${PYTHON}" tools/apps/degradation_gradio.py "$@"
+}
+
+app_wan_4step() {
+  "${PYTHON}" tools/apps/wan_4step_gradio.py "$@"
+}
+
 dispatch_train() {
   local subcmd="${1:-help}"
   if [[ "$#" -gt 0 ]]; then
@@ -228,10 +271,37 @@ dispatch_train() {
   fi
   case "${subcmd}" in
     help|-h|--help) usage_train ;;
+    base) train_base "$@" ;;
     online) train_online "$@" ;;
     online-noaug) train_online_noaug "$@" ;;
     cache) train_cache "$@" ;;
     *) usage_train >&2; die "Unknown train command: ${subcmd}" ;;
+  esac
+}
+
+dispatch_infer() {
+  local subcmd="${1:-help}"
+  if [[ "$#" -gt 0 ]]; then
+    shift
+  fi
+  case "${subcmd}" in
+    help|-h|--help) usage_infer ;;
+    neoverse) infer_neoverse "$@" ;;
+    *) usage_infer >&2; die "Unknown infer command: ${subcmd}" ;;
+  esac
+}
+
+dispatch_app() {
+  local subcmd="${1:-help}"
+  if [[ "$#" -gt 0 ]]; then
+    shift
+  fi
+  case "${subcmd}" in
+    help|-h|--help) usage_app ;;
+    neoverse) app_neoverse "$@" ;;
+    degradation) app_degradation "$@" ;;
+    wan-4step) app_wan_4step "$@" ;;
+    *) usage_app >&2; die "Unknown app command: ${subcmd}" ;;
   esac
 }
 
@@ -307,6 +377,8 @@ fi
 case "${cmd}" in
   help|-h|--help) usage ;;
   train) dispatch_train "$@" ;;
+  infer) dispatch_infer "$@" ;;
+  app) dispatch_app "$@" ;;
   cache) dispatch_cache "$@" ;;
   eval) dispatch_eval "$@" ;;
   debug) dispatch_debug "$@" ;;

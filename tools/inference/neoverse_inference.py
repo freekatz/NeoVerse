@@ -1,9 +1,16 @@
-import torch
-import os
 import argparse
+import os
+import sys
+
 import numpy as np
+import torch
 from PIL import Image
 from torchvision.transforms import functional as F
+
+CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if CODE_DIR not in sys.path:
+    sys.path.insert(0, CODE_DIR)
+
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
 from diffsynth import save_video
 from diffsynth.utils.auxiliary import CameraTrajectory, load_video, homo_matrix_inverse

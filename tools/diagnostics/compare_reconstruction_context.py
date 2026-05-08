@@ -18,7 +18,7 @@ from diffsynth.models import ModelManager
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
 from diffsynth.utils import ModelConfig
 from diffsynth.utils.auxiliary import homo_matrix_inverse
-from train_distill_control_latent import build_spatialvid_dataset
+from tools.train.distill_control_latent import build_spatialvid_dataset
 
 
 def zero_drop_probs(pipeline_kwargs):

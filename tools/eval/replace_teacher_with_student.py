@@ -18,7 +18,7 @@ from diffsynth.data import save_video
 from diffsynth.utils.auxiliary import homo_matrix_inverse
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline, model_fn_wan_video
 from hooks.extract_vggt_tokens import extract_vggt_tokens
-from train_distill_control_latent import (
+from tools.train.distill_control_latent import (
     build_spatialvid_dataset,
     build_adapter,
     extract_source_times,

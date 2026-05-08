@@ -153,12 +153,12 @@ log "extra_args=$*"
 
 if [[ "${DRY_RUN}" == "1" ]]; then
   log "+ bash -n $0"
-  log "+ ${ENV_PYTHON} -m py_compile tools/cache/build_frozen_cache.py train_distill_control_latent.py training/data/datasets/spatialvid.py training/data/temporal_trajectory.py"
+  log "+ ${ENV_PYTHON} -m py_compile tools/cache/build_frozen_cache.py tools/train/distill_control_latent.py training/data/datasets/spatialvid.py training/data/temporal_trajectory.py"
 else
   bash -n "$0"
   "${ENV_PYTHON}" -m py_compile \
     tools/cache/build_frozen_cache.py \
-    train_distill_control_latent.py \
+    tools/train/distill_control_latent.py \
     training/data/datasets/spatialvid.py \
     training/data/temporal_trajectory.py
 fi

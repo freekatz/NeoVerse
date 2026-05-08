@@ -1,6 +1,13 @@
-import torch, os
 import argparse
+import os
+import sys
+
+import torch
 from omegaconf import OmegaConf
+
+CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if CODE_DIR not in sys.path:
+    sys.path.insert(0, CODE_DIR)
 
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline, ModelConfig
 from training.utils import DiffusionTrainingModule, launch_training_task

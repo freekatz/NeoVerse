@@ -18,7 +18,7 @@ Methods 2–4 use a JSON file passed via `--trajectory_file`.
 Use the `--trajectory` flag to select a built-in trajectory type:
 
 ```bash
-python inference.py --trajectory pan_left --input_path input.mp4 --output_path outputs/pan_left.mp4
+./cli infer neoverse --trajectory pan_left --input_path input.mp4 --output_path outputs/pan_left.mp4
 ```
 
 ### Available Types
@@ -45,16 +45,16 @@ Override default parameters with CLI flags:
 
 ```bash
 # Pan left by 45 degrees instead of the default 30
-python inference.py --trajectory pan_left --angle 45 --input_path input.mp4
+./cli infer neoverse --trajectory pan_left --angle 45 --input_path input.mp4
 
 # Push in with larger distance
-python inference.py --trajectory push_in --distance 0.3 --input_path input.mp4
+./cli infer neoverse --trajectory push_in --distance 0.3 --input_path input.mp4
 
 # Orbit with custom radius and angle
-python inference.py --trajectory orbit_left --angle 45 --orbit_radius 0.8 --input_path input.mp4
+./cli infer neoverse --trajectory orbit_left --angle 45 --orbit_radius 0.8 --input_path input.mp4
 
 # Set trajectory mode and zoom
-python inference.py --trajectory pan_left --traj_mode global --zoom_ratio 1.2 --input_path input.mp4
+./cli infer neoverse --trajectory pan_left --traj_mode global --zoom_ratio 1.2 --input_path input.mp4
 ```
 
 ### Default Parameter Values
@@ -372,7 +372,7 @@ Fast forward then hold:
 Validate a trajectory file without running inference:
 
 ```bash
-python inference.py --trajectory_file your_trajectory.json --validate_only
+./cli infer neoverse --trajectory_file your_trajectory.json --validate_only
 ```
 
 Output includes format type, entry count, and mode. Common validation errors:
