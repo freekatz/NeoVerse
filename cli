@@ -12,8 +12,8 @@ NeoVerse local commands
 
 Usage:
   ./cli train online [extra OmegaConf overrides...]
+  ./cli train online-noaug [extra OmegaConf overrides...]
   ./cli train cache [extra OmegaConf overrides...]
-  ./cli train fast [extra OmegaConf overrides...]
   ./cli cache build-camera [builder args]
   ./cli cache build-frozen [builder args]
   ./cli cache inspect [inspect args]
@@ -42,13 +42,13 @@ usage_train() {
   cat <<'EOF'
 Usage:
   ./cli train online [extra OmegaConf overrides...]
+  ./cli train online-noaug [extra OmegaConf overrides...]
   ./cli train cache [extra OmegaConf overrides...]
-  ./cli train fast [extra OmegaConf overrides...]
 
 Commands:
   online  Online SpatialVID training with temporal augmentation.
+  online-noaug  Online training without temporal augmentation.
   cache   Train directly from frozen_cache/*.pt with deterministic train/eval split.
-  fast    Online training without temporal augmentation.
 EOF
 }
 
@@ -154,10 +154,10 @@ train_cache() {
   launch_train "$@"
 }
 
-train_fast() {
+train_online_noaug() {
   common_online_env
   disable_frozen_cache
-  export RUN_NAME="${RUN_NAME:-online_fast_gtcam}"
+  export RUN_NAME="${RUN_NAME:-online_noaug}"
   export CONTEXT_SAMPLING_STRATEGY="${CONTEXT_SAMPLING_STRATEGY:-mixed}"
   export TEMPORAL_AUGMENTATION="${TEMPORAL_AUGMENTATION:-false}"
   export DATASET_SEED="${DATASET_SEED:-null}"
@@ -229,8 +229,8 @@ dispatch_train() {
   case "${subcmd}" in
     help|-h|--help) usage_train ;;
     online) train_online "$@" ;;
+    online-noaug) train_online_noaug "$@" ;;
     cache) train_cache "$@" ;;
-    fast) train_fast "$@" ;;
     *) usage_train >&2; die "Unknown train command: ${subcmd}" ;;
   esac
 }

@@ -25,7 +25,7 @@ CONTEXT_SAMPLING_STRATEGY="${CONTEXT_SAMPLING_STRATEGY:-uniform_first}" \
 TEMPORAL_AUGMENTATION="${TEMPORAL_AUGMENTATION:-false}" \
 CACHE_TRAIN_BATCH="${CACHE_TRAIN_BATCH:-true}" \
 CACHE_FROZEN_OUTPUTS="${CACHE_FROZEN_OUTPUTS:-true}" \
-./cli train fast \
+./cli train online-noaug \
   max_steps="${MAX_STEPS_VALUE}" \
   num_epochs="${NUM_EPOCHS_VALUE}" \
   num_workers="${NUM_WORKERS:-0}" \
