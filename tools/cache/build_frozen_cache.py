@@ -12,8 +12,12 @@ CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
-from training.control_latent import distill as train_mod
-from training.control_latent.distill import ControlLatentDistillModule, frozen_cache_signature
+from training.control_latent import joint_train as train_mod
+from training.control_latent.joint_train import (
+    _V2_CACHE_FILENAME_PREFIX,
+    _v2_cache_signature,
+    ControlLatentJointModule,
+)
 
 
 def parse_bool(value):
@@ -119,7 +123,7 @@ def build_cfg(args):
         "frozen_cache_write": True,
         "preload_frozen_cache": False,
         "load_dit": False,
-        "load_text_encoder": False,
+        "load_text_encoder": True,
         "load_vae": True,
     }
     if args.overrides:
@@ -130,7 +134,7 @@ def build_cfg(args):
 
 
 def prepare_model(cfg, device):
-    model = ControlLatentDistillModule(cfg).to(device=device, dtype=torch_dtype_from_name(cfg.torch_dtype))
+    model = ControlLatentJointModule(cfg).to(device=device, dtype=torch_dtype_from_name(cfg.torch_dtype))
     model.eval()
     model.pipe.device = device
     if getattr(model.pipe, "reconstructor", None) is not None:
@@ -144,16 +148,18 @@ def prepare_model(cfg, device):
         model.pipe.control_branch.to(device)
     if getattr(model.pipe, "vae", None) is not None:
         model.pipe.vae.to(device)
-    model.pipe.load_models_to_device(["reconstructor", "control_branch", "vae"])
+    if getattr(model.pipe, "text_encoder", None) is not None:
+        model.pipe.text_encoder.to(device)
+    model.pipe.load_models_to_device(["reconstructor", "control_branch", "vae", "text_encoder"])
     return model
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build fixed clip/trajectory frozen forward caches for SpatialVID distillation.")
-    parser.add_argument("--config", default="configs/distill/control_latent.yaml")
+    parser = argparse.ArgumentParser(description="Build fixed clip/trajectory frozen forward caches for SpatialVID joint v2 training.")
+    parser.add_argument("--config", default="configs/distill/control_latent_v2.yaml")
     parser.add_argument("--data_root", default=None)
-    parser.add_argument("--output_dir", default="outputs/NeoVerseControlLatentDistill/frozen_cache")
-    parser.add_argument("--run_output_dir", default="outputs/NeoVerseControlLatentDistill/frozen_cache_build")
+    parser.add_argument("--output_dir", default="outputs/NeoVerseQueryableWorldModel/frozen_cache")
+    parser.add_argument("--run_output_dir", default="outputs/NeoVerseQueryableWorldModel/frozen_cache_build")
     parser.add_argument("--model_path", default=None)
     parser.add_argument("--reconstructor_path", default=None)
     parser.add_argument("--torch_dtype", default=None)
@@ -201,8 +207,8 @@ def main():
     start_time = time.time()
     for idx in tqdm(indices, desc=f"frozen-cache shard {args.shard_index}/{args.num_shards}"):
         batch = default_collate([dataset[idx]])
-        signature = frozen_cache_signature(batch, cfg)
-        cache_path = os.path.join(str(cfg.frozen_cache_dir), f"{signature}.pt")
+        signature = _v2_cache_signature(batch, cfg)
+        cache_path = os.path.join(str(cfg.frozen_cache_dir), f"{_V2_CACHE_FILENAME_PREFIX}{signature}.pt")
         if os.path.exists(cache_path) and not args.overwrite:
             skipped += 1
             continue

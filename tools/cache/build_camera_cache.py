@@ -143,9 +143,9 @@ def write_cache(path, views, camera_poses, camera_intrs):
 
 def main():
     parser = argparse.ArgumentParser(description="Build fixed-clip SpatialVID camera cache with the NeoVerse reconstructor.")
-    parser.add_argument("--config", default="configs/distill/control_latent.yaml")
+    parser.add_argument("--config", default="configs/distill/control_latent_v2.yaml")
     parser.add_argument("--data_root", default=None)
-    parser.add_argument("--output_dir", default="outputs/NeoVerseControlLatentDistill/camera_cache")
+    parser.add_argument("--output_dir", default="outputs/NeoVerseQueryableWorldModel/camera_cache")
     parser.add_argument("--reconstructor_path", default=None)
     parser.add_argument("--torch_dtype", default=None)
     parser.add_argument("--device", default="cuda:0")

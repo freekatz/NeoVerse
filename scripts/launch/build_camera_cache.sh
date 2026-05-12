@@ -7,7 +7,7 @@ set -euo pipefail
 #   bash scripts/launch/build_camera_cache.sh
 #   GPU_LIST=0,1,2,3 bash scripts/launch/build_camera_cache.sh
 #   LAUNCH_MODE=background GPU_LIST=0,1 bash scripts/launch/build_camera_cache.sh
-#   CAMERA_CACHE_DIR=outputs/NeoVerseControlLatentDistill/camera_cache \
+#   CAMERA_CACHE_DIR=outputs/NeoVerseQueryableWorldModel/camera_cache \
 #     FIXED_CLIPS_PER_SCENE=16 bash scripts/launch/build_camera_cache.sh
 
 timestamp_utc() {
@@ -31,8 +31,8 @@ LAUNCH_MODE="${LAUNCH_MODE:-foreground}"
 DRY_RUN="${DRY_RUN:-0}"
 VENV_PATH="${VENV_PATH:-/root/vepfs/envs/neoverse}"
 ENV_PYTHON="${ENV_PYTHON:-${PYTHON:-${VENV_PATH}/bin/python}}"
-CONFIG="${CONFIG:-configs/distill/control_latent.yaml}"
-PROJECT_NAME="${PROJECT_NAME:-NeoVerseControlLatentDistill}"
+CONFIG="${CONFIG:-configs/distill/control_latent_v2.yaml}"
+PROJECT_NAME="${PROJECT_NAME:-NeoVerseQueryableWorldModel}"
 RUN_TIME="${RUN_TIME:-$(timestamp_utc)}"
 OUTPUT_DIR="${CAMERA_CACHE_DIR:-${OUTPUT_DIR:-${CODE_DIR}/outputs/${PROJECT_NAME}/camera_cache}}"
 LOG_DIR="${LOG_DIR:-${CODE_DIR}/outputs/${PROJECT_NAME}/camera_cache_logs/${RUN_TIME}}"

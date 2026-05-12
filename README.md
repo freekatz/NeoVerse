@@ -54,13 +54,11 @@ conda activate neoverse
 # For CUDA 12.1
 pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
-pip install torch-scatter -f https://data.pyg.org/whl/torch-2.3.1+cu121.html
 pip install --no-build-isolation git+https://github.com/nerfstudio-project/gsplat.git
 
 # For CUDA 12.8
 pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
-pip install torch-scatter -f https://data.pyg.org/whl/torch-2.7.1+cu128.html
 pip install --no-build-isolation git+https://github.com/nerfstudio-project/gsplat.git
 ```
 

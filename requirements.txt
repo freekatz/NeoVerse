@@ -6,6 +6,7 @@ numpy
 Pillow
 tqdm
 sentencepiece
+regex
 
 # Video/Image processing
 imageio
@@ -29,6 +30,8 @@ moviepy==1.0.3
 # Demo
 gradio
 trimesh
+fastapi
+uvicorn
 
 # Training
 accelerate
@@ -42,3 +45,13 @@ ftfy
 
 # Dataset processing
 pandas
+
+# Installed separately because versions depend on CUDA / platform:
+# torch
+# torchvision
+# gsplat
+# torch-scatter
+#
+# Optional extras used by specific features:
+# cupy        # FastBlend
+# pycolmap    # COLMAP export / reconstruction helpers

@@ -1,4 +1,4 @@
-# NeoVerse 蒸馏训练
+# NeoVerse QWM v2 训练
 
 统一入口：
 
@@ -9,7 +9,7 @@ cd /root/vepfs/diffsynth-dev/papers/neoverse/code
 
 ## 推荐流程
 
-已有 cache，直接训练：
+已有 v2 cache，直接训练：
 
 ```bash
 ./cli train cache
@@ -26,25 +26,25 @@ cd /root/vepfs/diffsynth-dev/papers/neoverse/code
 评估 checkpoint：
 
 ```bash
-./cli eval last configs/distill/control_latent.yaml outputs/NeoVerseControlLatentDistill/YYYY-MM-DD/HH-MM-SS/adapter_last.pt
+./cli eval last configs/distill/control_latent_v2.yaml outputs/NeoVerseQueryableWorldModel/YYYY-MM-DD/HH-MM-SS/query_module_last.pt
 ```
 
 ## 训练逻辑
 
-当前主线是 `train cache`：
+当前主线是 QWM v2 的 `train cache`：
 
-- 训练只读 `frozen_cache/*.pt`
+- 训练只读 `frozen_cache/v2_*.pt`
 - 不在线抽视频 clip
 - 不在线跑 reconstructor/VGGT
 - 不在线算 teacher condition
-- 只训练 student adapter
+- 只训练 QueryModule
 
 正确数据链路：
 
 ```text
 原始视频 -> 连续 81 帧 clip -> camera cache
 81 帧 clip -> 多条 temporal trajectory -> frozen cache
-frozen cache -> adapter 训练
+frozen cache -> QueryModule + Wan 联合前向训练
 ```
 
 关键约束：
@@ -57,7 +57,7 @@ frozen cache -> adapter 训练
 
 ```bash
 # 主路径
-./cli train cache                 # 主训练，从 frozen cache 读
+./cli train cache                 # 主训练，从 v2 frozen cache 读
 
 ./cli cache build-camera          # 建 camera cache
 ./cli cache build-frozen          # 建 frozen cache
@@ -116,36 +116,36 @@ DRY_RUN=1 ./cli volc submit train-cache --replicas 1 --name neoverse-train-cache
 - `--name ...`：火山平台任务名。
 - `--submit`：真正提交；不加只生成 YAML。
 - `build-camera`：离线建 camera cache。
-- `build-frozen`：读取 camera cache，离线建训练用 frozen cache。
-- `train-cache`：读取 frozen cache 训练 adapter，不会自动补建 cache。
+- `build-frozen`：读取 camera cache，离线建 v2 frozen cache。
+- `train-cache`：读取 v2 frozen cache 训练 QueryModule，不会自动补建 cache。
 
 ## 关键目录
 
 ```text
-configs/distill/control_latent.yaml                      主配置
-training/control_latent/                                 蒸馏训练代码
+configs/distill/control_latent_v2.yaml                   主配置
+training/control_latent/                                 QWM / 蒸馏训练代码
 tools/cache/                                             cache 构建与检查
 tools/volc/                                              火山提交工具
 scripts/launch/                                          launcher
 
-outputs/NeoVerseControlLatentDistill/camera_cache        camera cache，别误删
-outputs/NeoVerseControlLatentDistill/frozen_cache        frozen cache，别误删
-outputs/NeoVerseControlLatentDistill/YYYY-MM-DD/HH-MM-SS 训练输出/checkpoint
+outputs/NeoVerseQueryableWorldModel/camera_cache         camera cache，别误删
+outputs/NeoVerseQueryableWorldModel/frozen_cache         v2 frozen cache，别误删
+outputs/NeoVerseQueryableWorldModel/YYYY-MM-DD/HH-MM-SS 训练输出/checkpoint
 ```
 
 ## 常用变量
 
 ```bash
 DATA_ROOT=data/SpatialVID_full
-FROZEN_CACHE_DIR=outputs/NeoVerseControlLatentDistill/frozen_cache
-CAMERA_CACHE_DIR=outputs/NeoVerseControlLatentDistill/camera_cache
+FROZEN_CACHE_DIR=outputs/NeoVerseQueryableWorldModel/frozen_cache
+CAMERA_CACHE_DIR=outputs/NeoVerseQueryableWorldModel/camera_cache
 MAX_STEPS=200000
 FIXED_CLIPS_PER_SCENE=16
 TRAJECTORIES_PER_CLIP=8
 FROZEN_CACHE_EVAL_RATIO=0.05
 EVAL_FREQ=500
 SWANLAB_MODE=cloud        # 需要 SWANLAB_API_KEY；本地离线可改 offline
-SWANLAB_PROJECT=NeoVerseControlLatentDistill
+SWANLAB_PROJECT=NeoVerseQueryableWorldModel
 ```
 
 例子：

@@ -3,19 +3,19 @@ set -euo pipefail
 
 # Usage examples:
 #   DRY_RUN=1 bash scripts/launch/train_distill.sh
-#   RUN_NAME=neoverse_distill_v1 bash scripts/launch/train_distill.sh
-#   GPU_LIST=0,1 RUN_NAME=neoverse_distill_v1 bash scripts/launch/train_distill.sh
-#   LAUNCH_MODE=background RUN_NAME=neoverse_distill_v1 bash scripts/launch/train_distill.sh
-#   ADAPTER_TYPE=conv RUN_NAME=neoverse_distill_conv bash scripts/launch/train_distill.sh
+#   RUN_NAME=qwm_v2 bash scripts/launch/train_distill.sh
+#   GPU_LIST=0,1 RUN_NAME=qwm_v2 bash scripts/launch/train_distill.sh
+#   LAUNCH_MODE=background RUN_NAME=qwm_v2 bash scripts/launch/train_distill.sh
+#   ADAPTER_TYPE=cross_attention_rope RUN_NAME=qwm_v2_rope bash scripts/launch/train_distill.sh
 #   On Volcengine/MLP with MLP_* env vars already set:
-#     RUN_NAME=neoverse_distill_v1 bash scripts/launch/train_distill.sh
+#     RUN_NAME=qwm_v2 bash scripts/launch/train_distill.sh
 
 timestamp_utc() {
   date -u "+%Y%m%d_%H%M%S"
 }
 
 log() {
-  printf '[train_distill_control][%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"
+  printf '[train_joint_v2][%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"
 }
 
 die() {
@@ -41,9 +41,9 @@ DRY_RUN="${DRY_RUN:-0}"
 VENV_PATH="${VENV_PATH:-/root/vepfs/envs/neoverse}"
 ENV_PYTHON="${ENV_PYTHON:-${VENV_PATH}/bin/python}"
 ACCELERATE="${ACCELERATE:-${VENV_PATH}/bin/accelerate}"
-CONFIG="${CONFIG:-configs/distill/control_latent.yaml}"
+CONFIG="${CONFIG:-configs/distill/control_latent_v2.yaml}"
 
-PROJECT_NAME="${PROJECT_NAME:-NeoVerseControlLatentDistill}"
+PROJECT_NAME="${PROJECT_NAME:-NeoVerseQueryableWorldModel}"
 RUN_DATE="${RUN_DATE:-$(date +%F)}"
 RUN_TIME="${RUN_TIME:-$(date +%H-%M-%S)}"
 OUTPUT_PATH="${OUTPUT_PATH:-outputs/${PROJECT_NAME}/${RUN_DATE}/${RUN_TIME}}"
@@ -67,8 +67,8 @@ TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
 
-# Adapter defaults live in configs/distill/control_latent.yaml. Set
-# ADAPTER_TYPE=conv or ADAPTER_TYPE=cross_attention_rope to override per run.
+# QueryModule defaults live in configs/distill/control_latent_v2.yaml. Set
+# ADAPTER_TYPE=cross_attention_rope to override per run.
 ADAPTER_TYPE="${ADAPTER_TYPE:-}"
 
 LAUNCHER="${LAUNCHER:-accelerate}"
@@ -389,7 +389,7 @@ log "config_file=${CONFIG_FILE}"
 
 run_cmd bash -n "$0"
 run_cmd "${ENV_PYTHON}" -m py_compile \
-  tools/train/distill_control_latent.py \
+  training/control_latent/joint_train.py \
   training/control_latent/distill.py \
   training/control_latent/reconstructor_tokens.py \
   diffsynth/models/student_adapters.py \
@@ -430,7 +430,7 @@ if [[ "${#accelerate_extra_args[@]}" -gt 0 ]]; then
 fi
 
 launch_cmd+=(
-  tools/train/distill_control_latent.py "${CONFIG}"
+  training/control_latent/joint_train.py "${CONFIG}"
   "${TRAIN_OVERRIDES[@]}"
   "$@"
 )

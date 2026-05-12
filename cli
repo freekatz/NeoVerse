@@ -36,8 +36,8 @@ Useful env overrides:
   RUN_NAME=train_cache
   MAX_STEPS=200000
   DATA_ROOT=data/SpatialVID
-  FROZEN_CACHE_DIR=outputs/NeoVerseControlLatentDistill/frozen_cache
-  CAMERA_CACHE_DIR=outputs/NeoVerseControlLatentDistill/camera_cache
+  FROZEN_CACHE_DIR=outputs/NeoVerseQueryableWorldModel/frozen_cache
+  CAMERA_CACHE_DIR=outputs/NeoVerseQueryableWorldModel/camera_cache
   FIXED_CLIPS_PER_SCENE=16
   TRAJECTORIES_PER_CLIP=8|16
   FROZEN_CACHE_EVAL_RATIO=0.05
@@ -237,7 +237,7 @@ train_cache() {
   export RUN_NAME="${RUN_NAME:-train_cache}"
   export CONTEXT_SAMPLING_STRATEGY="${CONTEXT_SAMPLING_STRATEGY:-mixed}"
   export DATASET_SEED="${DATASET_SEED:-null}"
-  export FROZEN_CACHE_DIR="${FROZEN_CACHE_DIR:-${CODE_DIR}/outputs/NeoVerseControlLatentDistill/frozen_cache}"
+  export FROZEN_CACHE_DIR="${FROZEN_CACHE_DIR:-${CODE_DIR}/outputs/NeoVerseQueryableWorldModel/frozen_cache}"
   export TRAIN_FROM_FROZEN_CACHE="true"
   export FROZEN_CACHE_SPLIT="${FROZEN_CACHE_SPLIT:-train}"
   export FROZEN_CACHE_READ="true"

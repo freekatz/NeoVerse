@@ -6,7 +6,7 @@ set -euo pipefail
 # Usage examples:
 #   bash scripts/launch/build_frozen_cache.sh
 #   GPU_LIST=0,1,2,3 bash scripts/launch/build_frozen_cache.sh
-#   TRAJECTORIES_PER_CLIP=16 CAMERA_CACHE_DIR=outputs/NeoVerseControlLatentDistill/camera_cache \
+#   TRAJECTORIES_PER_CLIP=16 CAMERA_CACHE_DIR=outputs/NeoVerseQueryableWorldModel/camera_cache \
 #     bash scripts/launch/build_frozen_cache.sh
 
 timestamp_utc() {
@@ -30,8 +30,8 @@ LAUNCH_MODE="${LAUNCH_MODE:-foreground}"
 DRY_RUN="${DRY_RUN:-0}"
 VENV_PATH="${VENV_PATH:-/root/vepfs/envs/neoverse}"
 ENV_PYTHON="${ENV_PYTHON:-${PYTHON:-${VENV_PATH}/bin/python}}"
-CONFIG="${CONFIG:-configs/distill/control_latent.yaml}"
-PROJECT_NAME="${PROJECT_NAME:-NeoVerseControlLatentDistill}"
+CONFIG="${CONFIG:-configs/distill/control_latent_v2.yaml}"
+PROJECT_NAME="${PROJECT_NAME:-NeoVerseQueryableWorldModel}"
 RUN_TIME="${RUN_TIME:-$(timestamp_utc)}"
 OUTPUT_DIR="${FROZEN_CACHE_DIR:-${OUTPUT_DIR:-${CODE_DIR}/outputs/${PROJECT_NAME}/frozen_cache}}"
 LOG_DIR="${LOG_DIR:-${CODE_DIR}/outputs/${PROJECT_NAME}/frozen_cache_logs/${RUN_TIME}}"
@@ -182,12 +182,12 @@ log "extra_args=$*"
 
 if [[ "${DRY_RUN}" == "1" ]]; then
   log "+ bash -n $0"
-  log "+ ${ENV_PYTHON} -m py_compile tools/cache/build_frozen_cache.py tools/train/distill_control_latent.py training/control_latent/distill.py training/control_latent/reconstructor_tokens.py training/data/datasets/spatialvid.py training/data/temporal_trajectory.py"
+  log "+ ${ENV_PYTHON} -m py_compile tools/cache/build_frozen_cache.py training/control_latent/joint_train.py training/control_latent/distill.py training/control_latent/reconstructor_tokens.py training/data/datasets/spatialvid.py training/data/temporal_trajectory.py"
 else
   bash -n "$0"
   "${ENV_PYTHON}" -m py_compile \
     tools/cache/build_frozen_cache.py \
-    tools/train/distill_control_latent.py \
+    training/control_latent/joint_train.py \
     training/control_latent/distill.py \
     training/control_latent/reconstructor_tokens.py \
     training/data/datasets/spatialvid.py \
