@@ -1194,6 +1194,7 @@ def model_fn_wan_video(
     control_camera_latents_input = None,
     fuse_vae_embedding_in_latents: bool = False,
     precomputed_control_hints = None,
+    raw_control_condition: torch.Tensor = None,
     **kwargs,
 ):
     # Timestep
@@ -1236,6 +1237,15 @@ def model_fn_wan_video(
             control_hints = tuple(control_hints)
         else:
             control_hints = tuple(precomputed_control_hints)
+    elif raw_control_condition is not None:
+        # Skip encode_condition; feed an externally-produced condition latent
+        # directly into the control_branch's hints stack. Caller must ensure
+        # raw_control_condition.shape == (B, x.shape[1], control_branch.dim).
+        raw_control_condition = raw_control_condition.to(device=x.device, dtype=x.dtype)
+        control_hints = control_branch.hints_from_condition(
+            raw_control_condition, x, context, t_mod, freqs,
+            use_gradient_checkpointing, use_gradient_checkpointing_offload,
+        )
     elif target_rgb is not None:
         control_hints = control_branch(
             x, target_rgb, target_depth, target_camera_embed, target_mask,

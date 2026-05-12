@@ -1,11 +1,20 @@
-# Route A v2 — Queryable World Model joint training.
+# Route A v2 — Queryable World Model (inherits NeoVerse injection).
 #
-# Key differences from control_latent.yaml (v0):
-#   * hits_dim: 4096   — hits occupies vanilla Wan's T5 text embedding slot (text_dim=4096).
-#   * wan_adapter       — WanAdapter head producing hits_adapted for VAE-latent supervision.
-#   * loss.aux_weight   — replaces l1/stat distillation loss with aux + diffusion losses.
-#   * enable_wan_diffusion_loss — runs vanilla Wan forward for diffusion loss.
-#   * Training entry: python training/control_latent/joint_train.py --config configs/distill/control_latent_v2.yaml
+# Architecture: QueryModule (CrossAttentionRoPEAdapter + WanAdapter) produces
+# `hits` which is fed directly into NeoVerseControlBranch.hints_from_condition
+# (skipping encode_condition), then per-layer hints are residually added to
+# Wan DiT — i.e. EXACTLY the NeoVerse injection pathway, with vggt-token-driven
+# hits replacing the rendered-RGB/depth/mask-driven condition latent.
+#
+# Frozen: Wan DiT, control_branch, VAE, text encoder, reconstructor (all NeoVerse pretrained).
+# Trainable: QueryModule only.
+#
+# Key differences from control_latent.yaml (v0 distill):
+#   * adapter still outputs (B, L_c, 5120) like v0 — but is trained against
+#     Wan diffusion loss + WanAdapter aux loss, NOT teacher distill.
+#   * wan_adapter      — new head producing hits_adapted for VAE-latent supervision.
+#   * load_text_encoder: true — Wan needs T5 emb for its native cross-attn.
+#   * Training entry: python training/control_latent/joint_train.py configs/distill/control_latent_v2.yaml
 
 seed: 0
 dataset_seed: ${seed}
@@ -22,13 +31,14 @@ reuse_reconstructor_tokens: true
 skip_unused_reconstructor_heads: true
 batch_vae_teacher_embeds: false
 reuse_context_forward_tokens: true
-load_dit: true              # v2: must load Wan DiT for diffusion loss
-load_text_encoder: false
+load_dit: true              # v2: load NeoVerse-fine-tuned Wan DiT
+load_text_encoder: true     # v2: need T5 emb for Wan's native cross-attn KV
 load_vae: true
-control_dim: 5120           # kept for control_branch reference; not used for hits
+control_dim: 5120           # control_branch hidden dim (14B variant); adapter output matches
 
-# hits dimension: must match vanilla Wan 14B text_dim (T5 slot = 4096)
-hits_dim: 4096
+# hits dimension: matches control_branch.dim so hits can be fed directly to
+# control_branch.hints_from_condition (replacing the encode_condition output).
+hits_dim: 5120
 
 height: 336
 width: 560
@@ -114,17 +124,17 @@ adapter:
   post_num_res_blocks: 2
 
 # WanAdapter downstream head: hits_adapted ↔ VAE(rebuild rendered rgb).
-# target_grid must match (T_lat, H_lat, W_lat) = ((num_target_frames+3)//4, H/8, W/8).
-# For the default 336×560 resolution and a 21-frame target trajectory:
-#   T_lat = (21+3)//4 = 6, H_lat = 336/8 = 42, W_lat = 560/8 = 70
+# `base_grid` only bounds the learnable embed parameter count — the actual
+# runtime target shape (T_lat, H/8, W/8) is derived from the VAE-encoded
+# rebuild/target video at every forward and the embed is trilinearly resampled
+# to it. Set `base_grid` near a typical runtime grid to minimize interpolation
+# distortion. For 81-frame 336×560 inputs the typical runtime is (21, 42, 70).
 wan_adapter:
-  target_grid: [6, 42, 70]
+  base_grid: [8, 16, 16]   # ~3.1M params at embed_dim=1536 (8*16*16*1536)
   embed_dim: 1536
   num_heads: 8
   c_z: 16
   mlp_ratio: 4.0
-
-target_latent_shapes: condition_embedding_auto
 
 loss:
   diffusion_weight: 1.0    # weight on vanilla Wan v-prediction MSE loss
@@ -136,8 +146,6 @@ min_timestep_step: 0       # lower bound of timestep_index sample range
 max_timestep_step: 1000    # upper bound (exclusive); maps to scheduler.timesteps
 
 scheduler_train_steps: 1000
-min_timestep_boundary: 0.0
-max_timestep_boundary: 1.0
 fuse_vae_embedding_in_latents: false
 
 vae_tiled: false
@@ -156,10 +164,9 @@ prefetch_factor: 2
 gradient_accumulation_steps: 1
 clip_grad: 1.0
 cache_train_batch: false
-cache_frozen_outputs: false
 train_from_frozen_cache: false
 frozen_cache_dir: null
-frozen_cache_pattern: "*.pt"
+frozen_cache_pattern: "v2_*.pt"
 frozen_cache_split: train
 frozen_cache_eval_ratio: 0.05
 frozen_cache_split_seed: 0
@@ -192,4 +199,3 @@ eval_steps: 20
 eval_batch_size: null
 eval_num_workers: null
 save_freq: 500
-vis_freq: 0
