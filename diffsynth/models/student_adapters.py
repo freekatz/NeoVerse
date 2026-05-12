@@ -1306,3 +1306,98 @@ def build_student_adapter(adapter_type: str, **kwargs) -> torch.nn.Module:
     if adapter_type in {"cross_attention_rope", "cross_attn_rope"}:
         return CrossAttentionRoPEAdapter(**kwargs)
     raise ValueError(f"Unknown adapter_type: {adapter_type}")
+
+
+class WanAdapter(torch.nn.Module):
+    """Downstream head turning ``hits`` into ``hits_adapted`` in Wan VAE latent space.
+
+    A learnable ``embed`` of shape ``(1, T_lat * H_lat * W_lat, embed_dim)`` queries
+    ``hits`` (B, L_hits, hits_dim) via one cross-attn block, then a linear head
+    projects to ``c_z`` channels and reshapes to ``(B, c_z, T_lat, H_lat, W_lat)``.
+    Output is aligned with the Wan VAE encoder output so it can be supervised
+    against ``VAE(rebuild rendered low-quality video)``.
+    """
+
+    def __init__(
+        self,
+        hits_dim: int,
+        target_grid: tuple[int, int, int],
+        embed_dim: int = 1536,
+        num_heads: int = 8,
+        c_z: int = 16,
+        mlp_ratio: float = 4.0,
+    ):
+        super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError("embed_dim must be divisible by num_heads")
+        self.hits_dim = int(hits_dim)
+        self.target_grid = tuple(int(x) for x in target_grid)
+        if len(self.target_grid) != 3:
+            raise ValueError("target_grid must be a 3-tuple (T_lat, H_lat, W_lat)")
+        self.embed_dim = int(embed_dim)
+        self.c_z = int(c_z)
+        L_grid = self.target_grid[0] * self.target_grid[1] * self.target_grid[2]
+        self.embed = torch.nn.Parameter(torch.randn(1, L_grid, self.embed_dim) * 0.02)
+        self.kv_proj = torch.nn.Linear(self.hits_dim, self.embed_dim)
+        self.block = CrossAttentionBlock(
+            self.embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, use_rope=False
+        )
+        self.head = torch.nn.Linear(self.embed_dim, self.c_z)
+
+    def forward(self, hits: torch.Tensor) -> torch.Tensor:
+        bsz = hits.shape[0]
+        q = self.embed.expand(bsz, -1, -1).to(dtype=hits.dtype)
+        kv = self.kv_proj(hits)
+        x = self.block(q, kv)
+        x = self.head(x)
+        T_lat, H_lat, W_lat = self.target_grid
+        x = x.transpose(1, 2).reshape(bsz, self.c_z, T_lat, H_lat, W_lat)
+        return x
+
+
+class QueryModule(torch.nn.Module):
+    """Compose a trunk query adapter (path 1 → ``hits``) and an optional
+    :class:`WanAdapter` (path 2 → ``hits_adapted``).
+
+    The trunk must be a :class:`CrossAttentionRoPEAdapter` running in
+    ``output_mode='condition_embedding'`` so its forward returns a single
+    Tensor of shape ``(B, L_hits, output_dim)``.
+    """
+
+    def __init__(
+        self,
+        adapter: CrossAttentionRoPEAdapter,
+        wan_adapter: WanAdapter | None = None,
+    ):
+        super().__init__()
+        if adapter.output_mode != "condition_embedding":
+            raise ValueError(
+                "QueryModule requires CrossAttentionRoPEAdapter in 'condition_embedding' mode"
+            )
+        self.adapter = adapter
+        self.wan_adapter = wan_adapter
+
+    def forward(self, *args, **kwargs):
+        hits = self.adapter(*args, **kwargs)
+        if not isinstance(hits, torch.Tensor):
+            raise RuntimeError(
+                "Expected adapter to return a Tensor in condition_embedding mode"
+            )
+        hits_adapted = self.wan_adapter(hits) if self.wan_adapter is not None else None
+        return hits, hits_adapted
+
+
+def build_query_module(
+    adapter_type: str,
+    adapter_cfg: dict,
+    wan_adapter_cfg: dict | None = None,
+) -> QueryModule:
+    adapter = build_student_adapter(adapter_type, **adapter_cfg)
+    if not isinstance(adapter, CrossAttentionRoPEAdapter):
+        raise ValueError("QueryModule requires CrossAttentionRoPEAdapter as the trunk")
+    wan_adapter = (
+        WanAdapter(hits_dim=int(adapter.output_dim), **wan_adapter_cfg)
+        if wan_adapter_cfg is not None
+        else None
+    )
+    return QueryModule(adapter, wan_adapter)

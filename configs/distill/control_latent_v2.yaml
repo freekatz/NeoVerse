@@ -1,0 +1,195 @@
+# Route A v2 — Queryable World Model joint training.
+#
+# Key differences from control_latent.yaml (v0):
+#   * hits_dim: 4096   — hits occupies vanilla Wan's T5 text embedding slot (text_dim=4096).
+#   * wan_adapter       — WanAdapter head producing hits_adapted for VAE-latent supervision.
+#   * loss.aux_weight   — replaces l1/stat distillation loss with aux + diffusion losses.
+#   * enable_wan_diffusion_loss — runs vanilla Wan forward for diffusion loss.
+#   * Training entry: python training/control_latent/joint_train.py --config configs/distill/control_latent_v2.yaml
+
+seed: 0
+dataset_seed: ${seed}
+data_root: data/SpatialVID
+video_ids: null
+video_paths: null
+torch_dtype: bfloat16
+model_path: ./models
+reconstructor_path: ./models/NeoVerse/reconstructor.ckpt
+lora_path: null
+lora_alpha: 1.0
+enable_vram_management: true
+reuse_reconstructor_tokens: true
+skip_unused_reconstructor_heads: true
+batch_vae_teacher_embeds: false
+reuse_context_forward_tokens: true
+load_dit: true              # v2: must load Wan DiT for diffusion loss
+load_text_encoder: false
+load_vae: true
+control_dim: 5120           # kept for control_branch reference; not used for hits
+
+# hits dimension: must match vanilla Wan 14B text_dim (T5 slot = 4096)
+hits_dim: 4096
+
+height: 336
+width: 560
+num_views: 81
+min_num_context_views: 10
+max_num_context_views: 20
+use_camera_annotations: false
+continuous_target_frames: true
+force_first_context: true
+timestamp_unit: seconds
+temporal_augmentation: false
+temporal_trajectory_profile: forward_pause
+temporal_order: trajectory
+temporal_max_condition_frames: 8
+context_sampling_strategy: mixed
+context_sampling_weights:
+  uniform_first: 0.25
+  random_first: 0.30
+  window_with_first: 0.15
+  prefix: 0.15
+  first_plus_sparse: 0.10
+  first_plus_recent_window: 0.05
+variants_per_scene: 1
+trajectories_per_clip: null
+temporal_variant_profile_weights: ""
+fixed_clips_per_scene: 0
+camera_cache_dir: ""
+camera_cache_required: false
+
+camera_condition_normalization:
+  enabled: true
+  normalize_poses: true
+  normalize_intrinsics: true
+  normalize_plucker: true
+  min_translation_scale: 1.0
+
+pipeline_kwargs:
+  novel_view_sampling_trans: [0.0, 0.0]
+  novel_view_sampling_max_rot: 0.0
+  culling_prob: 1.0
+  kernel_size_range: [0, 0]
+  occlusion_thresh: 0.1
+  alpha_thresh: 0.5
+  color_thresh: [50, 50]
+  mask_non_context_targets: false
+  prompt_drop_prob: 0.0
+  mask_drop_prob: 0.0
+  condition_drop_prob: 0.0
+
+token:
+  layer_indices: [4, 11, 17, 23]
+  include_camera_token: auto
+  context_only: true
+  ref_view_strategy: saddle_balanced
+  autocast_dtype: bfloat16
+  token_dim: 2048
+  token_groups: 5
+
+adapter:
+  type: cross_attention_rope
+  output_mode: condition_embedding   # internal; overridden to condition_embedding by build_query_module_from_cfg
+  input_channels: null
+  hidden_dim: 512
+  num_res_blocks: 4
+  dropout: 0.0
+  condition_time_dim: 128
+  use_text_context: false
+  use_dit_state: false
+  token_dim: null
+  num_heads: 8
+  num_blocks: 4
+  source_pool_hw: [16, 16]
+  max_source_tokens: 32768
+  query_chunk_size: 4096
+  use_rope: true
+  max_token_groups: null
+  use_group_embedding: true
+  use_local_grid: true
+  use_time_film: true
+  time_film_dim: 128
+  time_position_mode: reroped
+  rerope_interval: 4.0
+  post_num_res_blocks: 2
+
+# WanAdapter downstream head: hits_adapted ↔ VAE(rebuild rendered rgb).
+# target_grid must match (T_lat, H_lat, W_lat) = ((num_target_frames+3)//4, H/8, W/8).
+# For the default 336×560 resolution and a 21-frame target trajectory:
+#   T_lat = (21+3)//4 = 6, H_lat = 336/8 = 42, W_lat = 560/8 = 70
+wan_adapter:
+  target_grid: [6, 42, 70]
+  embed_dim: 1536
+  num_heads: 8
+  c_z: 16
+  mlp_ratio: 4.0
+
+target_latent_shapes: condition_embedding_auto
+
+loss:
+  diffusion_weight: 1.0    # weight on vanilla Wan v-prediction MSE loss
+  aux_weight: 0.1          # weight on hits_adapted ↔ VAE(rendered) L1
+
+# v2 training control
+enable_wan_diffusion_loss: true
+min_timestep_step: 0       # lower bound of timestep_index sample range
+max_timestep_step: 1000    # upper bound (exclusive); maps to scheduler.timesteps
+
+scheduler_train_steps: 1000
+min_timestep_boundary: 0.0
+max_timestep_boundary: 1.0
+fuse_vae_embedding_in_latents: false
+
+vae_tiled: false
+tile_size: [30, 52]
+tile_stride: [15, 26]
+
+learning_rate: 1.0e-4
+weight_decay: 0.01
+num_epochs: 20000
+max_steps: 20000
+batch_size: 1
+num_workers: 1
+pin_memory: false
+persistent_workers: true
+prefetch_factor: 2
+gradient_accumulation_steps: 1
+clip_grad: 1.0
+cache_train_batch: false
+cache_frozen_outputs: false
+train_from_frozen_cache: false
+frozen_cache_dir: null
+frozen_cache_pattern: "*.pt"
+frozen_cache_split: train
+frozen_cache_eval_ratio: 0.05
+frozen_cache_split_seed: 0
+frozen_cache_split_mode: hash
+frozen_cache_read: true
+frozen_cache_write: false
+frozen_cache_required: false
+frozen_cache_dtype: bfloat16
+preload_frozen_cache: false
+preload_frozen_cache_device: cpu
+preload_frozen_cache_batch_size: 1
+shuffle_preloaded_frozen_cache: true
+
+swanlab_enabled: true
+swanlab_project: NeoVerseQueryableWorldModel
+swanlab_experiment_name: null
+swanlab_workspace: null
+swanlab_mode: cloud
+swanlab_logdir: null
+swanlab_tags: []
+
+output_path: ./outputs/NeoVerseQueryableWorldModel/v2
+auto_resume: true
+resume_from: null
+resume_optimizer: true
+save_optimizer_intermediate: false
+print_freq: 10
+eval_freq: 500
+eval_steps: 20
+eval_batch_size: null
+eval_num_workers: null
+save_freq: 500
+vis_freq: 0

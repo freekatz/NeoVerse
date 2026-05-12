@@ -743,6 +743,7 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
             "target_timestamps": target_timestamps,
             "source_poses": source_poses,
             "source_intrs": source_intrs,
+            "rebuild_rendered_rgb": rendered_rgb,
         }
         if "token_list" in recon_output:
             output["reconstructor_token_list"] = recon_output["token_list"]
