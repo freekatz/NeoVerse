@@ -211,7 +211,11 @@ class ControlLatentJointModule(torch.nn.Module):
         # We immediately replace its adapter with our own QueryModule.
         base = ControlLatentDistillModule(cfg)
         del base.adapter  # we don't need the distill adapter
-        self._base = base  # keep for forward_preprocess re-use
+        # Keep the distill wrapper only as a plain helper object for
+        # ``forward_preprocess``. If it stays as a registered submodule,
+        # ``train()/eval()`` will recurse into ``ControlLatentDistillModule``
+        # and hit its deleted ``adapter`` attribute.
+        object.__setattr__(self, "_base", base)
         object.__setattr__(self, "pipe", base.pipe)
         self.query_module = build_query_module_from_cfg(self.pipe, cfg)
         freeze_module(self.pipe)
