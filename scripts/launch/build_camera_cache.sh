@@ -7,7 +7,7 @@ set -euo pipefail
 #   bash scripts/launch/build_camera_cache.sh
 #   GPU_LIST=0,1,2,3 bash scripts/launch/build_camera_cache.sh
 #   LAUNCH_MODE=background GPU_LIST=0,1 bash scripts/launch/build_camera_cache.sh
-#   CAMERA_CACHE_DIR=outputs/NeoVerseQueryableWorldModel/camera_cache \
+#   CAMERA_CACHE_DIR=data/camera_cache \
 #     FIXED_CLIPS_PER_SCENE=16 bash scripts/launch/build_camera_cache.sh
 
 timestamp_utc() {
@@ -34,7 +34,7 @@ ENV_PYTHON="${ENV_PYTHON:-${PYTHON:-${VENV_PATH}/bin/python}}"
 CONFIG="${CONFIG:-configs/distill/control_latent_v2.yaml}"
 PROJECT_NAME="${PROJECT_NAME:-NeoVerseQueryableWorldModel}"
 RUN_TIME="${RUN_TIME:-$(timestamp_utc)}"
-OUTPUT_DIR="${CAMERA_CACHE_DIR:-${OUTPUT_DIR:-${CODE_DIR}/outputs/${PROJECT_NAME}/camera_cache}}"
+OUTPUT_DIR="${CAMERA_CACHE_DIR:-${OUTPUT_DIR:-${CODE_DIR}/data/camera_cache}}"
 LOG_DIR="${LOG_DIR:-${CODE_DIR}/outputs/${PROJECT_NAME}/camera_cache_logs/${RUN_TIME}}"
 PID_FILE="${PID_FILE:-${LOG_DIR}/run.pid}"
 GPU_LIST="${GPU_LIST:-}"

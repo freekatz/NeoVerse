@@ -128,8 +128,8 @@ tools/cache/                                             cache 构建与检查
 tools/volc/                                              火山提交工具
 scripts/launch/                                          launcher
 
-outputs/NeoVerseQueryableWorldModel/camera_cache         camera cache，别误删
-outputs/NeoVerseQueryableWorldModel/frozen_cache         v2 frozen cache，别误删
+data/camera_cache                                        camera cache，别误删
+data/frozen_cache                                        v2 frozen cache，别误删
 outputs/NeoVerseQueryableWorldModel/YYYY-MM-DD/HH-MM-SS 训练输出/checkpoint
 ```
 
@@ -137,8 +137,8 @@ outputs/NeoVerseQueryableWorldModel/YYYY-MM-DD/HH-MM-SS 训练输出/checkpoint
 
 ```bash
 DATA_ROOT=data/SpatialVID_full
-FROZEN_CACHE_DIR=outputs/NeoVerseQueryableWorldModel/frozen_cache
-CAMERA_CACHE_DIR=outputs/NeoVerseQueryableWorldModel/camera_cache
+FROZEN_CACHE_DIR=data/frozen_cache
+CAMERA_CACHE_DIR=data/camera_cache
 MAX_STEPS=200000
 FIXED_CLIPS_PER_SCENE=16
 TRAJECTORIES_PER_CLIP=8

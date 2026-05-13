@@ -6,7 +6,7 @@ set -euo pipefail
 # Usage examples:
 #   bash scripts/launch/build_frozen_cache.sh
 #   GPU_LIST=0,1,2,3 bash scripts/launch/build_frozen_cache.sh
-#   TRAJECTORIES_PER_CLIP=16 CAMERA_CACHE_DIR=outputs/NeoVerseQueryableWorldModel/camera_cache \
+#   TRAJECTORIES_PER_CLIP=16 CAMERA_CACHE_DIR=data/camera_cache \
 #     bash scripts/launch/build_frozen_cache.sh
 
 timestamp_utc() {
@@ -33,7 +33,7 @@ ENV_PYTHON="${ENV_PYTHON:-${PYTHON:-${VENV_PATH}/bin/python}}"
 CONFIG="${CONFIG:-configs/distill/control_latent_v2.yaml}"
 PROJECT_NAME="${PROJECT_NAME:-NeoVerseQueryableWorldModel}"
 RUN_TIME="${RUN_TIME:-$(timestamp_utc)}"
-OUTPUT_DIR="${FROZEN_CACHE_DIR:-${OUTPUT_DIR:-${CODE_DIR}/outputs/${PROJECT_NAME}/frozen_cache}}"
+OUTPUT_DIR="${FROZEN_CACHE_DIR:-${OUTPUT_DIR:-${CODE_DIR}/data/frozen_cache}}"
 LOG_DIR="${LOG_DIR:-${CODE_DIR}/outputs/${PROJECT_NAME}/frozen_cache_logs/${RUN_TIME}}"
 RUN_OUTPUT_DIR="${RUN_OUTPUT_DIR:-${LOG_DIR}/run_output}"
 PID_FILE="${PID_FILE:-${LOG_DIR}/run.pid}"
@@ -42,7 +42,7 @@ CACHE_NNODES="${CACHE_NNODES:-${MLP_WORKER_NUM:-1}}"
 CACHE_NODE_RANK="${CACHE_NODE_RANK:-${MLP_ROLE_INDEX:-0}}"
 CACHE_GLOBAL_NUM_SHARDS="${CACHE_GLOBAL_NUM_SHARDS:-}"
 CACHE_GLOBAL_SHARD_OFFSET="${CACHE_GLOBAL_SHARD_OFFSET:-}"
-DEFAULT_CAMERA_CACHE_DIR="${DEFAULT_CAMERA_CACHE_DIR:-${CODE_DIR}/outputs/${PROJECT_NAME}/camera_cache}"
+DEFAULT_CAMERA_CACHE_DIR="${DEFAULT_CAMERA_CACHE_DIR:-${CODE_DIR}/data/camera_cache}"
 USE_CAMERA_CACHE="${USE_CAMERA_CACHE:-auto}"
 
 [[ -d "${CODE_DIR}" ]] || die "CODE_DIR does not exist: ${CODE_DIR}"

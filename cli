@@ -40,8 +40,8 @@ Useful env overrides:
   RUN_NAME=train_cache
   MAX_STEPS=200000
   DATA_ROOT=data/SpatialVID
-  FROZEN_CACHE_DIR=outputs/NeoVerseQueryableWorldModel/frozen_cache
-  CAMERA_CACHE_DIR=outputs/NeoVerseQueryableWorldModel/camera_cache
+  FROZEN_CACHE_DIR=data/frozen_cache
+  CAMERA_CACHE_DIR=data/camera_cache
   FIXED_CLIPS_PER_SCENE=16
   TRAJECTORIES_PER_CLIP=8|16
   FROZEN_CACHE_EVAL_RATIO=0.05
@@ -192,6 +192,7 @@ die() {
 
 common_online_env() {
   export GPU_LIST="${GPU_LIST:-${CUDA_VISIBLE_DEVICES:-}}"
+  export CAMERA_CACHE_DIR="${CAMERA_CACHE_DIR:-${CODE_DIR}/data/camera_cache}"
   export CAMERA_CONDITION_NORMALIZE="${CAMERA_CONDITION_NORMALIZE:-true}"
   export CAMERA_CONDITION_MIN_TRANSLATION_SCALE="${CAMERA_CONDITION_MIN_TRANSLATION_SCALE:-1.0}"
   export USE_CAMERA_ANNOTATIONS="${USE_CAMERA_ANNOTATIONS:-false}"
@@ -241,7 +242,7 @@ train_cache() {
   export RUN_NAME="${RUN_NAME:-train_cache}"
   export CONTEXT_SAMPLING_STRATEGY="${CONTEXT_SAMPLING_STRATEGY:-mixed}"
   export DATASET_SEED="${DATASET_SEED:-null}"
-  export FROZEN_CACHE_DIR="${FROZEN_CACHE_DIR:-${CODE_DIR}/outputs/NeoVerseQueryableWorldModel/frozen_cache}"
+  export FROZEN_CACHE_DIR="${FROZEN_CACHE_DIR:-${CODE_DIR}/data/frozen_cache}"
   export TRAIN_FROM_FROZEN_CACHE="true"
   export FROZEN_CACHE_SPLIT="${FROZEN_CACHE_SPLIT:-train}"
   export FROZEN_CACHE_READ="true"
