@@ -27,6 +27,7 @@ from tools.eval.render_student_comparison import (
     generate_with_student,
     load_adapter,
     pipeline_condition_kwargs,
+    resolve_eval_runtime,
     save_eval_comparison_grid,
     save_eval_condition_videos,
     save_eval_gt_comparison_grid,
@@ -652,7 +653,7 @@ def main():
         f"Resolved generation params: steps={args.num_inference_steps}, "
         f"cfg_scale={args.cfg_scale}, lora_path={lora_path}"
     )
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device, enable_vram_management = resolve_eval_runtime(args.enable_vram_management)
     pipe = WanVideoNeoVersePipeline.from_pretrained(
         local_model_path=cfg.model_path,
         reconstructor_path=cfg.reconstructor_path,
@@ -661,7 +662,7 @@ def main():
         torch_dtype=getattr(torch, cfg.torch_dtype),
         lora_path=lora_path,
         lora_alpha=float(cfg.get("lora_alpha", 1.0)),
-        enable_vram_management=args.enable_vram_management,
+        enable_vram_management=enable_vram_management,
     )
     pipe.eval()
     adapter = load_adapter(pipe, cfg, str(checkpoint), pipe.device) if "student" in modes else None

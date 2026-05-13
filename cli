@@ -103,8 +103,8 @@ Usage:
   ./cli eval last CONFIG CHECKPOINT [dataset indices...]  # legacy visual smoke test
 
 Examples:
-  ./cli eval frozen-cache outputs/.../config.yaml outputs/.../adapter_last.pt
-  ./cli eval frozen-cache outputs/.../config.yaml outputs/.../adapter_last.pt --max_samples 8 --modes student
+  ./cli eval frozen-cache outputs/.../config.yaml outputs/.../query_module_last.pt
+  ./cli eval frozen-cache outputs/.../config.yaml outputs/.../query_module_last.pt --max_samples 8 --modes student
 EOF
 }
 
@@ -320,8 +320,7 @@ eval_last() {
       "${checkpoint}" \
       --output_dir "$(dirname "${checkpoint}")/eval_idx${index}" \
       --dataset_index "${index}" \
-      --modes teacher,student \
-      --enable_vram_management
+      --modes teacher,student
   done
 }
 

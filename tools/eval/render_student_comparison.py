@@ -28,6 +28,7 @@ from training.control_latent.distill import (
     continuous_view_order_indices,
     target_trajectory_indices,
 )
+from training.control_latent.joint_train import build_query_module_from_cfg
 
 
 def zero_drop_probs(pipeline_kwargs):
@@ -50,14 +51,35 @@ def pipeline_condition_kwargs(render_conditions):
     return {key: value for key, value in render_conditions.items() if key in allowed}
 
 
+def _checkpoint_student_payload(checkpoint):
+    if isinstance(checkpoint, dict):
+        if "query_module" in checkpoint:
+            return checkpoint["query_module"], "query_module"
+        if "adapter" in checkpoint:
+            return checkpoint["adapter"], "adapter"
+        if checkpoint and all(isinstance(key, str) for key in checkpoint.keys()):
+            if any(key.startswith("adapter.") or key.startswith("wan_adapter.") for key in checkpoint.keys()):
+                return checkpoint, "query_module"
+            return checkpoint, "adapter"
+    return checkpoint, "adapter"
+
+
+def resolve_eval_runtime(requested_vram_management=False):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    enable_vram_management = bool(requested_vram_management) and device != "cuda"
+    if requested_vram_management and device == "cuda":
+        print("Ignoring --enable_vram_management during eval; loading weights on cuda.")
+    return device, enable_vram_management
+
+
 def load_adapter(pipe, cfg, checkpoint_path, device):
-    adapter = build_adapter(pipe, cfg)
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    state_dict = checkpoint["adapter"] if isinstance(checkpoint, dict) and "adapter" in checkpoint else checkpoint
-    adapter.load_state_dict(state_dict, strict=True)
-    adapter.to(device=device, dtype=pipe.torch_dtype)
-    adapter.eval()
-    return adapter
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict, checkpoint_kind = _checkpoint_student_payload(checkpoint)
+    student_model = build_query_module_from_cfg(pipe, cfg) if checkpoint_kind == "query_module" else build_adapter(pipe, cfg)
+    student_model.load_state_dict(state_dict, strict=True)
+    student_model.to(device=device, dtype=pipe.torch_dtype)
+    student_model.eval()
+    return student_model
 
 
 def batch_dataset_views(views, device):
@@ -653,7 +675,7 @@ def prepare_inputs(pipe, prompt, render_conditions, args):
 
 
 @torch.no_grad()
-def compute_student_condition(pipe, adapter, token_pack, inputs_shared, output_grid, cfg):
+def compute_student_condition(pipe, student_model, token_pack, inputs_shared, output_grid, cfg):
     target_times = inputs_shared.get("target_timestamps")
     if isinstance(target_times, torch.Tensor):
         target_times = target_times.to(device=pipe.device, dtype=torch.float32)
@@ -673,7 +695,7 @@ def compute_student_condition(pipe, adapter, token_pack, inputs_shared, output_g
             inputs_shared.get("target_intrs"),
             context_only=bool(cfg.token.context_only),
         )
-    return adapter(
+    student_condition = student_model(
         token_pack["tokens"],
         output_grid,
         target_times=target_times,
@@ -683,7 +705,14 @@ def compute_student_condition(pipe, adapter, token_pack, inputs_shared, output_g
         source_times=source_times,
         source_poses=source_poses,
         source_intrs=source_intrs,
-    ).to(dtype=pipe.torch_dtype, device=pipe.device)
+    )
+    if isinstance(student_condition, tuple):
+        student_condition = student_condition[0]
+    if not isinstance(student_condition, torch.Tensor):
+        raise RuntimeError(
+            f"Expected student model to return a Tensor or (Tensor, ...), got {type(student_condition).__name__}"
+        )
+    return student_condition.to(dtype=pipe.torch_dtype, device=pipe.device)
 
 
 @torch.no_grad()
@@ -708,7 +737,7 @@ def compute_student_hints(pipe, student_condition, context, latents, timestep, c
 
 
 @torch.no_grad()
-def generate_with_student(pipe, adapter, render_conditions, prompt, cfg, args):
+def generate_with_student(pipe, student_model, render_conditions, prompt, cfg, args):
     inputs_shared, inputs_posi, inputs_nega = prepare_inputs(pipe, prompt, render_conditions, args)
     pipe.load_models_to_device(["reconstructor"])
     token_pack = extract_vggt_tokens(
@@ -728,7 +757,7 @@ def generate_with_student(pipe, adapter, render_conditions, prompt, cfg, args):
         inputs_posi["context"],
         fuse_vae_embedding_in_latents=bool(cfg.get("fuse_vae_embedding_in_latents", False)),
     )
-    student_condition = compute_student_condition(pipe, adapter, token_pack, inputs_shared, output_grid, cfg)
+    student_condition = compute_student_condition(pipe, student_model, token_pack, inputs_shared, output_grid, cfg)
 
     pipe.load_models_to_device(pipe.in_iteration_models)
     models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
@@ -777,6 +806,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("config", type=str)
     parser.add_argument("checkpoint", type=str)
+    parser.add_argument(
+        "--config_overrides",
+        nargs="*",
+        default=None,
+        help="OmegaConf dotlist overrides for eval dataset/model config, e.g. video_ids=scene_001 camera_cache_dir=data/camera_cache.",
+    )
     parser.add_argument("--output_dir", default="./outputs/distill_eval")
     parser.add_argument("--dataset_index", type=int, default=0)
     parser.add_argument("--modes", default="teacher,student")
@@ -808,6 +843,8 @@ def main():
         raise ValueError(f"Unsupported mode(s): {', '.join(unsupported_modes)}. Supported modes: teacher, student")
 
     cfg = OmegaConf.load(args.config)
+    if args.config_overrides:
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(args.config_overrides))
     args.height = args.height or int(cfg.height)
     args.width = args.width or int(cfg.width)
     args.num_frames = args.num_frames or int(cfg.num_views)
@@ -830,19 +867,20 @@ def main():
         f"Resolved generation params: steps={args.num_inference_steps}, "
         f"cfg_scale={args.cfg_scale}, lora_path={lora_path}"
     )
+    device, enable_vram_management = resolve_eval_runtime(args.enable_vram_management)
 
     pipe = WanVideoNeoVersePipeline.from_pretrained(
         local_model_path=cfg.model_path,
         reconstructor_path=cfg.reconstructor_path,
         pipeline_kwargs=zero_drop_probs(cfg.pipeline_kwargs),
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        device=device,
         torch_dtype=getattr(torch, cfg.torch_dtype),
         lora_path=lora_path,
         lora_alpha=float(cfg.get("lora_alpha", 1.0)),
-        enable_vram_management=args.enable_vram_management,
+        enable_vram_management=enable_vram_management,
     )
     pipe.eval()
-    adapter = load_adapter(pipe, cfg, args.checkpoint, pipe.device) if "student" in requested_modes else None
+    student_model = load_adapter(pipe, cfg, args.checkpoint, pipe.device) if "student" in requested_modes else None
 
     dataset = build_spatialvid_dataset(cfg)
     source_views = dataset[int(args.dataset_index)]
@@ -880,7 +918,7 @@ def main():
                 tile_stride=tuple(args.tile_stride),
             )
         elif mode == "student":
-            video = generate_with_student(pipe, adapter, render_conditions, prompt, cfg, args)
+            video = generate_with_student(pipe, student_model, render_conditions, prompt, cfg, args)
         else:
             raise ValueError(f"Unsupported mode: {mode}")
         eval_frames[mode] = video
