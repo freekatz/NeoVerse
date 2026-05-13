@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export VENV_PATH=$(dirname $(dirname $(which python)))
+export ENV_PYTHON=$(which python)
+export ACCELERATE=$(which accelerate)
+
 CODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${CODE_DIR}"
 

@@ -389,11 +389,12 @@ class ControlLatentJointModule(torch.nn.Module):
     def _sample_diffusion_step(self, x0: torch.Tensor):
         """Sample a single diffusion (timestep, noise, noisy_latent, target_velocity)."""
         sched = self.pipe.scheduler
-        bsz = x0.shape[0]
-        # Inclusive lower / exclusive upper sample over the scheduler's training timesteps.
+        # Match the existing Wan/NeoVerse training path: sample one scheduler step
+        # per optimizer step, then broadcast that timestep across the batch.
+        # Keep the index on CPU because scheduler.timesteps is a CPU tensor.
         max_step = int(self.cfg.get("max_timestep_step", len(sched.timesteps)))
         min_step = int(self.cfg.get("min_timestep_step", 0))
-        t_idx = torch.randint(low=min_step, high=max_step, size=(bsz,), device=x0.device)
+        t_idx = torch.randint(low=min_step, high=max_step, size=(1,))
         timestep = sched.timesteps[t_idx].to(device=x0.device, dtype=x0.dtype)
         noise = torch.randn_like(x0)
         noisy_latent = sched.add_noise(x0, noise, timestep=timestep)
