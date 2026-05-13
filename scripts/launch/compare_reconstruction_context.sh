@@ -45,7 +45,12 @@ PREFER_GT_TRAJECTORY="${PREFER_GT_TRAJECTORY:-true}"
 cd "${CODE_DIR}"
 
 if [[ -f "${VENV_PATH}/bin/activate" ]]; then
+  compare_saved_argv=("$@")
+  set --
+  # shellcheck disable=SC1090
   source "${VENV_PATH}/bin/activate"
+  set -- "${compare_saved_argv[@]}"
+  unset compare_saved_argv
 fi
 
 export PYTHONPATH="${CODE_DIR}:${PYTHONPATH:-}"

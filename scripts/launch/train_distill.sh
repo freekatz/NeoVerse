@@ -122,7 +122,14 @@ fi
 cd "${CODE_DIR}"
 
 if [[ -f "${VENV_PATH}/bin/activate" ]]; then
+  # ``source`` inherits the caller's positional args; clear them temporarily so
+  # env activation does not misinterpret OmegaConf overrides as its own args.
+  neoverse_saved_argv=("$@")
+  set --
+  # shellcheck disable=SC1090
   source "${VENV_PATH}/bin/activate"
+  set -- "${neoverse_saved_argv[@]}"
+  unset neoverse_saved_argv
 fi
 
 export PYTHONUNBUFFERED
