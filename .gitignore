@@ -5,6 +5,7 @@ checkpoints/
 raw_data/
 bak/
 results/
+outputs/
 training/
 .DS_Store
 .claude/
