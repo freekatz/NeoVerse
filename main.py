@@ -31,65 +31,36 @@ def _run_sh(script_rel: str, args: list[str], env_extra: dict | None = None) -> 
     return subprocess.run(["bash", str(script), *args], cwd=str(CODE_DIR), env=env).returncode
 
 
-def _common_online_env() -> dict[str, str]:
-    e = {"GPU_LIST": os.environ.get("GPU_LIST", os.environ.get("CUDA_VISIBLE_DEVICES", "") or "")}
-    for k, d in (
-        ("CAMERA_CONDITION_NORMALIZE", "true"),
-        ("CAMERA_CONDITION_MIN_TRANSLATION_SCALE", "1.0"),
-        ("USE_CAMERA_ANNOTATIONS", "false"),
-        ("ENABLE_VRAM_MANAGEMENT", "false"),
-        ("NUM_WORKERS", "4"),
-        ("PIN_MEMORY", "true"),
-        ("PERSISTENT_WORKERS", "true"),
-        ("PREFETCH_FACTOR", "2"),
-        ("REUSE_RECONSTRUCTOR_TOKENS", "true"),
-        ("SKIP_UNUSED_RECONSTRUCTOR_HEADS", "true"),
-        ("REUSE_CONTEXT_FORWARD_TOKENS", "true"),
-    ):
-        e.setdefault(k, os.environ.get(k, d))
-    return e
-
-
-def _disable_frozen() -> dict[str, str]:
-    return {
-        k: "false"
-        for k in (
-            "TRAIN_FROM_FROZEN_CACHE",
-            "FROZEN_CACHE_READ",
-            "FROZEN_CACHE_WRITE",
-            "FROZEN_CACHE_REQUIRED",
-            "PRELOAD_FROZEN_CACHE",
-            "CACHE_FROZEN_OUTPUTS",
-        )
-    }
+def _gpu_env() -> dict[str, str]:
+    return {"GPU_LIST": os.environ.get("GPU_LIST", os.environ.get("CUDA_VISIBLE_DEVICES", "") or "")}
 
 
 def _train_online(rest: list[str]) -> int:
-    env = {**_common_online_env(), **_disable_frozen()}
+    env = _gpu_env()
     env.setdefault("RUN_NAME", os.environ.get("RUN_NAME", "online_time_forward_pause"))
-    env.setdefault("CONTEXT_SAMPLING_STRATEGY", os.environ.get("CONTEXT_SAMPLING_STRATEGY", "mixed"))
-    env["TEMPORAL_AUGMENTATION"] = "true"
-    env.setdefault("TEMPORAL_TRAJECTORY_PROFILE", os.environ.get("TEMPORAL_TRAJECTORY_PROFILE", "forward_pause"))
-    env.setdefault(
-        "TEMPORAL_VARIANT_PROFILE_WEIGHTS",
-        os.environ.get(
-            "TEMPORAL_VARIANT_PROFILE_WEIGHTS",
-            "forward_pause:0.5,mixed_fzr:0.4,backward:0.1",
+    overrides = [
+        "temporal_augmentation=true",
+        "temporal_trajectory_profile=" + os.environ.get("TEMPORAL_TRAJECTORY_PROFILE", "forward_pause"),
+        "temporal_variant_profile_weights=" + os.environ.get(
+            "TEMPORAL_VARIANT_PROFILE_WEIGHTS", "forward_pause:0.5,mixed_fzr:0.4,backward:0.1"
         ),
-    )
-    env.setdefault("TEMPORAL_ORDER", os.environ.get("TEMPORAL_ORDER", "trajectory"))
-    env.setdefault("TRAJECTORIES_PER_CLIP", os.environ.get("TRAJECTORIES_PER_CLIP", "8"))
-    env.setdefault("DATASET_SEED", os.environ.get("DATASET_SEED", "0"))
-    return _run_sh("scripts/launch/train_distill.sh", rest, env)
+        "temporal_order=" + os.environ.get("TEMPORAL_ORDER", "trajectory"),
+        "trajectories_per_clip=" + os.environ.get("TRAJECTORIES_PER_CLIP", "8"),
+        "context_sampling_strategy=" + os.environ.get("CONTEXT_SAMPLING_STRATEGY", "mixed"),
+        "dataset_seed=" + os.environ.get("DATASET_SEED", "0"),
+    ]
+    return _run_sh("scripts/launch/train_distill.sh", overrides + rest, env)
 
 
 def _train_online_noaug(rest: list[str]) -> int:
-    env = {**_common_online_env(), **_disable_frozen()}
+    env = _gpu_env()
     env.setdefault("RUN_NAME", os.environ.get("RUN_NAME", "online_noaug"))
-    env.setdefault("CONTEXT_SAMPLING_STRATEGY", os.environ.get("CONTEXT_SAMPLING_STRATEGY", "mixed"))
-    env["TEMPORAL_AUGMENTATION"] = "false"
-    env.setdefault("DATASET_SEED", os.environ.get("DATASET_SEED", "null"))
-    return _run_sh("scripts/launch/train_distill.sh", rest, env)
+    overrides = [
+        "temporal_augmentation=false",
+        "context_sampling_strategy=" + os.environ.get("CONTEXT_SAMPLING_STRATEGY", "mixed"),
+        "dataset_seed=" + os.environ.get("DATASET_SEED", "null"),
+    ]
+    return _run_sh("scripts/launch/train_distill.sh", overrides + rest, env)
 
 
 def _train_cache(rest: list[str]) -> int:
@@ -97,19 +68,21 @@ def _train_cache(rest: list[str]) -> int:
         "FROZEN_CACHE_DIR",
         str(CODE_DIR / "outputs/NeoVerseControlLatentDistill/frozen_cache"),
     )
-    env = {**_common_online_env()}
+    env = _gpu_env()
     env.setdefault("RUN_NAME", os.environ.get("RUN_NAME", "train_cache"))
-    env.setdefault("CONTEXT_SAMPLING_STRATEGY", os.environ.get("CONTEXT_SAMPLING_STRATEGY", "mixed"))
-    env.setdefault("DATASET_SEED", os.environ.get("DATASET_SEED", "null"))
-    env["FROZEN_CACHE_DIR"] = fc
-    env.setdefault("TRAIN_FROM_FROZEN_CACHE", "true")
-    env.setdefault("FROZEN_CACHE_SPLIT", os.environ.get("FROZEN_CACHE_SPLIT", "train"))
-    env.setdefault("FROZEN_CACHE_READ", "true")
-    env.setdefault("FROZEN_CACHE_WRITE", "false")
-    env.setdefault("FROZEN_CACHE_REQUIRED", "true")
-    env.setdefault("PRELOAD_FROZEN_CACHE", os.environ.get("PRELOAD_FROZEN_CACHE", "false"))
-    env.setdefault("CACHE_FROZEN_OUTPUTS", os.environ.get("CACHE_FROZEN_OUTPUTS", "false"))
-    return _run_sh("scripts/launch/train_distill.sh", rest, env)
+    overrides = [
+        f"frozen_cache_dir={fc}",
+        "train_from_frozen_cache=true",
+        "frozen_cache_read=true",
+        "frozen_cache_write=false",
+        "frozen_cache_required=true",
+        "frozen_cache_split=" + os.environ.get("FROZEN_CACHE_SPLIT", "train"),
+        "context_sampling_strategy=" + os.environ.get("CONTEXT_SAMPLING_STRATEGY", "mixed"),
+        "dataset_seed=" + os.environ.get("DATASET_SEED", "null"),
+        "preload_frozen_cache=" + os.environ.get("PRELOAD_FROZEN_CACHE", "false"),
+        "cache_frozen_outputs=" + os.environ.get("CACHE_FROZEN_OUTPUTS", "false"),
+    ]
+    return _run_sh("scripts/launch/train_distill.sh", overrides + rest, env)
 
 
 def usage() -> None:

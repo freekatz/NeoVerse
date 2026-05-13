@@ -22,18 +22,13 @@ def torch_dtype_from_name(name):
     return getattr(torch, str(name))
 
 
-def build_dataset(cfg, args):
-    data_root = args.data_root or cfg.data_root
-    fixed_clips_per_scene = (
-        args.fixed_clips_per_scene
-        if args.fixed_clips_per_scene is not None
-        else int(cfg.get("fixed_clips_per_scene", 16) or 16)
-    )
+def build_dataset(cfg):
+    fixed_clips_per_scene = int(cfg.get("fixed_clips_per_scene", 16) or 16)
     return SpatialVID(
         split=None,
-        ROOT=data_root,
-        video_ids=normalize_filter_values(args.video_ids if args.video_ids is not None else cfg.get("video_ids", None)),
-        video_paths=normalize_filter_values(args.video_paths if args.video_paths is not None else cfg.get("video_paths", None)),
+        ROOT=str(cfg.data_root),
+        video_ids=normalize_filter_values(cfg.get("video_ids", None)),
+        video_paths=normalize_filter_values(cfg.get("video_paths", None)),
         use_camera_annotations=False,
         continuous_target_frames=True,
         force_first_context=True,
@@ -58,11 +53,11 @@ def build_dataset(cfg, args):
     )
 
 
-def load_reconstructor(cfg, args, device):
-    dtype = torch_dtype_from_name(args.torch_dtype or cfg.get("torch_dtype", "bfloat16"))
+def load_reconstructor(cfg, device):
+    dtype = torch_dtype_from_name(cfg.get("torch_dtype", "bfloat16"))
     manager = ModelManager(torch_dtype=dtype, device=device)
     manager.load_model(
-        args.reconstructor_path or cfg.reconstructor_path,
+        cfg.reconstructor_path,
         model_names=["reconstructor"],
         device=device,
         torch_dtype=dtype,
@@ -124,18 +119,12 @@ def write_cache(path, views, camera_poses, camera_intrs):
 def main():
     parser = argparse.ArgumentParser(description="Build fixed-clip SpatialVID camera cache with the NeoVerse reconstructor.")
     parser.add_argument("--config", default="configs/distill/control_latent.yaml")
-    parser.add_argument("--data_root", default=None)
     parser.add_argument("--output_dir", default="outputs/NeoVerseControlLatentDistill/camera_cache")
-    parser.add_argument("--reconstructor_path", default=None)
-    parser.add_argument("--torch_dtype", default=None)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--fixed_clips_per_scene", type=int, default=None)
-    parser.add_argument("--video_ids", default=None)
-    parser.add_argument("--video_paths", default=None)
     parser.add_argument("--num_shards", type=int, default=1)
     parser.add_argument("--shard_index", type=int, default=0)
-    parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("overrides", nargs="*", help="OmegaConf dotlist overrides (key=value).")
     args = parser.parse_args()
     if args.num_shards <= 0:
         raise ValueError("--num_shards must be positive.")
@@ -143,11 +132,14 @@ def main():
         raise ValueError("--shard_index must satisfy 0 <= shard_index < num_shards.")
 
     cfg = OmegaConf.load(args.config)
+    if args.overrides:
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(args.overrides))
     device = torch.device(args.device if torch.cuda.is_available() or str(args.device) == "cpu" else "cpu")
-    dataset = build_dataset(cfg, args)
-    reconstructor, dtype = load_reconstructor(cfg, args, device)
+    dataset = build_dataset(cfg)
+    reconstructor, dtype = load_reconstructor(cfg, device)
 
-    total = len(dataset) if args.limit is None else min(len(dataset), int(args.limit))
+    limit = cfg.get("limit", None)
+    total = len(dataset) if limit is None else min(len(dataset), int(limit))
     indices = range(args.shard_index, total, args.num_shards)
     written = 0
     skipped = 0

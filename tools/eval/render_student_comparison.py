@@ -779,24 +779,10 @@ def main():
     parser.add_argument("--output_dir", default="./outputs/distill_eval")
     parser.add_argument("--dataset_index", type=int, default=0)
     parser.add_argument("--modes", default="teacher,student")
-    parser.add_argument("--height", type=int, default=None)
-    parser.add_argument("--width", type=int, default=None)
-    parser.add_argument("--num_frames", type=int, default=None)
-    parser.add_argument("--num_inference_steps", type=int, default=None)
-    parser.add_argument("--sigma_shift", type=float, default=5.0)
-    parser.add_argument("--control_scale", type=float, default=1.0)
-    parser.add_argument("--cfg_scale", type=float, default=None)
-    parser.add_argument("--negative_prompt", default="")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--rand_device", default="cpu")
-    parser.add_argument("--tiled", action="store_true")
-    parser.add_argument("--tile_size", type=int, nargs=2, default=(30, 52))
-    parser.add_argument("--tile_stride", type=int, nargs=2, default=(15, 26))
     parser.add_argument("--enable_vram_management", action="store_true")
     parser.add_argument("--disable_lora", action="store_true")
-    parser.add_argument("--lora_path", default=None)
-    parser.add_argument("--no_save_conditions", action="store_true")
-    parser.add_argument("--no_save_comparison_grid", action="store_true")
+    parser.add_argument("overrides", nargs="*", help="OmegaConf dotlist overrides (key=value).")
     args = parser.parse_args()
     requested_modes = [item.strip() for item in args.modes.split(",") if item.strip()]
     if not requested_modes:
@@ -807,16 +793,30 @@ def main():
         raise ValueError(f"Unsupported mode(s): {', '.join(unsupported_modes)}. Supported modes: teacher, student")
 
     cfg = OmegaConf.load(args.config)
-    args.height = args.height or int(cfg.height)
-    args.width = args.width or int(cfg.width)
-    args.num_frames = args.num_frames or int(cfg.num_views)
+    if args.overrides:
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(args.overrides))
+    args.height = int(cfg.height)
+    args.width = int(cfg.width)
+    args.num_frames = int(cfg.num_views)
+    args.num_inference_steps = cfg.get("num_inference_steps", None)
+    args.sigma_shift = float(cfg.get("sigma_shift", 5.0))
+    args.control_scale = float(cfg.get("control_scale", 1.0))
+    args.cfg_scale = cfg.get("cfg_scale", None)
+    args.negative_prompt = str(cfg.get("negative_prompt", ""))
+    args.rand_device = str(cfg.get("rand_device", "cpu"))
+    args.tiled = bool(cfg.get("tiled", False))
+    args.tile_size = list(cfg.get("tile_size", [30, 52]))
+    args.tile_stride = list(cfg.get("tile_stride", [15, 26]))
+    args.no_save_conditions = bool(cfg.get("no_save_conditions", False))
+    args.no_save_comparison_grid = bool(cfg.get("no_save_comparison_grid", False))
+    args.lora_path = cfg.get("lora_path", None)
     official_lora_path = os.path.join(
         str(cfg.model_path),
         "NeoVerse/loras/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors",
     )  # default cfg.model_path is ./checkpoints
     lora_path = None
     if not args.disable_lora:
-        lora_path = args.lora_path or cfg.get("lora_path", None)
+        lora_path = args.lora_path
         if lora_path is None and os.path.exists(official_lora_path):
             lora_path = official_lora_path
     use_lora = lora_path is not None

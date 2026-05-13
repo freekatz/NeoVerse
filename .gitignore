@@ -1,6 +1,7 @@
 tmp/
 refer/
 data/
+checkpoints/
 raw_data/
 bak/
 results/
