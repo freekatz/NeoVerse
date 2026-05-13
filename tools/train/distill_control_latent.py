@@ -343,10 +343,6 @@ def main():
                     if experiment_logger is not None:
                         lr = optimizer.param_groups[0]["lr"]
                         experiment_logger.log(compact_distill_log_metrics(metrics_float, "train", lr=lr), step=step)
-                    shapes = accelerator.unwrap_model(model).last_shapes
-                    print(f"token_shape={shapes['tokens']} output_grid={shapes['output_grid']}")
-                    first_key = next(iter(shapes["teacher"]))
-                    print(f"teacher[{first_key}]={shapes['teacher'][first_key]} student[{first_key}]={shapes['student'][first_key]}")
 
                 if eval_dataloader is not None and int(cfg.get("eval_freq", 0)) > 0 and step % int(cfg.eval_freq) == 0:
                     eval_start = time.time()

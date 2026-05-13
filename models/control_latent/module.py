@@ -345,14 +345,6 @@ class ControlLatentDistillModule(torch.nn.Module):
             )
         if not hasattr(self, "_frozen_forward_cache"):
             self._frozen_forward_cache = self.build_frozen_forward_cache(data)
-            cache = self._frozen_forward_cache
-            tokens = cache["tokens"]
-            teacher = cache["teacher"]
-            print(
-                "Cached frozen training inputs: "
-                f"tokens={tuple(tokens.shape)} teacher={tuple(teacher.shape)} "
-                f"output_grid={cache['output_grid']}"
-            )
         return cache_to_target_device(
             self._frozen_forward_cache,
             target_device,
