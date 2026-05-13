@@ -12,7 +12,7 @@ if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
 from diffsynth.models import ModelManager
-from training.data.datasets.spatialvid import SpatialVID
+from training.data.spatialvid import SpatialVID
 
 
 def normalize_filter_values(value):

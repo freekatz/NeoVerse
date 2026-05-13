@@ -12,8 +12,9 @@ CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
-from training.control_latent import distill as train_mod
-from training.control_latent.distill import ControlLatentDistillModule, frozen_cache_signature
+from training.config_utils import build_spatialvid_dataset
+from training.control_latent.cache import frozen_cache_signature
+from training.control_latent.module import ControlLatentDistillModule
 
 
 def parse_bool(value):
@@ -190,7 +191,7 @@ def main():
     OmegaConf.save(cfg, os.path.join(cfg.output_path, f"config_shard{args.shard_index}.yaml"))
 
     device = torch.device(args.device if torch.cuda.is_available() or str(args.device) == "cpu" else "cpu")
-    dataset = train_mod.build_spatialvid_dataset(cfg)
+    dataset = build_spatialvid_dataset(cfg)
     model = None
 
     total = len(dataset) if args.limit is None else min(len(dataset), int(args.limit))

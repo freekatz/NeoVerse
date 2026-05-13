@@ -18,16 +18,15 @@ from diffsynth.data import save_video
 from diffsynth.utils.auxiliary import homo_matrix_inverse
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline, model_fn_wan_video
 from training.control_latent.reconstructor_tokens import extract_vggt_tokens
-from training.control_latent.distill import (
-    build_spatialvid_dataset,
-    build_adapter,
+from training.config_utils import build_spatialvid_dataset
+from training.control_latent.camera import (
     extract_source_times,
     extract_target_times,
     gather_source_cameras_from_target,
-    prepare_control_state,
     continuous_view_order_indices,
     target_trajectory_indices,
 )
+from training.control_latent.main import build_adapter, prepare_control_state
 
 
 def zero_drop_probs(pipeline_kwargs):

@@ -10,8 +10,8 @@ if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline, ModelConfig
-from training.utils import DiffusionTrainingModule, launch_training_task
-from training.data.datasets.spatialvid import SpatialVID
+from training.engine import DiffusionTrainingModule, launch_training_task
+from training.data.spatialvid import SpatialVID
 import torch.multiprocessing
 
 torch.multiprocessing.set_sharing_strategy("file_system")

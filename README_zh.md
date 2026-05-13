@@ -69,7 +69,14 @@ cd /path/to/NeoVerse
 
 ```text
 configs/distill/control_latent.yaml       蒸馏主配置
-training/control_latent/                  蒸馏训练代码
+training/config_utils.py                  共享配置解析 / SpatialVID 构建
+training/engine.py                        Legacy 训练引擎
+training/data/spatialvid.py               主数据集
+training/control_latent/main.py           蒸馏训练入口
+training/control_latent/module.py         ControlLatentDistillModule
+training/control_latent/cache.py          frozen cache 读写 / 切分
+training/control_latent/camera.py         相机 / 时间 / token 辅助
+training/control_latent/loss.py           distill loss 与可视化
 training/configs/train.yaml               Legacy 训练配置
 tools/cache/                              cache 构建与检查
 tools/inference/                          推理脚本
