@@ -44,9 +44,16 @@ from einops import rearrange
 from omegaconf import OmegaConf
 
 from diffsynth.models.student_adapters import build_query_module
-from diffsynth.pipelines.wan_video_neoverse import (
-    model_fn_wan_video as model_fn_wan_video_neoverse,
-)
+
+
+def _lazy_model_fn_wan_video_neoverse():
+    """Defer the NeoVerse pipeline import — it hard-imports gsplat at module
+    load, which we don't need in smoke_test mode. Only resolve when an actual
+    Wan forward step happens."""
+    from diffsynth.pipelines.wan_video_neoverse import (
+        model_fn_wan_video as _model_fn,
+    )
+    return _model_fn
 
 from training.control_latent import distill as _distill
 from training.control_latent.distill import (
@@ -539,6 +546,7 @@ class ControlLatentJointModule(torch.nn.Module):
             x0 = x0.to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
             text_emb = text_emb.to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
             timestep, noisy_latent, target_velocity = self._sample_diffusion_step(x0)
+            model_fn_wan_video_neoverse = _lazy_model_fn_wan_video_neoverse()
             pred = model_fn_wan_video_neoverse(
                 dit=self.pipe.dit,
                 control_branch=self.pipe.control_branch,

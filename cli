@@ -28,6 +28,7 @@ Stable user paths:
 
 Development paths:
   ./cli train online|online-noaug [extra OmegaConf overrides...]
+  ./cli smoke [extra OmegaConf overrides...]      # CPU-only, no weights, ~5s
   ./cli dev profile distill-step [args]
   ./cli dev debug temporal|reconstruction [args]
   ./cli dev overfit conv|cross [extra OmegaConf overrides...]
@@ -47,6 +48,9 @@ Useful env overrides:
   FROZEN_CACHE_EVAL_RATIO=0.05
   EVAL_FREQ=500
   DRY_RUN=1
+  SMOKE_CONFIG=configs/distill/control_latent_v2.yaml
+  SMOKE_OUTPUT=outputs/smoke
+  SMOKE_STEPS=2
 EOF
 }
 
@@ -261,6 +265,29 @@ train_online_noaug() {
   export TEMPORAL_AUGMENTATION="${TEMPORAL_AUGMENTATION:-false}"
   export DATASET_SEED="${DATASET_SEED:-null}"
   launch_train "$@"
+}
+
+smoke() {
+  # Run joint_train.py in smoke_test mode: CPU-only, synthetic cache batch,
+  # _SmokePipe stub (no NeoVerse / Wan / VAE / reconstructor / T5 weights load,
+  # no gsplat or torch_scatter import). Exercises QueryModule shapes,
+  # WanAdapter runtime target_grid, backward, optimizer step, and checkpoint
+  # save/load paths end-to-end. Completes in seconds.
+  local config="${SMOKE_CONFIG:-${CODE_DIR}/configs/distill/control_latent_v2.yaml}"
+  local out_dir="${SMOKE_OUTPUT:-${CODE_DIR}/outputs/smoke}"
+  local steps="${SMOKE_STEPS:-2}"
+  CUDA_VISIBLE_DEVICES="" "${PYTHON}" training/control_latent/joint_train.py \
+    "${config}" \
+    smoke_test=true \
+    output_path="${out_dir}" \
+    max_steps="${steps}" \
+    num_epochs=1 \
+    batch_size=1 \
+    num_workers=0 \
+    print_freq=1 \
+    save_freq=0 \
+    eval_freq=0 \
+    "$@"
 }
 
 cache_build_camera() {
@@ -567,5 +594,6 @@ case "${cmd}" in
   volc) dispatch_volc "$@" ;;
   dev) dispatch_dev "$@" ;;
   legacy) dispatch_legacy "$@" ;;
+  smoke) smoke "$@" ;;
   *) usage >&2; die "Unknown command: ${cmd}" ;;
 esac

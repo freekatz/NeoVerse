@@ -11,11 +11,27 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 from typing import Optional
-from gsplat.rendering import rasterization
-from gsplat.cuda._torch_impl import (
-    _fully_fused_projection,
-    _quat_scale_to_covar_preci,
-)
+try:
+    from gsplat.rendering import rasterization
+    from gsplat.cuda._torch_impl import (
+        _fully_fused_projection,
+        _quat_scale_to_covar_preci,
+    )
+    _HAS_GSPLAT = True
+except ImportError:  # pragma: no cover - import-time fallback
+    rasterization = None
+    _fully_fused_projection = None
+    _quat_scale_to_covar_preci = None
+    _HAS_GSPLAT = False
+
+
+def _require_gsplat(operation: str) -> None:
+    if not _HAS_GSPLAT:
+        raise RuntimeError(
+            f"{operation} requires `gsplat`. Either install gsplat (with CUDA "
+            "build matching your environment) or run from a pre-built frozen "
+            "cache (e.g. `./cli train cache` after `./cli cache build-frozen`)."
+        )
 
 
 from ..utils import BasePipeline, ModelConfig, PipelineUnit, PipelineUnitRunner
@@ -696,6 +712,7 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
             continuous_is_target = self._gather_view_tensor(source_views["is_target"], continuous_order)
             target_is_target = self._gather_view_tensor(continuous_is_target, target_indices)
 
+        _require_gsplat("Rendering target_rgb/depth via reconstructor.gs_renderer.rasterizer")
         rendered_rgb, target_depth, target_alpha = pipe.reconstructor.gs_renderer.rasterizer.forward(
             splats,
             render_viewmats=homo_matrix_inverse(target_poses),   # c2w -> w2c
@@ -884,6 +901,7 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
                     continue
 
                 # Project Gaussians to novel views
+                _require_gsplat("Gaussian degradation_simulation (visibility / occlusion check)")
                 covars, _ = _quat_scale_to_covar_preci(
                     cur_gaussian.rotations,
                     cur_gaussian.scales,
