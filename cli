@@ -224,7 +224,7 @@ launch_train() {
 }
 
 train_base() {
-  "${PYTHON}" tools/train/base_train.py "$@"
+  "${ENV_PYTHON}" tools/train/base_train.py "$@"
 }
 
 train_online() {
@@ -276,7 +276,7 @@ smoke() {
   local config="${SMOKE_CONFIG:-${CODE_DIR}/configs/distill/control_latent_v2.yaml}"
   local out_dir="${SMOKE_OUTPUT:-${CODE_DIR}/outputs/smoke}"
   local steps="${SMOKE_STEPS:-2}"
-  CUDA_VISIBLE_DEVICES="" "${PYTHON}" training/control_latent/joint_train.py \
+  CUDA_VISIBLE_DEVICES="" "${ENV_PYTHON}" training/control_latent/joint_train.py \
     "${config}" \
     smoke_test=true \
     output_path="${out_dir}" \
@@ -299,7 +299,7 @@ cache_build_frozen() {
 }
 
 cache_inspect() {
-  "${PYTHON}" tools/cache/inspect_cache.py "$@"
+  "${ENV_PYTHON}" tools/cache/inspect_cache.py "$@"
 }
 
 eval_last() {
@@ -315,7 +315,7 @@ eval_last() {
     indices=(0 17 33 81 159 240 319)
   fi
   for index in "${indices[@]}"; do
-    "${PYTHON}" tools/eval/render_student_comparison.py \
+    "${ENV_PYTHON}" tools/eval/render_student_comparison.py \
       "${config}" \
       "${checkpoint}" \
       --output_dir "$(dirname "${checkpoint}")/eval_idx${index}" \
@@ -330,11 +330,11 @@ eval_frozen_cache() {
     usage_eval >&2
     exit 2
   fi
-  "${PYTHON}" tools/eval/evaluate_frozen_cache_metrics.py "$@"
+  "${ENV_PYTHON}" tools/eval/evaluate_frozen_cache_metrics.py "$@"
 }
 
 debug_temporal() {
-  "${PYTHON}" tools/diagnostics/compare_temporal_trajectories.py "$@"
+  "${ENV_PYTHON}" tools/diagnostics/compare_temporal_trajectories.py "$@"
 }
 
 debug_reconstruction() {
@@ -354,7 +354,7 @@ data_prepare_spatialvid_hq() {
 }
 
 profile_distill_step() {
-  "${PYTHON}" tools/profile/distill_step.py "$@"
+  "${ENV_PYTHON}" tools/profile/distill_step.py "$@"
 }
 
 load_volc_env_local() {
@@ -368,7 +368,7 @@ load_volc_env_local() {
 }
 
 volc_auth() {
-  "${PYTHON}" tools/volc/import_auth.py "$@"
+  "${ENV_PYTHON}" tools/volc/import_auth.py "$@"
 }
 
 volc_submit() {
@@ -377,23 +377,23 @@ volc_submit() {
     exit 2
   fi
   load_volc_env_local
-  "${PYTHON}" tools/volc/submit_job.py "$@"
+  "${ENV_PYTHON}" tools/volc/submit_job.py "$@"
 }
 
 infer_neoverse() {
-  "${PYTHON}" tools/inference/neoverse_inference.py "$@"
+  "${ENV_PYTHON}" tools/inference/neoverse_inference.py "$@"
 }
 
 app_neoverse() {
-  "${PYTHON}" tools/apps/neoverse_app.py "$@"
+  "${ENV_PYTHON}" tools/apps/neoverse_app.py "$@"
 }
 
 app_degradation() {
-  "${PYTHON}" tools/apps/degradation_gradio.py "$@"
+  "${ENV_PYTHON}" tools/apps/degradation_gradio.py "$@"
 }
 
 app_wan_4step() {
-  "${PYTHON}" tools/apps/wan_4step_gradio.py "$@"
+  "${ENV_PYTHON}" tools/apps/wan_4step_gradio.py "$@"
 }
 
 dispatch_train() {
