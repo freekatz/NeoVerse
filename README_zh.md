@@ -1,21 +1,23 @@
-# NeoVerse 蒸馏训练
+# NeoVerse 精简仓库说明（训练 + 推理 + 可视化评估）
+
+本仓库已裁剪为最小功能子集：**数据样例、模型占位、蒸馏训练（cache / online）、Legacy 全量微调入口、推理 CLI/Gradio、checkpoint 可视化对比评估**。`diffsynth/` 未改动。
 
 统一入口：
 
 ```bash
-cd /root/vepfs/diffsynth-dev/papers/neoverse/code
+cd /path/to/NeoVerse
 ./cli help
 ```
 
-## 推荐流程
+## 蒸馏训练（主路径：`train cache`）
 
-已有 cache，直接训练：
+已有 frozen cache 时直接训练：
 
 ```bash
 ./cli train cache
 ```
 
-没有 cache，先离线构建：
+没有 cache 时先离线构建再训练：
 
 ```bash
 ./cli cache build-camera
@@ -23,120 +25,68 @@ cd /root/vepfs/diffsynth-dev/papers/neoverse/code
 ./cli train cache
 ```
 
-评估 checkpoint：
+在线训练（从视频在线抽 clip，用于调试或 sanity check）：
+
+```bash
+./cli train online
+./cli train online-noaug
+```
+
+### 训练逻辑概要
+
+- `train cache`：只读 `frozen_cache/*.pt`，不在线抽 clip、不在线跑完整 teacher 链路；训练 student adapter。
+- 数据链路：`原始视频 → 连续 81 帧 clip → camera cache →（多条 temporal trajectory）→ frozen cache → adapter 训练`
+- 约束：target 可按 forward/pause/backward/FZR 重排；source 须来自原始连续 81 帧 clip；camera normalization 在 build frozen cache 阶段完成。
+
+### 评估 checkpoint（可视化）
 
 ```bash
 ./cli eval last configs/distill/control_latent.yaml outputs/NeoVerseControlLatentDistill/YYYY-MM-DD/HH-MM-SS/adapter_last.pt
 ```
 
-## 训练逻辑
+## Legacy 训练（公开 README 路径）
 
-当前主线是 `train cache`：
-
-- 训练只读 `frozen_cache/*.pt`
-- 不在线抽视频 clip
-- 不在线跑 reconstructor/VGGT
-- 不在线算 teacher condition
-- 只训练 student adapter
-
-正确数据链路：
-
-```text
-原始视频 -> 连续 81 帧 clip -> camera cache
-81 帧 clip -> 多条 temporal trajectory -> frozen cache
-frozen cache -> adapter 训练
-```
-
-关键约束：
-
-- target 可以按 forward/pause/backward/FZR 重排。
-- source 必须从原始连续 81 帧 clip 里取，不能从重排后的 target 里取。
-- camera normalization 在 build frozen cache 时完成；`train cache` 不会重新归一化旧 cache。
-
-## 常用命令
+在自有数据上微调 control branch（配置见 `training/configs/train.yaml`）：
 
 ```bash
-# 主路径
-./cli train cache                 # 主训练，从 frozen cache 读
-
-./cli cache build-camera          # 建 camera cache
-./cli cache build-frozen          # 建 frozen cache
-./cli cache inspect               # 看 cache 数量、大小、train/eval 切分
-
-./cli eval last CONFIG CHECKPOINT # 评估 checkpoint
-
-# 开发/诊断
-./cli train online                # 在线时序增强训练，调试用
-./cli train online-noaug          # 在线无时序增强，sanity check
-./cli dev profile distill-step    # 单 step profile
-./cli dev debug temporal          # 时序轨迹诊断
-./cli dev debug reconstruction    # 重建诊断
-./cli dev data prepare-spatialvid-hq
-
-# Legacy
 ./cli legacy train-base training/configs/train.yaml
 ```
 
-## 火山任务
+## 推理与演示
 
-先导入密钥到本机 MLP CLI 配置，密钥不会写入仓库：
+详见根目录 [README.md](README.md)：
 
-```bash
-./cli volc auth import ../AccessKey.txt
-```
+- `./cli infer neoverse ...`
+- `./cli app neoverse`
 
-非密钥资源参数放这里：
-
-```text
-deploy/volc/env.local
-```
-
-火山上建 cache：
+## 数据准备
 
 ```bash
-./cli volc submit build-camera --replicas 1 --name neoverse-build-camera --submit
-./cli volc submit build-frozen --replicas 1 --name neoverse-build-frozen --submit
+./cli dev data prepare-spatialvid-hq
 ```
-
-火山上训练：
-
-```bash
-./cli volc submit train-cache --replicas 1 --name neoverse-train-cache-1w --submit
-```
-
-只生成任务 YAML，不提交：
-
-```bash
-DRY_RUN=1 ./cli volc submit train-cache --replicas 1 --name neoverse-train-cache-1w
-```
-
-说明：
-
-- `--replicas 1`：1 个 worker 实例，也就是 1 台 8 卡机器。
-- `--name ...`：火山平台任务名。
-- `--submit`：真正提交；不加只生成 YAML。
-- `build-camera`：离线建 camera cache。
-- `build-frozen`：读取 camera cache，离线建训练用 frozen cache。
-- `train-cache`：读取 frozen cache 训练 adapter，不会自动补建 cache。
 
 ## 关键目录
 
 ```text
-configs/distill/control_latent.yaml                      主配置
-training/control_latent/                                 蒸馏训练代码
-tools/cache/                                             cache 构建与检查
-tools/volc/                                              火山提交工具
-scripts/launch/                                          launcher
+configs/distill/control_latent.yaml       蒸馏主配置
+training/control_latent/                  蒸馏训练代码
+training/configs/train.yaml               Legacy 训练配置
+tools/cache/                              cache 构建与检查
+tools/inference/                          推理脚本
+tools/apps/neoverse_app.py                Gradio 演示
+tools/eval/render_student_comparison.py   可视化评估（eval last）
+scripts/launch/                           训练与 cache 启动脚本
+scripts/data/prepare_spatialvid_hq.sh     数据准备
 
-outputs/NeoVerseControlLatentDistill/camera_cache        camera cache，别误删
-outputs/NeoVerseControlLatentDistill/frozen_cache        frozen cache，别误删
-outputs/NeoVerseControlLatentDistill/YYYY-MM-DD/HH-MM-SS 训练输出/checkpoint
+outputs/NeoVerseControlLatentDistill/camera_cache
+outputs/NeoVerseControlLatentDistill/frozen_cache
+outputs/NeoVerseControlLatentDistill/YYYY-MM-DD/HH-MM-SS   # 训练输出 / checkpoint
 ```
 
-## 常用变量
+## 常用环境变量
 
 ```bash
-DATA_ROOT=data/SpatialVID_full
+DATA_ROOT=data/SpatialVID
 FROZEN_CACHE_DIR=outputs/NeoVerseControlLatentDistill/frozen_cache
 CAMERA_CACHE_DIR=outputs/NeoVerseControlLatentDistill/camera_cache
 MAX_STEPS=200000
@@ -144,11 +94,11 @@ FIXED_CLIPS_PER_SCENE=16
 TRAJECTORIES_PER_CLIP=8
 FROZEN_CACHE_EVAL_RATIO=0.05
 EVAL_FREQ=500
-SWANLAB_MODE=cloud        # 需要 SWANLAB_API_KEY；本地离线可改 offline
+SWANLAB_MODE=cloud        # 需要 SWANLAB_API_KEY；本地可改 offline
 SWANLAB_PROJECT=NeoVerseControlLatentDistill
 ```
 
-例子：
+示例：
 
 ```bash
 MAX_STEPS=1000 ./cli train cache
