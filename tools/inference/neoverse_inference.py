@@ -149,9 +149,9 @@ def parse_args():
                         help="Negative text prompt")
 
     # Model parameters
-    parser.add_argument("--model_path", default="models",
-                        help="Model directory path (default: models)")
-    parser.add_argument("--reconstructor_path", default="models/NeoVerse/reconstructor.ckpt",
+    parser.add_argument("--model_path", default="checkpoints",
+                        help="Model directory path (default: checkpoints)")
+    parser.add_argument("--reconstructor_path", default="checkpoints/NeoVerse/reconstructor.ckpt",
                         help="Path to reconstructor checkpoint")
     parser.add_argument("--disable_lora", action="store_true",
                         help="Skip distilled LoRA loading")
@@ -189,10 +189,15 @@ def main():
     num_inference_steps = 4 if use_lora else 50
     cfg_scale = 1.0 if use_lora else 5.0
 
-    lora_path = os.path.join(
-        args.model_path,
-        "NeoVerse/loras/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors"
-    ) if use_lora else None
+    # LoRA weights live under checkpoints/NeoVerse/... when using default layout
+    lora_path = (
+        os.path.join(
+            args.model_path,
+            "NeoVerse/loras/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors",
+        )
+        if use_lora
+        else None
+    )
 
     # --- Validate-only mode ---
     if args.validate_only:

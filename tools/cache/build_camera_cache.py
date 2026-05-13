@@ -12,28 +12,8 @@ if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
 from diffsynth.models import ModelManager
-from training.data.spatialvid import SpatialVID
-
-
-def normalize_filter_values(value):
-    if value in (None, "", "null", "None"):
-        return None
-    if isinstance(value, (list, tuple)):
-        items = []
-        for item in value:
-            normalized = normalize_filter_values(item)
-            if normalized is None:
-                continue
-            if isinstance(normalized, list):
-                items.extend(normalized)
-            else:
-                items.append(normalized)
-        return items or None
-    text = str(value).strip()
-    if text.startswith("[") and text.endswith("]"):
-        text = text[1:-1]
-    items = [item.strip().strip("'\"") for item in text.split(",")]
-    return [item for item in items if item] or None
+from utils.config import normalize_filter_values
+from utils.data.spatialvid import SpatialVID
 
 
 def torch_dtype_from_name(name):

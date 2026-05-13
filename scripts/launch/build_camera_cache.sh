@@ -142,10 +142,10 @@ log "extra_args=$*"
 
 if [[ "${DRY_RUN}" == "1" ]]; then
   log "+ bash -n $0"
-  log "+ ${ENV_PYTHON} -m py_compile tools/cache/build_camera_cache.py training/data/spatialvid.py"
+  log "+ ${ENV_PYTHON} -m py_compile tools/cache/build_camera_cache.py utils/data/spatialvid.py"
 else
   bash -n "$0"
-  "${ENV_PYTHON}" -m py_compile tools/cache/build_camera_cache.py training/data/spatialvid.py
+  "${ENV_PYTHON}" -m py_compile tools/cache/build_camera_cache.py utils/data/spatialvid.py
 fi
 
 pids=()

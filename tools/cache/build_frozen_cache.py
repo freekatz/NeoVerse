@@ -12,9 +12,9 @@ CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
-from training.config_utils import build_spatialvid_dataset
-from training.control_latent.cache import frozen_cache_signature
-from training.control_latent.module import ControlLatentDistillModule
+from models.control_latent.cache import frozen_cache_signature
+from models.control_latent.module import ControlLatentDistillModule
+from utils.config import build_spatialvid_dataset, normalize_filter_values
 
 
 def parse_bool(value):
@@ -23,16 +23,6 @@ def parse_bool(value):
     if value is None:
         return False
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def normalize_filter_values(value):
-    if value in (None, "", "null", "None"):
-        return None
-    text = str(value).strip()
-    if text.startswith("[") and text.endswith("]"):
-        text = text[1:-1]
-    items = [item.strip().strip("'\"") for item in text.split(",")]
-    return [item for item in items if item] or None
 
 
 def torch_dtype_from_name(name):
@@ -87,8 +77,8 @@ def build_cfg(args):
         "video_ids": normalize_filter_values(args.video_ids if args.video_ids is not None else cfg.get("video_ids", None)),
         "video_paths": normalize_filter_values(args.video_paths if args.video_paths is not None else cfg.get("video_paths", None)),
         "torch_dtype": args.torch_dtype or cfg.get("torch_dtype", "bfloat16"),
-        "model_path": args.model_path or cfg.get("model_path", "./models"),
-        "reconstructor_path": args.reconstructor_path or cfg.get("reconstructor_path", "./models/NeoVerse/reconstructor.ckpt"),
+        "model_path": args.model_path or cfg.get("model_path", "./checkpoints"),
+        "reconstructor_path": args.reconstructor_path or cfg.get("reconstructor_path", "./checkpoints/NeoVerse/reconstructor.ckpt"),
         "continuous_target_frames": True,
         "temporal_augmentation": True,
         "temporal_order": args.temporal_order or cfg.get("temporal_order", "trajectory"),

@@ -4,8 +4,8 @@ data_root: data/SpatialVID
 video_ids: null
 video_paths: null
 torch_dtype: bfloat16
-model_path: ./models
-reconstructor_path: ./models/NeoVerse/reconstructor.ckpt
+model_path: ./checkpoints
+reconstructor_path: ./checkpoints/NeoVerse/reconstructor.ckpt
 lora_path: null
 lora_alpha: 1.0
 enable_vram_management: true

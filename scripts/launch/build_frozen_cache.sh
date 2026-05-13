@@ -182,21 +182,20 @@ log "extra_args=$*"
 
 if [[ "${DRY_RUN}" == "1" ]]; then
   log "+ bash -n $0"
-  log "+ ${ENV_PYTHON} -m py_compile tools/cache/build_frozen_cache.py tools/train/distill_control_latent.py training/config_utils.py training/control_latent/cache.py training/control_latent/camera.py training/control_latent/loss.py training/control_latent/main.py training/control_latent/module.py training/control_latent/reconstructor_tokens.py training/data/spatialvid.py training/data/temporal_trajectory.py"
+  log "+ ${ENV_PYTHON} -m py_compile tools/cache/build_frozen_cache.py tools/train/distill_control_latent.py utils/config.py models/control_latent/cache.py models/control_latent/camera.py models/control_latent/loss.py models/control_latent/module.py models/control_latent/reconstructor_tokens.py utils/data/spatialvid.py utils/data/temporal_trajectory.py"
 else
   bash -n "$0"
   "${ENV_PYTHON}" -m py_compile \
     tools/cache/build_frozen_cache.py \
     tools/train/distill_control_latent.py \
-    training/config_utils.py \
-    training/control_latent/cache.py \
-    training/control_latent/camera.py \
-    training/control_latent/loss.py \
-    training/control_latent/main.py \
-    training/control_latent/module.py \
-    training/control_latent/reconstructor_tokens.py \
-    training/data/spatialvid.py \
-    training/data/temporal_trajectory.py
+    utils/config.py \
+    models/control_latent/cache.py \
+    models/control_latent/camera.py \
+    models/control_latent/loss.py \
+    models/control_latent/module.py \
+    models/control_latent/reconstructor_tokens.py \
+    utils/data/spatialvid.py \
+    utils/data/temporal_trajectory.py
 fi
 
 pids=()

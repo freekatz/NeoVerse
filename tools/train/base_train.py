@@ -10,8 +10,9 @@ if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline, ModelConfig
-from training.engine import DiffusionTrainingModule, launch_training_task
-from training.data.spatialvid import SpatialVID
+from tools.train.launch import launch_training_task
+from utils.data.spatialvid import SpatialVID
+from utils.training_module import DiffusionTrainingModule
 import torch.multiprocessing
 
 torch.multiprocessing.set_sharing_strategy("file_system")
@@ -20,8 +21,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 class WanTrainingModule(DiffusionTrainingModule):
     def __init__(
         self,
-        model_path="models",
-        reconstructor_path="models/NeoVerse/reconstructor.ckpt",
+        model_path="checkpoints",
+        reconstructor_path="checkpoints/NeoVerse/reconstructor.ckpt",
         pipeline_kwargs={},
         trainable_models=None,
         lora_base_model=None, lora_target_modules="q,k,v,o,ffn.0,ffn.2", lora_exclude_modules=None, lora_rank=32,
@@ -120,7 +121,7 @@ if __name__ == "__main__":
     args = config
 
     print(f"Preparing dataset {args.train_dataset}")
-    dataset = eval(args.train_dataset)
+    dataset = eval(args.train_dataset, {"SpatialVID": SpatialVID})
     model = WanTrainingModule(
         model_path=args.model_path,
         reconstructor_path=args.reconstructor_path,

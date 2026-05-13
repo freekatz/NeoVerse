@@ -204,4 +204,4 @@ Additionally, operations at each keyframe accumulate onto the running pose from 
 
 For more information, see:
 - [trajectory_format.md](trajectory_format.md) — Trajectory file format specification
-- [examples/trajectories/](../examples/trajectories/) — Example trajectory files
+- [data/examples/trajectories/](../data/examples/trajectories/) — Example trajectory files

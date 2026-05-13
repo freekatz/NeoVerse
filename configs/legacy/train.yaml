@@ -7,8 +7,8 @@ seed: 0
 
 train_dataset: SpatialVID(split=None, ROOT="data/SpatialVID", max_interval=5, height=${height}, width=${width}, num_views=${num_views}, min_num_context_views=${min_num_context_views}, max_num_context_views=${max_num_context_views}, seed=${seed})
 
-model_path: ./models
-reconstructor_path: ./models/NeoVerse/reconstructor.ckpt
+model_path: ./checkpoints
+reconstructor_path: ./checkpoints/NeoVerse/reconstructor.ckpt
 pipeline_kwargs:
   novel_view_sampling_trans: [0.01, 0.1]
   novel_view_sampling_max_rot: 0.0

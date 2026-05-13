@@ -390,20 +390,22 @@ log "config_file=${CONFIG_FILE}"
 run_cmd bash -n "$0"
 run_cmd "${ENV_PYTHON}" -m py_compile \
   tools/train/distill_control_latent.py \
-  training/config_utils.py \
-  training/engine.py \
-  training/control_latent/cache.py \
-  training/control_latent/camera.py \
-  training/control_latent/loss.py \
-  training/control_latent/main.py \
-  training/control_latent/module.py \
-  training/control_latent/reconstructor_tokens.py \
+  tools/train/launch.py \
+  utils/config.py \
+  utils/training.py \
+  utils/training_module.py \
+  utils/swanlab.py \
+  models/control_latent/cache.py \
+  models/control_latent/camera.py \
+  models/control_latent/loss.py \
+  models/control_latent/module.py \
+  models/control_latent/reconstructor_tokens.py \
   diffsynth/models/student_adapters.py \
   diffsynth/pipelines/wan_video_neoverse.py \
   diffsynth/models/wan_video_neoverse_controller.py \
-  training/data/base_dataset.py \
-  training/data/spatialvid.py \
-  training/data/temporal_trajectory.py \
+  utils/data/base_dataset.py \
+  utils/data/spatialvid.py \
+  utils/data/temporal_trajectory.py \
   tools/cache/build_camera_cache.py \
   tools/cache/build_frozen_cache.py
 

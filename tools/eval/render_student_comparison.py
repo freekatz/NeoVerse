@@ -17,16 +17,16 @@ if CODE_DIR not in sys.path:
 from diffsynth.data import save_video
 from diffsynth.utils.auxiliary import homo_matrix_inverse
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline, model_fn_wan_video
-from training.control_latent.reconstructor_tokens import extract_vggt_tokens
-from training.config_utils import build_spatialvid_dataset
-from training.control_latent.camera import (
+from models.control_latent.camera import (
+    continuous_view_order_indices,
     extract_source_times,
     extract_target_times,
     gather_source_cameras_from_target,
-    continuous_view_order_indices,
     target_trajectory_indices,
 )
-from training.control_latent.main import build_adapter, prepare_control_state
+from models.control_latent.module import build_adapter, prepare_control_state
+from models.control_latent.reconstructor_tokens import extract_vggt_tokens
+from utils.config import build_spatialvid_dataset
 
 
 def zero_drop_probs(pipeline_kwargs):
@@ -813,7 +813,7 @@ def main():
     official_lora_path = os.path.join(
         str(cfg.model_path),
         "NeoVerse/loras/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors",
-    )
+    )  # default cfg.model_path is ./checkpoints
     lora_path = None
     if not args.disable_lora:
         lora_path = args.lora_path or cfg.get("lora_path", None)
