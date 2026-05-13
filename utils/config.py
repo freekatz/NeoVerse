@@ -1,6 +1,6 @@
 from omegaconf import OmegaConf
 
-from utils.data.spatialvid import SpatialVID
+from utils.datasets.spatialvid import SpatialVID
 
 NULL_CONFIG_STRINGS = {"", "none", "None", "null", "Null"}
 

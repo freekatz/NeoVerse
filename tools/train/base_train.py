@@ -11,7 +11,7 @@ if CODE_DIR not in sys.path:
 
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline, ModelConfig
 from tools.train.launch import launch_training_task
-from utils.data.spatialvid import SpatialVID
+from utils.datasets.spatialvid import SpatialVID
 from utils.training_module import DiffusionTrainingModule
 import torch.multiprocessing
 

@@ -15,17 +15,19 @@ CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
-from models.control_latent.cache import (
+from utils.datasets.frozen_cache import (
     FrozenForwardCacheDataset,
     batch_preloaded_frozen_cache,
-    cache_float_dtype,
-    cache_target_is_cpu,
-    cache_to_target_device,
     collate_frozen_cache_entries,
-    looks_like_frozen_cache,
     make_dataloader_kwargs,
     optional_int,
     validation_enabled,
+)
+from models.control_latent.cache import (
+    cache_float_dtype,
+    cache_target_is_cpu,
+    cache_to_target_device,
+    looks_like_frozen_cache,
 )
 from models.control_latent.camera import compact_distill_log_metrics
 from models.control_latent.loss import save_heatmaps

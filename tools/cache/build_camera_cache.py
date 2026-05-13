@@ -13,7 +13,7 @@ if CODE_DIR not in sys.path:
 
 from diffsynth.models import ModelManager
 from utils.config import normalize_filter_values
-from utils.data.spatialvid import SpatialVID
+from utils.datasets.spatialvid import SpatialVID
 
 
 def torch_dtype_from_name(name):
