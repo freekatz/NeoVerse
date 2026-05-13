@@ -30,6 +30,7 @@ import random
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if CODE_DIR not in sys.path:
@@ -88,6 +89,7 @@ from training.swanlab_utils import init_swanlab_logger
 _V2_CACHE_FORMAT_VERSION = 4
 _V2_CACHE_NAMESPACE = "joint_v2"
 _V2_CACHE_FILENAME_PREFIX = "v2_"
+_DEFAULT_CONTROL_LAYERS = (0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28)
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +157,23 @@ def _resolve_target_grid(value, fallback):
     return grid
 
 
+class _SmokePipe:
+    """Tiny pipe stub for smoke-testing QueryModule without loading NeoVerse."""
+
+    def __init__(self, cfg):
+        self.device = "cpu"
+        self.torch_dtype = getattr(torch, str(cfg.get("torch_dtype", "bfloat16")))
+        self.control_branch = SimpleNamespace(
+            control_layers=tuple(cfg.get("control_layers", _DEFAULT_CONTROL_LAYERS))
+        )
+
+    def eval(self):
+        return self
+
+    def load_models_to_device(self, *_args, **_kwargs):
+        return None
+
+
 def build_query_module_from_cfg(pipe, cfg):
     """Build a :class:`QueryModule` (CrossAttentionRoPEAdapter + WanAdapter) from cfg."""
     adapter_cfg = OmegaConf.to_container(cfg.adapter, resolve=True)
@@ -207,6 +226,12 @@ class ControlLatentJointModule(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        self.smoke_test = bool(cfg.get("smoke_test", False))
+        if self.smoke_test:
+            object.__setattr__(self, "_base", None)
+            object.__setattr__(self, "pipe", _SmokePipe(cfg))
+            self.query_module = build_query_module_from_cfg(self.pipe, cfg)
+            return
         # Use the distill module purely to build pipe + reuse its preprocessor.
         # We immediately replace its adapter with our own QueryModule.
         base = ControlLatentDistillModule(cfg)
@@ -238,9 +263,13 @@ class ControlLatentJointModule(torch.nn.Module):
     # ----- preprocessing & cache -------------------------------------------------
 
     def forward_preprocess(self, data):
+        if self.smoke_test:
+            raise RuntimeError("smoke_test mode expects prebuilt v2 cache batches, not raw dataset samples.")
         return self._base.forward_preprocess(data)
 
     def build_frozen_forward_cache(self, data):
+        if self.smoke_test:
+            raise RuntimeError("smoke_test mode does not support building frozen caches from raw data.")
         inputs = self.forward_preprocess(data)
         with torch.no_grad():
             output_grid = condition_output_grid(self.pipe.control_branch, inputs["target_rgb"])
@@ -348,6 +377,8 @@ class ControlLatentJointModule(torch.nn.Module):
         return normalize_camera_condition_cache(cache, self.cfg)
 
     def get_forward_cache(self, data, device=None):
+        if self.smoke_test:
+            raise RuntimeError("smoke_test mode expects prebuilt v2 cache batches, not runtime cache generation.")
         target_device = self.pipe.device if device is None else device
         frozen_cache_dir = self.cfg.get("frozen_cache_dir", None)
         if frozen_cache_dir:
@@ -412,6 +443,46 @@ class ControlLatentJointModule(torch.nn.Module):
         else:
             data = _reject_legacy_cache_or_pass(data)
             cache = self.get_forward_cache(data)
+
+        if self.smoke_test:
+            hits, hits_adapted = self.query_module(
+                cache["tokens"],
+                cache["output_grid"],
+                target_times=cache.get("target_times"),
+                target_poses=cache.get("target_poses"),
+                target_intrs=cache.get("target_intrs"),
+                target_plucker=cache.get("target_plucker"),
+                source_times=cache.get("source_times"),
+                source_poses=cache.get("source_poses"),
+                source_intrs=cache.get("source_intrs"),
+                wan_adapter_target_grid=tuple(int(s) for s in cache["rendered_rgb_latents"].shape[-3:]),
+            )
+            hits_target = cache.get("smoke_hits_target")
+            loss_hits = F.mse_loss(hits.float(), hits_target.float()) if hits_target is not None else hits.float().pow(2).mean()
+            loss_aux = hits.new_zeros(())
+            rendered_target = cache.get("rendered_rgb_latents")
+            if hits_adapted is not None and rendered_target is not None:
+                loss_aux = F.l1_loss(hits_adapted.float(), rendered_target.float())
+            aux_weight = float(self.cfg.get("loss", {}).get("aux_weight", 0.1))
+            loss = loss_hits + aux_weight * loss_aux
+            metrics = {
+                "loss": loss.detach(),
+                "loss_diffusion": hits.new_zeros(()),
+                "loss_aux": loss_aux.detach(),
+                "loss_smoke_hits": loss_hits.detach(),
+                "hits_norm": hits.detach().float().norm(dim=-1).mean(),
+            }
+            if hits_adapted is not None:
+                metrics["hits_adapted_norm"] = hits_adapted.detach().float().flatten(1).norm(dim=-1).mean()
+            metrics["seq_len"] = torch.tensor(cache["sequence_length"], device=loss.device, dtype=torch.float32)
+            self.last_shapes = {
+                "hits": tuple(hits.shape),
+                "hits_adapted": None if hits_adapted is None else tuple(hits_adapted.shape),
+                "tokens": tuple(cache["tokens"].shape),
+                "output_grid": cache["output_grid"],
+                "mode": "smoke_test",
+            }
+            return loss, metrics
 
         # Derive runtime VAE-latent grid from the supervision targets so the
         # WanAdapter's learnable embed gets resampled to the right shape.
@@ -508,6 +579,51 @@ class ControlLatentJointModule(torch.nn.Module):
             "target_rgb_latents": None if x0 is None else tuple(x0.shape),
         }
         return loss, metrics
+
+
+def build_smoke_cache(cfg):
+    batch_size = int(cfg.get("smoke_batch_size", 1))
+    num_views = int(cfg.get("smoke_num_source_views", 3))
+    token_groups = int(cfg.token.token_groups)
+    token_dim = int(cfg.token.token_dim)
+    token_h, token_w = tuple(int(v) for v in cfg.get("smoke_token_hw", (4, 6)))
+    output_grid = tuple(int(v) for v in cfg.get("smoke_output_grid", (2, 4, 4)))
+    target_grid = tuple(int(v) for v in cfg.get("smoke_wan_target_grid", (2, 4, 4)))
+    query_len = int(np.prod(output_grid))
+    hits_dim = int(cfg.get("hits_dim", cfg.get("control_dim", 5120)))
+    z_channels = int(cfg.get("wan_adapter", {}).get("c_z", 16) if cfg.get("wan_adapter", None) is not None else 16)
+    target_frames = int(output_grid[0])
+
+    def randn(*shape):
+        return torch.randn(*shape, dtype=torch.float32)
+
+    def eye_batch(frames, size):
+        return torch.eye(size, dtype=torch.float32).reshape(1, 1, size, size).expand(batch_size, frames, -1, -1).clone()
+
+    return {
+        "cache_format_version": _V2_CACHE_FORMAT_VERSION,
+        "cache_namespace": _V2_CACHE_NAMESPACE,
+        "cache_signature": "smoke",
+        "dataset_index": -1,
+        "signature_views": [{"mode": "smoke_test"}],
+        "tokens": randn(batch_size, num_views, token_groups, token_h, token_w, token_dim),
+        "token_dim": token_dim,
+        "num_token_groups": token_groups,
+        "output_grid": output_grid,
+        "sequence_length": query_len,
+        "target_times": torch.linspace(0, 1, target_frames, dtype=torch.float32)[None].expand(batch_size, -1).clone(),
+        "source_times": torch.linspace(0, 1, num_views, dtype=torch.float32)[None].expand(batch_size, -1).clone(),
+        "target_poses": eye_batch(target_frames, 4),
+        "target_intrs": eye_batch(target_frames, 3),
+        "target_plucker": randn(batch_size, target_frames, 6, output_grid[1], output_grid[2]),
+        "source_poses": eye_batch(num_views, 4),
+        "source_intrs": eye_batch(num_views, 3),
+        "rendered_rgb_latents": randn(batch_size, z_channels, *target_grid),
+        "target_rgb_latents": randn(batch_size, z_channels, *target_grid),
+        "text_emb": randn(batch_size, 4, 16),
+        "smoke_hits_target": randn(batch_size, query_len, hits_dim),
+        "reused_reconstructor_tokens": False,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -622,8 +738,23 @@ def main():
         OmegaConf.save(cfg, os.path.join(cfg.output_path, "config.yaml"))
 
     train_from_frozen_cache = bool(cfg.get("train_from_frozen_cache", False))
+    smoke_test = bool(cfg.get("smoke_test", False))
     eval_dataloader = None
-    if train_from_frozen_cache:
+    if smoke_test:
+        dataset = [build_smoke_cache(cfg)]
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=lambda entries: entries[0],
+        )
+        if accelerator.is_main_process:
+            print(
+                "Running in smoke_test mode: using a synthetic cache batch and skipping "
+                "NeoVerse/Wan pretrained weight loading."
+            )
+    elif train_from_frozen_cache:
         if not cfg.get("frozen_cache_dir", None):
             raise ValueError("train_from_frozen_cache=true requires frozen_cache_dir.")
         frozen_cache_split = str(cfg.get("frozen_cache_split", "train") or "train").strip().lower()
@@ -668,19 +799,20 @@ def main():
     else:
         dataset = build_spatialvid_dataset(cfg)
 
-    collate_fn = collate_frozen_cache_entries if train_from_frozen_cache else None
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        **make_dataloader_kwargs(
-            cfg,
-            batch_size=int(cfg.batch_size),
-            shuffle=True,
-            num_workers=int(cfg.num_workers),
-            collate_fn=collate_fn,
-        ),
-    )
+    if not smoke_test:
+        collate_fn = collate_frozen_cache_entries if train_from_frozen_cache else None
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            **make_dataloader_kwargs(
+                cfg,
+                batch_size=int(cfg.batch_size),
+                shuffle=True,
+                num_workers=int(cfg.num_workers),
+                collate_fn=collate_fn,
+            ),
+        )
 
-    if train_from_frozen_cache and eval_dataset is not None:
+    if train_from_frozen_cache and eval_dataset is not None and not smoke_test:
         eval_batch_size = optional_int(cfg.get("eval_batch_size", None), int(cfg.batch_size))
         eval_num_workers = optional_int(cfg.get("eval_num_workers", None), int(cfg.num_workers))
         eval_dataloader = torch.utils.data.DataLoader(
@@ -695,8 +827,9 @@ def main():
         )
 
     model = ControlLatentJointModule(cfg)
+    trainable_params = [p for p in model.query_module.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
-        [p for p in model.query_module.parameters() if p.requires_grad],
+        trainable_params,
         lr=float(cfg.learning_rate),
         weight_decay=float(cfg.weight_decay),
     )
@@ -787,6 +920,13 @@ def main():
     save_freq = int(cfg.get("save_freq", 500))
     clip_grad = float(cfg.get("clip_grad", 1.0))
     max_steps = int(cfg.get("max_steps", 20000))
+    if smoke_test:
+        max_steps = min(max_steps, int(cfg.get("smoke_max_steps", 1)))
+        if accelerator.is_main_process:
+            print(
+                f"Smoke test step budget: max_steps={max_steps} "
+                f"(override with smoke_max_steps=... if needed)."
+            )
     t0 = time.time()
     last_log = time.time()
 
@@ -807,7 +947,7 @@ def main():
                 accelerator.backward(loss)
                 if accelerator.sync_gradients and clip_grad > 0:
                     accelerator.clip_grad_norm_(
-                        [p for p in model.query_module.parameters() if p.requires_grad],
+                        optimizer.param_groups[0]["params"],
                         clip_grad,
                     )
                 optimizer.step()

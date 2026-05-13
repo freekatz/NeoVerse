@@ -405,12 +405,13 @@ def launch_training_task(
 def launch_data_process_task(model: DiffusionTrainingModule, dataset, output_path="./models"):
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=False, collate_fn=lambda x: x[0])
     accelerator = Accelerator()
+    model_input_keys = tuple(model.model_input_keys)
     model, dataloader = accelerator.prepare(model, dataloader)
     os.makedirs(os.path.join(output_path, "data_cache"), exist_ok=True)
     for data_id, data in enumerate(tqdm(dataloader)):
         with torch.no_grad():
             inputs = model.forward_preprocess(data)
-            inputs = {key: inputs[key] for key in model.model_input_keys if key in inputs}
+            inputs = {key: inputs[key] for key in model_input_keys if key in inputs}
             torch.save(inputs, os.path.join(output_path, "data_cache", f"{data_id}.pth"))
 
 
