@@ -33,6 +33,7 @@ from models.control_latent.camera import compact_distill_log_metrics
 from models.control_latent.loss import save_heatmaps
 from models.control_latent.module import ControlLatentDistillModule
 from utils.config import build_spatialvid_dataset
+from utils.config import resolve_repo_path
 from utils.swanlab import init_swanlab_logger
 
 
@@ -158,6 +159,8 @@ def main():
         OmegaConf.save(cfg, os.path.join(cfg.output_path, "config.yaml"))
 
     train_from_frozen_cache = bool(cfg.get("train_from_frozen_cache", False))
+    if cfg.get("frozen_cache_dir", None):
+        cfg.frozen_cache_dir = resolve_repo_path(cfg.frozen_cache_dir)
     eval_dataloader = None
     eval_dataset = None
     if train_from_frozen_cache:

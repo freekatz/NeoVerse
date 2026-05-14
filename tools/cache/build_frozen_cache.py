@@ -15,6 +15,7 @@ if CODE_DIR not in sys.path:
 from models.control_latent.cache import frozen_cache_signature
 from models.control_latent.module import ControlLatentDistillModule
 from utils.config import build_spatialvid_dataset
+from utils.config import resolve_repo_path
 
 
 def torch_dtype_from_name(name):
@@ -39,8 +40,8 @@ def build_cfg(args):
     cfg = OmegaConf.load(args.config)
     if args.overrides:
         cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(args.overrides))
-    cfg.frozen_cache_dir = args.output_dir
-    cfg.output_path = args.run_output_dir
+    cfg.frozen_cache_dir = resolve_repo_path(args.output_dir)
+    cfg.output_path = resolve_repo_path(args.run_output_dir)
     cfg.num_workers = 0
     cfg.pin_memory = False
     cfg.persistent_workers = False

@@ -1,8 +1,11 @@
+import os
+
 from omegaconf import OmegaConf
 
 from utils.datasets.spatialvid import SpatialVID
 
 NULL_CONFIG_STRINGS = {"", "none", "None", "null", "Null"}
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def is_null_config_value(value):
@@ -22,6 +25,16 @@ def config_value(cfg, key, default=None):
 def none_if_null(value):
     value = resolved_config_value(value)
     return None if is_null_config_value(value) else value
+
+
+def resolve_repo_path(value):
+    value = none_if_null(value)
+    if value is None:
+        return None
+    path = os.path.expanduser(str(value))
+    if os.path.isabs(path):
+        return path
+    return os.path.join(REPO_ROOT, path)
 
 
 def config_bool(cfg, key, default=False):
@@ -78,7 +91,7 @@ def normalize_filter_values(value):
 def build_spatialvid_dataset(cfg):
     return SpatialVID(
         split=None,
-        ROOT=str(config_value(cfg, "data_root", "data/SpatialVID")),
+        ROOT=str(resolve_repo_path(config_value(cfg, "data_root", "data/SpatialVID"))),
         video_ids=normalize_filter_values(config_value(cfg, "video_ids", None)),
         video_paths=normalize_filter_values(config_value(cfg, "video_paths", None)),
         use_camera_annotations=config_bool(cfg, "use_camera_annotations", False),
@@ -95,7 +108,7 @@ def build_spatialvid_dataset(cfg):
         trajectories_per_clip=config_optional_int(cfg, "trajectories_per_clip", None),
         temporal_variant_profile_weights=none_if_null(config_value(cfg, "temporal_variant_profile_weights", None)),
         fixed_clips_per_scene=config_int(cfg, "fixed_clips_per_scene", 0),
-        camera_cache_dir=none_if_null(config_value(cfg, "camera_cache_dir", None)),
+        camera_cache_dir=resolve_repo_path(config_value(cfg, "camera_cache_dir", None)),
         camera_cache_required=config_bool(cfg, "camera_cache_required", False),
         min_interval=1,
         max_interval=1,

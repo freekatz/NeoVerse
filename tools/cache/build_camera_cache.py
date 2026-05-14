@@ -13,6 +13,7 @@ if CODE_DIR not in sys.path:
 
 from diffsynth.models import ModelManager
 from utils.config import normalize_filter_values
+from utils.config import resolve_repo_path
 from utils.datasets.spatialvid import SpatialVID
 
 
@@ -126,6 +127,7 @@ def main():
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("overrides", nargs="*", help="OmegaConf dotlist overrides (key=value).")
     args = parser.parse_args()
+    args.output_dir = resolve_repo_path(args.output_dir)
     if args.num_shards <= 0:
         raise ValueError("--num_shards must be positive.")
     if args.shard_index < 0 or args.shard_index >= args.num_shards:

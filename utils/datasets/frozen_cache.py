@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 from collections import OrderedDict
 from pathlib import Path
 
@@ -87,7 +88,10 @@ class FrozenForwardCacheDataset(torch.utils.data.Dataset):
         split_mode="hash",
         allow_empty=False,
     ):
-        self.cache_dir = str(cache_dir)
+        path = os.path.expanduser(str(cache_dir))
+        if not os.path.isabs(path):
+            path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", path))
+        self.cache_dir = path
         self.pattern = str(pattern or "*.pt")
         self.split = str(split or "all").strip().lower()
         self.eval_ratio = float(eval_ratio)
