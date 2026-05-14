@@ -1,0 +1,30 @@
+wan_series = [{'model_hash': '9269f8db9040a9d860eaca435be61814',
+  'model_name': 'wan_video_dit',
+  'model_class': 'diffsynth.models.wan_video_dit.WanModel',
+  'extra_kwargs': {'has_image_input': False,
+                   'patch_size': [1, 2, 2],
+                   'in_dim': 16,
+                   'dim': 1536,
+                   'ffn_dim': 8960,
+                   'freq_dim': 256,
+                   'text_dim': 4096,
+                   'out_dim': 16,
+                   'num_heads': 12,
+                   'num_layers': 30,
+                   'eps': 1e-06}},
+ {'model_hash': '9c8818c2cbea55eca56c7b447df170da',
+  'model_name': 'wan_video_text_encoder',
+  'model_class': 'diffsynth.models.wan_video_text_encoder.WanTextEncoder'},
+ {'model_hash': 'ccc42284ea13e1ad04693284c7a09be6',
+  'model_name': 'wan_video_vae',
+  'model_class': 'diffsynth.models.wan_video_vae.WanVideoVAE',
+  'state_dict_converter': 'diffsynth.utils.state_dict_converters.wan_video_vae.WanVideoVAEStateDictConverter'},
+  {
+
+        "model_hash": "5941c53e207d62f20f9025686193c40b",
+        "model_name": "wan_video_image_encoder",
+        "model_class": "diffsynth.models.wan_video_image_encoder.WanImageEncoder",
+        "state_dict_converter": "diffsynth.utils.state_dict_converters.wan_video_image_encoder.WanImageEncoderStateDictConverter"
+    },]
+
+MODEL_CONFIGS = wan_series

@@ -11,7 +11,7 @@ CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
-from diffsynth.models import ModelManager
+from diffsynth.models.model_loader import ModelPool
 from utils.config import normalize_filter_values
 from utils.config import resolve_repo_path
 from utils.datasets.spatialvid import SpatialVID
@@ -56,14 +56,14 @@ def build_dataset(cfg):
 
 def load_reconstructor(cfg, device):
     dtype = torch_dtype_from_name(cfg.get("torch_dtype", "bfloat16"))
-    manager = ModelManager(torch_dtype=dtype, device=device)
-    manager.load_model(
-        cfg.reconstructor_path,
-        model_names=["reconstructor"],
-        device=device,
-        torch_dtype=dtype,
-    )
-    reconstructor = manager.fetch_model("reconstructor")
+    pool = ModelPool()
+    vram_config = pool.default_vram_config()
+    vram_config["computation_dtype"] = dtype
+    vram_config["computation_device"] = device
+    vram_config["onload_dtype"] = dtype
+    vram_config["onload_device"] = device
+    pool.auto_load_model(cfg.reconstructor_path, vram_config=vram_config)
+    reconstructor = pool.fetch_model("reconstructor")
     if reconstructor is None:
         raise RuntimeError("Failed to load reconstructor.")
     return reconstructor.eval().to(device), dtype
