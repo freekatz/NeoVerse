@@ -465,6 +465,110 @@ def fill_vram_config(model, vram_config):
     return vram_config_
 
 
+class WanAutoCastLayerNorm(torch.nn.LayerNorm, AutoTorchModule):
+    def __init__(
+        self,
+        module: torch.nn.LayerNorm,
+        offload_dtype: torch.dtype = None,
+        offload_device: Union[str, torch.device] = None,
+        onload_dtype: torch.dtype = None,
+        onload_device: Union[str, torch.device] = None,
+        preparing_dtype: torch.dtype = None,
+        preparing_device: Union[str, torch.device] = None,
+        computation_dtype: torch.dtype = None,
+        computation_device: Union[str, torch.device] = None,
+        vram_limit: float = None,
+        name: str = "",
+        disk_map: DiskMap = None,
+        **kwargs
+    ):
+        with skip_model_initialization():
+            super().__init__(
+                module.normalized_shape,
+                eps=module.eps,
+                elementwise_affine=module.elementwise_affine,
+                bias=module.bias is not None,
+            )
+        self.set_dtype_and_device(
+            offload_dtype,
+            offload_device,
+            onload_dtype,
+            onload_device,
+            preparing_dtype,
+            preparing_device,
+            computation_dtype,
+            computation_device,
+            vram_limit,
+        )
+        self.weight = module.weight
+        self.bias = module.bias
+        self.state = 0
+        self.name = name
+        self.computation_device_type = parse_device_type(self.computation_device)
+
+        if offload_dtype == "disk":
+            self.disk_map = disk_map
+            self.disk_offload = True
+        else:
+            self.disk_offload = False
+
+    def load_from_disk(self, torch_dtype, device, assign=True):
+        weight = None if self.weight is None else self.disk_map[self.name + ".weight"].to(dtype=torch_dtype, device=device)
+        bias = None if self.bias is None else self.disk_map[self.name + ".bias"].to(dtype=torch_dtype, device=device)
+        if assign:
+            state_dict = {}
+            if weight is not None: state_dict["weight"] = weight
+            if bias is not None: state_dict["bias"] = bias
+            self.load_state_dict(state_dict, assign=True)
+        return weight, bias
+
+    def offload(self):
+        if self.state != 0:
+            if self.disk_offload:
+                self.to("meta")
+            else:
+                self.to(dtype=self.offload_dtype, device=self.offload_device)
+            self.state = 0
+
+    def onload(self):
+        if self.state < 1:
+            if self.disk_offload and self.onload_device != "disk" and self.offload_device == "disk":
+                self.load_from_disk(self.onload_dtype, self.onload_device)
+            elif self.onload_device != "disk":
+                self.to(dtype=self.onload_dtype, device=self.onload_device)
+            self.state = 1
+
+    def preparing(self):
+        if self.state != 2:
+            if self.disk_offload and self.preparing_device != "disk" and self.onload_device == "disk":
+                self.load_from_disk(self.preparing_dtype, self.preparing_device)
+            elif self.preparing_device != "disk":
+                self.to(dtype=self.preparing_dtype, device=self.preparing_device)
+            self.state = 2
+
+    def computation(self):
+        if self.state == 2:
+            torch_dtype, device = self.preparing_dtype, self.preparing_device
+        else:
+            torch_dtype, device = self.onload_dtype, self.onload_device
+        if torch_dtype == self.computation_dtype and device == self.computation_device:
+            weight, bias = self.weight, self.bias
+        elif self.disk_offload and device == "disk":
+            weight, bias = self.load_from_disk(self.computation_dtype, self.computation_device, assign=False)
+        else:
+            weight = None if self.weight is None else self.cast_to(self.weight, self.computation_dtype, self.computation_device)
+            bias = None if self.bias is None else self.cast_to(self.bias, self.computation_dtype, self.computation_device)
+        return weight, bias
+
+    def forward(self, x, *args, **kwargs):
+        if self.state == 1 and (self.vram_limit is None or self.check_free_vram()):
+            self.preparing()
+        weight, bias = self.computation()
+        with torch.amp.autocast(device_type=x.device.type):
+            x = torch.nn.functional.layer_norm(x.float(), self.normalized_shape, weight, bias, self.eps).type_as(x)
+        return x
+
+
 def enable_vram_management(model: torch.nn.Module, module_map: dict, vram_config: dict, vram_limit=None, disk_map=None, **kwargs):
     for source_module, target_module in module_map.items():
         # If no fine-grained VRAM configuration is provided, the entire model will be managed uniformly.
