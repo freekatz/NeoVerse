@@ -5,7 +5,7 @@ set -euo pipefail
 #
 # Usage examples:
 #   bash scripts/launch/build_camera_cache.sh
-#   CAMERA_CACHE_DIR=outputs/NeoVerseControlLatentDistill/camera_cache \
+#   CAMERA_CACHE_DIR=data/camera_cache \
 #     FIXED_CLIPS_PER_SCENE=16 bash scripts/launch/build_camera_cache.sh
 
 timestamp_utc() {
@@ -29,7 +29,7 @@ DRY_RUN="${DRY_RUN:-0}"
 CONFIG="${CONFIG:-configs/distill/control_latent.yaml}"
 PROJECT_NAME="${PROJECT_NAME:-NeoVerseControlLatentDistill}"
 RUN_TIME="${RUN_TIME:-$(timestamp_utc)}"
-OUTPUT_DIR="${CAMERA_CACHE_DIR:-${OUTPUT_DIR:-${CODE_DIR}/outputs/${PROJECT_NAME}/camera_cache}}"
+OUTPUT_DIR="${CAMERA_CACHE_DIR:-${OUTPUT_DIR:-${CODE_DIR}/data/camera_cache}}"
 LOG_DIR="${LOG_DIR:-${CODE_DIR}/outputs/${PROJECT_NAME}/camera_cache_logs/${RUN_TIME}}"
 
 mkdir -p "${LOG_DIR}" "${OUTPUT_DIR}"

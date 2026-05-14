@@ -5,7 +5,7 @@ set -euo pipefail
 #
 # Usage examples:
 #   bash scripts/launch/build_frozen_cache.sh
-#   TRAJECTORIES_PER_CLIP=16 CAMERA_CACHE_DIR=outputs/NeoVerseControlLatentDistill/camera_cache \
+#   TRAJECTORIES_PER_CLIP=16 CAMERA_CACHE_DIR=data/camera_cache \
 #     bash scripts/launch/build_frozen_cache.sh
 
 timestamp_utc() {
@@ -29,9 +29,9 @@ DRY_RUN="${DRY_RUN:-0}"
 CONFIG="${CONFIG:-configs/distill/control_latent.yaml}"
 PROJECT_NAME="${PROJECT_NAME:-NeoVerseControlLatentDistill}"
 RUN_TIME="${RUN_TIME:-$(timestamp_utc)}"
-OUTPUT_DIR="${FROZEN_CACHE_DIR:-${OUTPUT_DIR:-${CODE_DIR}/outputs/${PROJECT_NAME}/frozen_cache}}"
+OUTPUT_DIR="${FROZEN_CACHE_DIR:-${OUTPUT_DIR:-${CODE_DIR}/data/frozen_cache}}"
 LOG_DIR="${LOG_DIR:-${CODE_DIR}/outputs/${PROJECT_NAME}/frozen_cache_logs/${RUN_TIME}}"
-DEFAULT_CAMERA_CACHE_DIR="${DEFAULT_CAMERA_CACHE_DIR:-${CODE_DIR}/outputs/${PROJECT_NAME}/camera_cache}"
+DEFAULT_CAMERA_CACHE_DIR="${DEFAULT_CAMERA_CACHE_DIR:-${CODE_DIR}/data/camera_cache}"
 USE_CAMERA_CACHE="${USE_CAMERA_CACHE:-auto}"
 
 run_output_dir="${LOG_DIR}/run_output"

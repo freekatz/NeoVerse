@@ -43,7 +43,7 @@ variants_per_scene: 1
 trajectories_per_clip: null
 temporal_variant_profile_weights: ""
 fixed_clips_per_scene: 0
-camera_cache_dir: ""
+camera_cache_dir: data/camera_cache
 camera_cache_required: false
 
 camera_condition_normalization:
@@ -142,7 +142,7 @@ clip_grad: 1.0
 cache_train_batch: false
 cache_frozen_outputs: false
 train_from_frozen_cache: false
-frozen_cache_dir: null
+frozen_cache_dir: data/frozen_cache
 frozen_cache_pattern: "*.pt"
 frozen_cache_split: train
 frozen_cache_eval_ratio: 0.05

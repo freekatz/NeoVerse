@@ -69,7 +69,7 @@ def print_samples(paths, sample_count):
 
 def main():
     parser = argparse.ArgumentParser(description="Inspect NeoVerse frozen cache directories.")
-    parser.add_argument("--cache_dir", default="outputs/NeoVerseControlLatentDistill/frozen_cache")
+    parser.add_argument("--cache_dir", default="data/frozen_cache")
     parser.add_argument("--pattern", default="*.pt")
     parser.add_argument("--eval_ratio", type=float, default=0.05)
     parser.add_argument("--split_seed", type=int, default=0)

@@ -76,7 +76,7 @@ def prepare_model(cfg, device):
 def main():
     parser = argparse.ArgumentParser(description="Build fixed clip/trajectory frozen forward caches for SpatialVID distillation.")
     parser.add_argument("--config", default="configs/distill/control_latent.yaml")
-    parser.add_argument("--output_dir", default="outputs/NeoVerseControlLatentDistill/frozen_cache")
+    parser.add_argument("--output_dir", default="data/frozen_cache")
     parser.add_argument("--run_output_dir", default="outputs/NeoVerseControlLatentDistill/frozen_cache_build")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--num_shards", type=int, default=1)
