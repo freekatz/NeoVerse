@@ -32,7 +32,8 @@ def _run_sh(script_rel: str, args: list[str], env_extra: dict | None = None) -> 
 
 
 def _gpu_env() -> dict[str, str]:
-    return {"GPU_LIST": os.environ.get("GPU_LIST", os.environ.get("CUDA_VISIBLE_DEVICES", "") or "")}
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", os.environ.get("GPU_LIST", "") or "")
+    return {"CUDA_VISIBLE_DEVICES": cuda_visible_devices} if cuda_visible_devices else {}
 
 
 def _train_online(rest: list[str]) -> int:
@@ -66,7 +67,7 @@ def _train_online_noaug(rest: list[str]) -> int:
 def _train_cache(rest: list[str]) -> int:
     fc = os.environ.get(
         "FROZEN_CACHE_DIR",
-        str(CODE_DIR / "outputs/NeoVerseControlLatentDistill/frozen_cache"),
+        str(CODE_DIR / "data/frozen_cache"),
     )
     env = _gpu_env()
     env.setdefault("RUN_NAME", os.environ.get("RUN_NAME", "train_cache"))
@@ -94,7 +95,7 @@ def usage() -> None:
   python main.py eval last CONFIG CKPT [indices...]
   python main.py legacy train-base CONFIG [...]
   python main.py dev data prepare-spatialvid-hq [...]
-Optional: PYTHON=python3  FROZEN_CACHE_DIR=...  GPU_LIST=0,1
+Optional: PYTHON=python3  FROZEN_CACHE_DIR=...  CUDA_VISIBLE_DEVICES=0,1
 """
     )
 
