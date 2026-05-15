@@ -1,5 +1,6 @@
 import warnings
 from collections import OrderedDict
+from contextlib import nullcontext
 import torch, warnings, os
 import torch.nn.functional as F
 import numpy as np
@@ -42,6 +43,13 @@ from ..models.wan_video_text_encoder import (
 from ..models.wan_video_vae import WanVideoVAE, RMS_norm, CausalConv3d, Upsample
 from ..models.wan_video_neoverse_controller import NeoVerseControlBranch
 from .wan_video import WanVideoPipeline, WanVideoUnit_PromptEmbedder
+
+
+def _autocast_context(device, dtype):
+    device = torch.device(device)
+    if device.type == "cuda" and dtype in (torch.float16, torch.bfloat16):
+        return torch.amp.autocast(device_type=device.type, dtype=dtype)
+    return nullcontext()
 
 
 def build_vis_output_path(save_root, source_views, filename):
@@ -130,7 +138,7 @@ class WanVideoNeoVersePipeline(BasePipeline):
         inputs["latents"] = self.scheduler.add_noise(inputs["input_latents"], inputs["noise"], timestep)
         training_target = self.scheduler.training_target(inputs["input_latents"], inputs["noise"], timestep)
 
-        with torch.amp.autocast("cuda", dtype=self.torch_dtype):
+        with _autocast_context(self.device, self.torch_dtype):
             noise_pred = self.model_fn(**inputs, timestep=timestep)
 
         loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
@@ -342,12 +350,16 @@ class WanVideoNeoVersePipeline(BasePipeline):
         pipe.vae = base_pipe.vae if load_vae else None
 
         # 4) Load NeoVerseControlBranch from the same combined diffusion checkpoint.
-        ctrl_pool = ModelPool()
         ctrl_state_dict = load_state_dict(diffusion_cfg.path, torch_dtype=torch_dtype, device=offload_device)
         converter = NeoVerseControlBranch.state_dict_converter()
         ctrl_state, ctrl_config = converter.from_civitai(ctrl_state_dict)
         pipe.control_branch = NeoVerseControlBranch(**ctrl_config)
-        pipe.control_branch.load_state_dict(ctrl_state, assign=True, strict=False)
+        incompatible = pipe.control_branch.load_state_dict(ctrl_state, assign=True, strict=False)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise ValueError(
+                "Failed to load NeoVerse control branch cleanly: "
+                f"missing_keys={incompatible.missing_keys}, unexpected_keys={incompatible.unexpected_keys}."
+            )
         pipe.control_branch.to(dtype=torch_dtype, device=offload_device).eval()
 
         # 5) Load reconstructor via ModelPool (registered in MODEL_CONFIGS by hash).
@@ -542,6 +554,15 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
         continuous_views = self._gather_views(source_views, continuous_order)
         target_indices = self._target_trajectory_indices(source_views, continuous_order)
         target_input_video = self._gather_view_tensor(continuous_views["img"], target_indices)
+        continuous_is_context = ~continuous_views["is_target"].bool()
+        context_counts = continuous_is_context.sum(dim=1)
+        if not bool(torch.all(context_counts == context_counts[0]).item()):
+            raise ValueError("NeoVerse preprocessing expects the same number of context views in every batch item.")
+        context_indices = torch.stack(
+            [torch.nonzero(mask, as_tuple=False).flatten() for mask in continuous_is_context],
+            dim=0,
+        ).to(device=continuous_views["img"].device, dtype=torch.long)
+        continuous_context_views = self._gather_views(continuous_views, context_indices)
         if pipe.is_training:
             input_video = target_input_video.clone()
             assert len(input_video) == 1, "During training, only batch size 1 is supported."
@@ -564,28 +585,11 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
         )
         has_camera_cache = has_gt_cameras and "camera_cache_path" in source_views
         has_annotation_cameras = has_gt_cameras and not has_camera_cache
-        context_num = (~source_views["is_target"]).sum()
-        context_num_int = int(context_num.item() if isinstance(context_num, torch.Tensor) else context_num)
-        context_indices = None
         if has_annotation_cameras:
-            total_views = source_views["img"].shape[1]
-            recon_source_views = {}
-            for key, value in source_views.items():
-                if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[1] == total_views:
-                    recon_source_views[key] = value[:, :context_num_int]
-                else:
-                    recon_source_views[key] = value
-            recon_source_views["is_target"] = torch.zeros_like(source_views["is_target"][:, :context_num_int])
+            recon_source_views = dict(continuous_context_views)
+            recon_source_views["is_target"] = torch.zeros_like(continuous_context_views["is_target"])
         elif has_camera_cache:
-            continuous_is_context = ~continuous_views["is_target"].bool()
-            context_counts = continuous_is_context.sum(dim=1)
-            if not bool(torch.all(context_counts == context_counts[0]).item()):
-                raise ValueError("NeoVerse preprocessing expects the same number of context views in every batch item.")
-            context_indices = torch.stack(
-                [torch.nonzero(mask, as_tuple=False).flatten() for mask in continuous_is_context],
-                dim=0,
-            ).to(device=continuous_views["img"].device, dtype=torch.long)
-            recon_source_views = self._gather_views(continuous_views, context_indices)
+            recon_source_views = dict(continuous_context_views)
             recon_source_views.pop("camera_poses", None)
             recon_source_views.pop("camera_intrs", None)
             recon_source_views["is_target"] = torch.zeros_like(recon_source_views["is_target"])
@@ -593,7 +597,7 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
             recon_source_views = dict(continuous_views)
 
         pipe.load_models_to_device(self.onload_model_names)
-        with torch.amp.autocast("cuda", dtype=pipe.torch_dtype):
+        with _autocast_context(pipe.device, pipe.torch_dtype):
             skip_unused_heads = bool(getattr(pipe, "skip_unused_reconstructor_heads", False))
             force_motion_tokens = (has_annotation_cameras or has_camera_cache) and bool(getattr(pipe, "reuse_context_forward_tokens", True))
             if bool(getattr(pipe, "reuse_reconstructor_tokens", False)):
@@ -639,14 +643,6 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
             render_extrinsics = recon_output["rendered_extrinsics"]
             render_intrinsics = recon_output["rendered_intrinsics"]
             render_timestamps = recon_output["rendered_timestamps"]
-            continuous_is_context = ~continuous_views["is_target"].bool()
-            context_counts = continuous_is_context.sum(dim=1)
-            if not bool(torch.all(context_counts == context_counts[0]).item()):
-                raise ValueError("NeoVerse preprocessing expects the same number of context views in every batch item.")
-            context_indices = torch.stack(
-                [torch.nonzero(mask, as_tuple=False).flatten() for mask in continuous_is_context],
-                dim=0,
-            ).to(device=render_extrinsics.device, dtype=torch.long)
             context_extrinsics = self._gather_view_tensor(render_extrinsics, context_indices)
             context_intrinsics = self._gather_view_tensor(render_intrinsics, context_indices)
         novel_context_poses = self.novel_view_sampling(
@@ -674,19 +670,9 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
         target_poses = self._gather_view_tensor(render_extrinsics, target_indices)
         target_intrs = self._gather_view_tensor(render_intrinsics, target_indices)
         target_timestamps = self._gather_view_tensor(render_timestamps.unsqueeze(-1), target_indices).squeeze(-1)
-        source_traj = source_views.get("trajectory_index")
-        if source_traj is None:
-            source_traj_indices = torch.arange(
-                context_num_int,
-                device=render_extrinsics.device,
-                dtype=torch.long,
-            ).unsqueeze(0).expand(render_extrinsics.shape[0], -1)
-        else:
-            if not isinstance(source_traj, torch.Tensor):
-                source_traj = torch.as_tensor(source_traj, device=render_extrinsics.device, dtype=torch.long)
-            source_traj_indices = source_traj[:, :context_num_int].to(device=render_extrinsics.device, dtype=torch.long)
-        source_poses = self._gather_view_tensor(render_extrinsics, source_traj_indices)
-        source_intrs = self._gather_view_tensor(render_intrinsics, source_traj_indices)
+        source_poses = self._gather_view_tensor(render_extrinsics, context_indices)
+        source_intrs = self._gather_view_tensor(render_intrinsics, context_indices)
+        source_timestamps = self._gather_view_tensor(render_timestamps.unsqueeze(-1), context_indices).squeeze(-1)
         target_is_target = None
         if (
             isinstance(source_views.get("is_target"), torch.Tensor)
@@ -740,6 +726,7 @@ class WanVideoUnit_4DPreprocesser(PipelineUnit):
             "target_poses": target_poses,
             "target_intrs": target_intrs,
             "target_timestamps": target_timestamps,
+            "source_timestamps": source_timestamps,
             "source_poses": source_poses,
             "source_intrs": source_intrs,
         }

@@ -214,11 +214,10 @@ class ControlLatentDistillModule(torch.nn.Module):
             "use_gradient_checkpointing_offload": False,
             "cfg_merge": False,
         }
-        # The existing preprocessing unit uses pipe.is_training to decide whether to
-        # keep input_video for VAE latents. Temporarily mark one frozen module as
-        # training, then restore eval before teacher/student forward.
-        old_state = self.pipe.control_branch.training
-        self.pipe.control_branch.train(True)
+        # The migrated pipeline stores this flag explicitly; the original
+        # DiffSynth BasePipeline derived it from child-module training states.
+        old_is_training = bool(getattr(self.pipe, "is_training", False))
+        self.pipe.is_training = True
         try:
             with torch.no_grad():
                 for unit in self.pipe.units:
@@ -232,7 +231,7 @@ class ControlLatentDistillModule(torch.nn.Module):
                         unit, self.pipe, inputs_shared, inputs_posi, inputs_nega
                     )
         finally:
-            self.pipe.control_branch.train(old_state)
+            self.pipe.is_training = old_is_training
             self.pipe.eval()
         return {**inputs_shared, **inputs_posi}
 
@@ -269,11 +268,15 @@ class ControlLatentDistillModule(torch.nn.Module):
                 target_times = target_times.to(device=self.pipe.device, dtype=torch.float32)
             else:
                 target_times = extract_target_times(inputs["source_views"], device=self.pipe.device)
-            source_times = extract_source_times(
-                inputs["source_views"],
-                device=self.pipe.device,
-                context_only=bool(self.cfg.token.context_only),
-            )
+            source_times = inputs.get("source_timestamps")
+            if isinstance(source_times, torch.Tensor):
+                source_times = source_times.to(device=self.pipe.device, dtype=torch.float32)
+            else:
+                source_times = extract_source_times(
+                    inputs["source_views"],
+                    device=self.pipe.device,
+                    context_only=bool(self.cfg.token.context_only),
+                )
             source_poses = inputs.get("source_poses")
             source_intrs = inputs.get("source_intrs")
             if not isinstance(source_poses, torch.Tensor) or not isinstance(source_intrs, torch.Tensor):

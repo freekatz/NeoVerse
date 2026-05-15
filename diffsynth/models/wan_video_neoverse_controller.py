@@ -176,7 +176,8 @@ class NeoVerseControlBranchDictConverter:
 
     def from_civitai(self, state_dict):
         state_dict_ = {name: param for name, param in state_dict.items() if name.startswith("control")}
-        if hash_state_dict_keys(state_dict_) == '45cf2d04f7f77286df2bf0e723a36e03':
+        state_hash = hash_state_dict_keys(state_dict_)
+        if state_hash == '45cf2d04f7f77286df2bf0e723a36e03':
             config = {
                 "control_layers": (0, 5, 10, 15, 20, 25, 30, 35),
                 "control_in_dim": 96,
@@ -187,4 +188,9 @@ class NeoVerseControlBranchDictConverter:
                 "ffn_dim": 13824,
                 "eps": 1e-06,
             }
+        else:
+            raise ValueError(
+                "Unsupported NeoVerse control branch checkpoint: "
+                f"hash={state_hash}, control_keys={len(state_dict_)}."
+            )
         return state_dict_, config

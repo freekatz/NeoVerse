@@ -27,15 +27,14 @@ def extract_source_times(source_views, device, context_only: bool = True):
     timestamps = source_views.get("timestamp")
     if timestamps is None or not isinstance(timestamps, torch.Tensor):
         return None
-    timestamps = timestamps.to(device=device, dtype=torch.float32)
+    source_views = _ordered_views(source_views, device=device)
+    timestamps = source_views["timestamp"].to(device=device, dtype=torch.float32)
     if not context_only or "is_target" not in source_views or not isinstance(source_views["is_target"], torch.Tensor):
         return timestamps
-    keep = ~source_views["is_target"].bool()
-    if keep.ndim != 2:
+    context_indices = _context_indices_from_ordered(source_views, device=device)
+    if context_indices is None:
         return timestamps
-    # SpatialVID and ExampleVideo return context views first, followed by target views.
-    count = int(keep[0].sum().item())
-    return timestamps[:, :count]
+    return _gather_view_tensor(timestamps, context_indices)
 
 
 def _as_tensor_2d(value, device, dtype=None):
@@ -55,6 +54,40 @@ def _as_tensor_2d(value, device, dtype=None):
     elif tensor.ndim == 1:
         tensor = tensor.unsqueeze(0)
     return tensor
+
+
+def _gather_view_tensor(tensor: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    if indices.ndim == 1:
+        indices = indices.unsqueeze(0).expand(tensor.shape[0], -1)
+    index = indices.to(device=tensor.device, dtype=torch.long)
+    index = index.reshape(index.shape[0], index.shape[1], *([1] * (tensor.ndim - 2)))
+    index = index.expand(-1, -1, *tensor.shape[2:])
+    return torch.gather(tensor, dim=1, index=index)
+
+
+def _ordered_views(source_views, device):
+    order = continuous_view_order_indices(source_views, device=device)
+    if order is None:
+        return source_views
+    total_views = order.shape[1]
+    return {
+        key: _gather_view_tensor(value, order)
+        if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[1] == total_views
+        else value
+        for key, value in source_views.items()
+    }
+
+
+def _context_indices_from_ordered(source_views, device):
+    if "is_target" not in source_views or not isinstance(source_views["is_target"], torch.Tensor):
+        return None
+    keep = ~source_views["is_target"].to(device=device).bool()
+    if keep.ndim != 2:
+        return None
+    counts = keep.sum(dim=1)
+    if not bool(torch.all(counts == counts[0]).item()):
+        raise ValueError("Expected the same number of context views in every batch item.")
+    return torch.stack([torch.nonzero(mask, as_tuple=False).flatten() for mask in keep], dim=0).to(device=device)
 
 
 def continuous_view_order_indices(source_views, device):
@@ -78,15 +111,6 @@ def target_trajectory_indices(source_views, device):
     return target_index
 
 
-def _context_count(source_views, fallback_count):
-    if "is_target" not in source_views or not isinstance(source_views["is_target"], torch.Tensor):
-        return fallback_count
-    keep = ~source_views["is_target"].bool()
-    if keep.ndim != 2:
-        return fallback_count
-    return int(keep[0].sum().item())
-
-
 def gather_source_cameras_from_target(source_views, target_poses, target_intrs, context_only: bool = True):
     if isinstance(source_views, list):
         source_views = compose_views_from_list(source_views)
@@ -95,6 +119,7 @@ def gather_source_cameras_from_target(source_views, target_poses, target_intrs, 
         return None, None
 
     device = target_poses.device if target_poses is not None else timestamps.device
+    source_views = _ordered_views(source_views, device=device)
     pose_key = "camera_poses" if "camera_poses" in source_views else "extrinsics"
     intr_key = "camera_intrs" if "camera_intrs" in source_views else "intrinsics"
     if pose_key in source_views and intr_key in source_views:
@@ -103,28 +128,25 @@ def gather_source_cameras_from_target(source_views, target_poses, target_intrs, 
         if isinstance(source_poses, torch.Tensor) and isinstance(source_intrs, torch.Tensor):
             source_poses = source_poses.to(device=device)
             source_intrs = source_intrs.to(device=device)
-            if context_only and "is_target" in source_views and isinstance(source_views["is_target"], torch.Tensor):
-                keep = ~source_views["is_target"].bool()
-                count = int(keep[0].sum().item()) if keep.ndim == 2 else source_poses.shape[1]
-                source_poses = source_poses[:, :count]
-                source_intrs = source_intrs[:, :count]
+            context_indices = _context_indices_from_ordered(source_views, device=device) if context_only else None
+            if context_indices is not None:
+                source_poses = _gather_view_tensor(source_poses, context_indices)
+                source_intrs = _gather_view_tensor(source_intrs, context_indices)
             return source_poses, source_intrs
 
     if target_poses is None or target_intrs is None:
         return None, None
 
-    timestamps = timestamps.to(device=device, dtype=torch.float32)
-    if context_only and "is_target" in source_views and isinstance(source_views["is_target"], torch.Tensor):
-        count = _context_count(source_views, timestamps.shape[1])
-        source_times = timestamps[:, :count]
-    else:
-        count = timestamps.shape[1]
-        source_times = timestamps
+    timestamps = source_views["timestamp"].to(device=device, dtype=torch.float32)
+    context_indices = _context_indices_from_ordered(source_views, device=device) if context_only else None
+    source_times = _gather_view_tensor(timestamps, context_indices) if context_indices is not None else timestamps
+    target_times = extract_target_times(source_views, device=device)
+    if target_times is None:
+        target_times = torch.sort(timestamps, dim=1).values
 
-    sorted_times, _ = torch.sort(timestamps, dim=1)
     gather_indices = []
-    for b_idx in range(timestamps.shape[0]):
-        distance = (sorted_times[b_idx, None, :] - source_times[b_idx, :, None]).abs()
+    for b_idx in range(source_times.shape[0]):
+        distance = (target_times[b_idx, None, :] - source_times[b_idx, :, None]).abs()
         gather_indices.append(distance.argmin(dim=-1))
     gather_idx = torch.stack(gather_indices, dim=0).to(device=device)
 
@@ -319,4 +341,3 @@ def normalize_camera_condition_cache(cache: dict, cfg):
     if bool(norm_cfg["normalize_plucker"]):
         cache["target_plucker"] = _normalize_plucker_to_first(cache.get("target_plucker"), reference_poses, anchor_inv, scale)
     return cache
-

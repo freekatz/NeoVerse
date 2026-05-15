@@ -25,17 +25,64 @@ def compose_views_from_list(batch: list[dict[str, Any]]) -> dict[str, Any]:
     return batched
 
 
+def _as_tensor_2d(value, device, dtype=None):
+    if isinstance(value, torch.Tensor):
+        tensor = value.to(device=device, dtype=dtype) if dtype is not None else value.to(device=device)
+    elif isinstance(value, np.ndarray):
+        tensor = torch.as_tensor(value, device=device, dtype=dtype)
+    elif isinstance(value, (list, tuple)):
+        try:
+            tensor = torch.as_tensor(value, device=device, dtype=dtype)
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+    if tensor.ndim == 0:
+        tensor = tensor.reshape(1, 1)
+    elif tensor.ndim == 1:
+        tensor = tensor.unsqueeze(0)
+    return tensor
+
+
+def _gather_view_tensor(tensor: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    if indices.ndim == 1:
+        indices = indices.unsqueeze(0).expand(tensor.shape[0], -1)
+    index = indices.to(device=tensor.device, dtype=torch.long)
+    index = index.reshape(index.shape[0], index.shape[1], *([1] * (tensor.ndim - 2)))
+    index = index.expand(-1, -1, *tensor.shape[2:])
+    return torch.gather(tensor, dim=1, index=index)
+
+
+def continuous_view_order_indices(views: dict[str, Any], device) -> torch.Tensor | None:
+    trajectory_index = _as_tensor_2d(views.get("trajectory_index"), device=device, dtype=torch.long)
+    if trajectory_index is None:
+        return None
+    return torch.argsort(trajectory_index, dim=1)
+
+
 def filter_context_views(views: dict[str, Any]) -> dict[str, Any]:
     """Keep only views where `is_target` is false when that mask exists."""
     if "is_target" not in views or not isinstance(views["is_target"], torch.Tensor):
         return views
     keep = ~views["is_target"].bool()
     if keep.ndim == 2:
-        # The existing SpatialVID loader uses the same context count per batch.
-        count = int(keep[0].sum().item())
-        return {
-            key: value[:, :count] if isinstance(value, torch.Tensor) and value.ndim >= 2 else value
+        order = continuous_view_order_indices(views, device=views["is_target"].device)
+        ordered = views if order is None else {
+            key: _gather_view_tensor(value, order)
+            if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[1] == keep.shape[1]
+            else value
             for key, value in views.items()
+        }
+        keep = ~ordered["is_target"].bool()
+        counts = keep.sum(dim=1)
+        if not bool(torch.all(counts == counts[0]).item()):
+            raise ValueError("Expected the same number of context views in every batch item.")
+        indices = torch.stack([torch.nonzero(mask, as_tuple=False).flatten() for mask in keep], dim=0)
+        return {
+            key: _gather_view_tensor(value, indices)
+            if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[1] == keep.shape[1]
+            else value
+            for key, value in ordered.items()
         }
     return views
 
