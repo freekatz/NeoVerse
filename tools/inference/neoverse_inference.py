@@ -11,9 +11,9 @@ CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
-from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
-from diffsynth.utils.data import save_video
-from diffsynth.utils.auxiliary import CameraTrajectory, load_video, homo_matrix_inverse
+from neoverse.pipeline import WanVideoNeoVersePipeline
+from neoverse.data import save_video
+from neoverse.utils.auxiliary import CameraTrajectory, load_video, homo_matrix_inverse
 
 
 def save_scalar_video(path, frames, fps=15):

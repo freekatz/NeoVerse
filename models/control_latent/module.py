@@ -5,9 +5,9 @@ import torch
 import torch.nn.functional as F
 from omegaconf import OmegaConf
 
-from diffsynth.models.student_adapters import build_student_adapter
-from diffsynth.models.wan_video_dit import sinusoidal_embedding_1d
-from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
+from neoverse.models.student_adapters import build_student_adapter
+from neoverse.pipeline import WanVideoNeoVersePipeline
+from neoverse.adapters.wan import expanded_rope_freqs_for_legacy_control, patchify_tensor, sinusoidal_embedding_1d
 
 from .cache import (
     cache_float_dtype,
@@ -120,16 +120,22 @@ def prepare_control_state(
         t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))
 
     context = dit.text_embedding(context)
-    x, grid = dit.patchify(latents, control_camera_latents_input)
+    if hasattr(dit, "patchify"):
+        x, grid = dit.patchify(latents, control_camera_latents_input)
+    else:
+        x, grid = patchify_tensor(dit, latents)
     frames, height, width = grid
-    freqs = torch.cat(
-        [
-            dit.freqs[0][:frames].view(frames, 1, 1, -1).expand(frames, height, width, -1),
-            dit.freqs[1][:height].view(1, height, 1, -1).expand(frames, height, width, -1),
-            dit.freqs[2][:width].view(1, 1, width, -1).expand(frames, height, width, -1),
-        ],
-        dim=-1,
-    ).reshape(frames * height * width, 1, -1).to(x.device)
+    if isinstance(dit.freqs, tuple):
+        freqs = torch.cat(
+            [
+                dit.freqs[0][:frames].view(frames, 1, 1, -1).expand(frames, height, width, -1),
+                dit.freqs[1][:height].view(1, height, 1, -1).expand(frames, height, width, -1),
+                dit.freqs[2][:width].view(1, 1, width, -1).expand(frames, height, width, -1),
+            ],
+            dim=-1,
+        ).reshape(frames * height * width, 1, -1).to(x.device)
+    else:
+        freqs = expanded_rope_freqs_for_legacy_control(dit, frames, height, width, x.device)
     return x, tuple(int(v) for v in grid), context, t, t_mod, freqs
 
 

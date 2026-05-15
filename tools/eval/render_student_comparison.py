@@ -14,9 +14,9 @@ CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
-from diffsynth.utils.data import save_video
-from diffsynth.utils.auxiliary import homo_matrix_inverse
-from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline, model_fn_wan_video
+from neoverse.data import save_video
+from neoverse.utils.auxiliary import homo_matrix_inverse
+from neoverse.pipeline import WanVideoNeoVersePipeline, model_fn_wan_video
 from models.control_latent.camera import (
     continuous_view_order_indices,
     extract_source_times,

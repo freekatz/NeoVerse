@@ -9,8 +9,7 @@ CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
-from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
-from diffsynth.core import ModelConfig
+from neoverse.pipeline import WanVideoNeoVersePipeline
 from tools.train.launch import launch_training_task
 from utils.datasets.spatialvid import SpatialVID
 from utils.training_module import DiffusionTrainingModule

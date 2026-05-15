@@ -11,7 +11,7 @@ CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
 
-from diffsynth.models.model_loader import ModelPool
+from neoverse.loaders import ModelPool
 from utils.config import normalize_filter_values
 from utils.config import resolve_repo_path
 from utils.datasets.spatialvid import SpatialVID

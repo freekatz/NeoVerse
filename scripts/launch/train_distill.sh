@@ -129,9 +129,9 @@ run_cmd python -m py_compile \
   models/control_latent/loss.py \
   models/control_latent/module.py \
   models/control_latent/reconstructor_tokens.py \
-  diffsynth/models/student_adapters.py \
-  diffsynth/pipelines/wan_video_neoverse.py \
-  diffsynth/models/wan_video_neoverse_controller.py \
+  neoverse/models/student_adapters.py \
+  neoverse/pipeline.py \
+  neoverse/control_branch.py \
   utils/datasets/base.py \
   utils/datasets/spatialvid.py \
   utils/datasets/frozen_cache.py \

@@ -241,7 +241,7 @@ def save_current_code(outdir):
         "*.zip",
         "*.jpg",
     )
-    for src_dir in ["utils", "models", "tools", "diffsynth"]:
+    for src_dir in ["utils", "models", "tools", "neoverse", "wan"]:
         src_path = src_dir
         if os.path.isdir(src_path):
             shutil.copytree(
